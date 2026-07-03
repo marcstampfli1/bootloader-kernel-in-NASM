@@ -2323,6 +2323,13 @@ static uint64_t sys_sigprocmask(uint64_t how, uint64_t set_ptr, uint64_t oldset_
 // ── sys_sigreturn ─────────────────────────────────────────────────────────
 // Called by the restorer trampoline after a signal handler returns.
 // Restores the interrupted user context from the sigframe saved on the stack.
+//
+// force_align_arg_pointer: the syscall entry enters C with rsp 8 bytes off the
+// SysV 16-byte boundary (it pushes an odd number of registers), so without this
+// the aligned(16) `frame` local lands 8-aligned and the FXRSTOR below #GP's.
+// The attribute makes GCC realign the stack (`and rsp,-16`) on entry.  noinline
+// so the attribute is not lost to inlining into the syscall wrapper.
+__attribute__((force_align_arg_pointer, noinline))
 static uint64_t sys_sigreturn(void) {
     uint64_t frame_base = g_current->sigstate.sigframe_rsp;
 
@@ -2376,10 +2383,18 @@ static uint64_t sys_sigreturn(void) {
     g_current->sigstate.sigframe_rsp = 0;
 
     // Restore the interrupted FPU/SSE state saved by signal_setup_frame.
-    // Sanitize MXCSR first: a crafted sigframe with reserved MXCSR bits set
-    // would #GP the kernel on FXRSTOR (a userland-triggerable DoS).  Mask to
-    // the architecturally writable bits.  `frame` is a 16-byte-aligned kernel
-    // copy (sigframe_t is aligned(16)), so FXRSTOR's alignment rule holds.
+    // FXRSTOR needs a 16-byte-aligned operand.  `frame` is a stack local, but
+    // the syscall entry does NOT keep the SysV 16-byte stack boundary (it pushes
+    // an odd number of registers), so this function is entered 8-off and frame
+    // -- hence frame.fpu -- lands only 8-aligned, which #GP's FXRSTOR.  Observed:
+    // any return from an async signal handler (bash SIGINT, and compositor
+    // clients taking SIGWINCH/SIGCHLD/timers -- a real desktop-stability bug).
+    // The function carries force_align_arg_pointer (see its definition) so GCC
+    // emits an `and rsp,-16` prologue that makes the stack -- and frame.fpu --
+    // truly aligned.  A hand-aligned buffer does NOT work: the compiler folds
+    // the alignment away, trusting the (violated) ABI.
+    // Sanitize MXCSR first: reserved bits set would themselves #GP FXRSTOR (a
+    // userland-triggerable DoS); mask to the architecturally writable bits.
     *(uint32_t*)(frame.fpu + 24) &= 0x0000FFBFu;   // MXCSR is at FXSAVE off 24
     __asm__ volatile("fxrstor %0" : : "m"(frame.fpu));
     // Return the interrupted syscall's rax so the resumed code sees the
@@ -5772,6 +5787,11 @@ static uint64_t w_sys_sigaction(uint64_t a, uint64_t b, uint64_t c, uint64_t d) 
 static uint64_t w_sys_sigprocmask(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)d; return sys_sigprocmask(a, b, c);
 }
+// force_align_arg_pointer on the WRAPPER: sys_sigreturn inlines into here (it is
+// tiny), so the realign attribute must live on this address-taken function (in
+// the dispatch table -> cannot itself be inlined away) or the `and rsp,-16`
+// prologue is never emitted and the inlined FXRSTOR #GP's on the 8-off stack.
+__attribute__((force_align_arg_pointer))
 static uint64_t w_sys_sigreturn(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)a; (void)b; (void)c; (void)d; return sys_sigreturn();
 }
