@@ -296,7 +296,28 @@ static int user_buf_prefault(virt_addr_t addr, size_t len) {
         }
 
     map_page:;
-        // Allocate a frame, zero it, map it with the VMA's permissions.
+        // A FILE-BACKED page (text/rodata/data) must hold its on-disk content,
+        // NOT zeros.  The old code allocated a zeroed anon frame here for EVERY
+        // absent page, which silently corrupted file-backed pages whenever a
+        // syscall prefaulted a buffer that overlapped one: e.g. read(2)/blit
+        // callers zero-mapped a rodata/data page, so bash's format strings and
+        // variable names ("BASH_COMPAT", ...) read back empty and cascaded into
+        // bogus startup errors.  Delegate to the single source of truth for
+        // populating a page, the demand-fault handler, by touching the page in
+        // the process's own address space (CR3 is the caller's here).  isr14
+        // loads it from the page cache / disk, honours the BSS clamp and
+        // permissions, and maps a writable file VMA as a private R/W copy; a
+        // read touch is enough because the copy that follows uses the resulting
+        // mapping.  If the VMA exists (checked above) the fault resolves or the
+        // task is killed on OOM: either way we never install wrong content.
+        if (vma_flags & VMA_FILE) {
+            (void)*(volatile uint8_t*)page;   // fault in the real content
+            continue;
+        }
+
+        // Anonymous page: there is no backing store, so a freshly zeroed frame
+        // IS the correct content (a new zero page, about to be written into or
+        // read as zero).  Allocate, zero, and map with the VMA's permissions.
         phys_addr_t frame = pmm_buddy_alloc(0);
         if (frame == PMM_INVALID_ADDR) return -1;  // OOM — can't back the range
 
