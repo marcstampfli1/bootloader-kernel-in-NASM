@@ -115,6 +115,24 @@ int user_buf_readable_ok(uint64_t addr, uint64_t len);
 // raw deref).  Returns length, -EFAULT (bad pointer), or -ENAMETOOLONG.
 static int64_t copy_path_from_user(char* dst, const void* uptr, uint64_t dstsz);
 
+// Resolve `src` against `cwd` into `out` (outsz bytes): an absolute src (leading
+// '/') is copied verbatim; a relative src becomes cwd + '/' + src.  Always
+// NUL-terminated and bounded to outsz-1.  The single relative-path builder the
+// path syscalls (open/stat/access/chdir/exec/readdir/truncate/...) each used to
+// hand-roll identically.  Caps match the old per-call code for a 512-byte out.
+static void resolve_at_path(char* out, uint32_t outsz,
+                            const char* cwd, const char* src) {
+    if (outsz == 0) return;
+    uint32_t j = 0;
+    if (src[0] != '/') {
+        // cwd prefix, leaving room for a '/' separator + src + NUL.
+        for (uint32_t k = 0; cwd[k] && j + 2 < outsz; k++) out[j++] = cwd[k];
+        if (j > 0 && out[j-1] != '/' && j + 1 < outsz) out[j++] = '/';
+    }
+    for (uint32_t k = 0; src[k] && j + 1 < outsz; k++) out[j++] = src[k];
+    out[j] = '\0';
+}
+
 // ── mmap_round_len / mmap_range_ok ────────────────────────────────────────
 // Overflow-safe primitives for the user-controlled (addr, len) of the VMA
 // range syscalls (mmap / munmap / MAP_FIXED replace).  WITHOUT them, the
@@ -350,19 +368,7 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
 
     // Resolve relative paths: prepend cwd if path does not start with '/'.
     char path[512];
-    if (raw[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0;
-        while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        // Ensure cwd ends with '/'.
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current->cwd, raw);
 
     vfs_file_t* f = NULL;
 
@@ -929,17 +935,7 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
 
     // Resolve relative path using cwd.
     char resolved[512];
-    if (path[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) resolved[j] = cwd[j];
-        if (j > 0 && resolved[j-1] != '/') resolved[j++] = '/';
-        for (uint64_t k = 0; path[k] && j < 511; k++, j++) resolved[j] = path[k];
-        resolved[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= plen; k++) resolved[k] = path[k];
-    }
+    resolve_at_path(resolved, sizeof(resolved), g_current->cwd, path);
     normalize_path(resolved);
     if (!unveil_ok(resolved, UNVEIL_EXEC)) return (uint64_t)-ENOENT;   // sandbox
 
@@ -1762,17 +1758,7 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     }
     raw[pathlen] = '\0';
 
-    if (raw[0] != '/') {
-        const char* cwd = g_current ? g_current->cwd : "/";
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= pathlen; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current ? g_current->cwd : "/", raw);
     kfree(raw);
 
     ext2_entry_t* kbuf = kmalloc(max_entries * sizeof(ext2_entry_t));
@@ -1862,17 +1848,7 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
     raw[pathlen] = '\0';
 
     char path[512];
-    if (raw[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= pathlen; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current->cwd, raw);
 
     struct stat kst;
     __builtin_memset(&kst, 0, sizeof(kst));
@@ -2087,17 +2063,7 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
 
     // Resolve relative paths against cwd.
     char path[512];
-    if (raw[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= pathlen; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current->cwd, raw);
 
     // Unified lookup — covers both virtfs and ext2.
     {
@@ -4077,20 +4043,8 @@ static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
     char raw[512];
     int64_t arl = copy_path_from_user(raw, (const void*)path_ptr, sizeof(raw));
     if (arl < 0) return (uint64_t)arl;
-    uint64_t i = (uint64_t)arl;
-
     char path[512];
-    if (raw[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current->cwd, raw);
 
     // Unified lookup for both virtfs and ext2.
     {
@@ -5620,19 +5574,8 @@ static uint64_t sys_truncate(uint64_t path_ptr, uint64_t length) {
     char raw[512];
     int64_t trl = copy_path_from_user(raw, (const void*)path_ptr, sizeof(raw));
     if (trl < 0) return (uint64_t)trl;
-    uint64_t i = (uint64_t)trl;
     char path[512];
-    if (raw[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current->cwd, raw);
     normalize_path(path);
     if (!unveil_ok(path, UNVEIL_WRITE)) return (uint64_t)-ENOENT;   // sandbox
     // Require write permission on the file itself.
