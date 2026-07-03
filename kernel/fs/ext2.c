@@ -3118,6 +3118,124 @@ int ext2_unlink(const char* path, const void* cred) {
     return 1;
 }
 
+// ── ext2_rmdir ──────────────────────────────────────────────────────────────
+
+// Returns 1 iff the directory holds only "." and ".." (every other dirent is a
+// hole, inode==0).  Walks all data blocks with the same bounded-dirent
+// discipline as dir_remove_entry so a corrupt on-disk rec_len cannot over-read.
+// Operates on a caller-provided inode snapshot (no lock held during the block
+// I/O).  On OOM returns 0 (treated as "not empty" -> rmdir refuses, safe).
+static int ext2_dir_is_empty(const ext2_inode_t* dir_inode) {
+    uint32_t bytes_left = dir_inode->i_size;
+    uint32_t blk_idx    = 0;
+    EXT2_SCRATCH_DECL(die_buf);
+    while (bytes_left > 0) {
+        uint32_t blk = inode_get_block(dir_inode, blk_idx);
+        blk_idx++;
+        if (!blk) break;
+        if (!die_buf) EXT2_SCRATCH_ALLOC(die_buf);
+        if (!read_block(blk, die_buf)) return 0;
+
+        uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
+        uint32_t off = 0;
+        while (off + 8 <= blk_bytes) {
+            ext2_dirent_t* de = (ext2_dirent_t*)(die_buf + off);
+            if (de->rec_len == 0) break;
+            if (!ext2_dirent_in_block(off, de->rec_len, de->name_len, blk_bytes)) break;
+            if (de->inode != 0) {
+                int is_dot    = (de->name_len == 1 && de->name[0] == '.');
+                int is_dotdot = (de->name_len == 2 && de->name[0] == '.' &&
+                                                      de->name[1] == '.');
+                if (!is_dot && !is_dotdot) return 0;   // a real child -> not empty
+            }
+            off += de->rec_len;
+        }
+        if (blk_bytes >= s_block_size) bytes_left -= s_block_size;
+        else                          bytes_left = 0;
+    }
+    return 1;
+}
+
+// Remove an EMPTY directory.  Returns 1 on success, 0 on failure (not found,
+// not a directory, non-empty, or a permission denial).  Mirrors ext2_unlink's
+// lock discipline (never hold the target inode lock across dir_remove_entry,
+// which locks the parent) and, because that brief unlock reopens a create-race
+// window, re-checks emptiness after the entry is gone and rolls the removal
+// back rather than orphan any child that raced in.
+int ext2_rmdir(const char* path, const void* cred) {
+    if (!s_mounted || !path) return 0;
+
+    uint32_t ino = path_to_inode(path);
+    if (!ino) return 0;
+
+    char rd_parent[EXT2_PATH_MAX];
+    const char* basename = path_split(path, rd_parent, sizeof(rd_parent));
+    if (!basename || basename[0] == '\0') return 0;
+    // Refuse "." and ".." as the leaf.
+    if (basename[0] == '.' &&
+        (basename[1] == '\0' || (basename[1] == '.' && basename[2] == '\0')))
+        return 0;
+
+    uint32_t parent_ino = path_to_inode(rd_parent);
+    if (!parent_ino || parent_ino == ino) return 0;   // never the root itself
+
+    // Write+exec on the resolved parent, on the same parent_ino we
+    // dir_remove_entry from below (path-TOCTOU close, as in ext2_unlink).
+    if (cred && ext2_dir_write_ok(parent_ino, cred) != 0) return 0;
+
+    // Must be an EMPTY directory.  Snapshot the inode under the lock, then do
+    // the block I/O for the empty scan without holding it.
+    irtree_leaf_t* leaf = inode_lock(ino);
+    if (!leaf) return 0;
+    if ((leaf->inode.i_mode & 0xF000) != EXT2_S_IFDIR) { inode_unlock(leaf); return 0; }
+    ext2_inode_t dir_copy = leaf->inode;
+    inode_unlock(leaf);
+    if (!ext2_dir_is_empty(&dir_copy)) return 0;
+
+    // Detach from the parent first (makes the dir unreachable by name).
+    if (!dir_remove_entry(parent_ino, basename)) return 0;
+
+    // Re-check emptiness now the entry is gone: if a create raced in during the
+    // brief unlock, roll the detach back rather than orphan the child.
+    leaf = inode_lock(ino);
+    if (!leaf) return 0;
+    dir_copy = leaf->inode;
+    inode_unlock(leaf);
+    if (!ext2_dir_is_empty(&dir_copy)) {
+        dir_add_entry(parent_ino, basename, ino, EXT2_FT_DIR);   // rollback
+        return 0;
+    }
+
+    // Free the empty directory: release its data block(s) + inode.
+    leaf = inode_lock(ino);
+    if (!leaf) return 0;
+    ext2_inode_t work = leaf->inode;
+    free_inode_blocks(&work);
+    work.i_links_count = 0;
+    work.i_dtime       = 1;
+    inode_pub_begin(leaf);
+    leaf->inode = work;
+    inode_pub_end(leaf);
+    inode_writeback(leaf);
+    inode_unlock(leaf);
+    free_inode_num(ino);
+
+    // The removed dir's ".." held a link on the parent; drop it (RMW under lock).
+    {
+        irtree_leaf_t* pleaf = inode_lock(parent_ino);
+        if (pleaf) {
+            inode_pub_begin(pleaf);
+            if (pleaf->inode.i_links_count > 0) pleaf->inode.i_links_count--;
+            inode_pub_end(pleaf);
+            inode_writeback(pleaf);
+            inode_unlock(pleaf);
+        }
+    }
+
+    dcache_invalidate(parent_ino, basename, str_len(basename));
+    return 1;
+}
+
 // ── ext2_rename ───────────────────────────────────────────────────────────
 // Move/rename `src` to `dst`.  Returns 1 on success, 0 on failure.
 // If `dst` already exists as a regular file it is removed first.
@@ -3284,15 +3402,40 @@ void ext2_perm_op_selftest(void) {
     cred_t root;
     __builtin_memset(&root, 0, sizeof root);   // euid/egid 0 -> root, passes write+exec
 
+    // Clear any leftovers from a prior boot of the SAME read-write disk so the
+    // test starts from a known-clean state -- these no-op (return 0) if absent.
+    // This is what makes the test reboot-idempotent.
+    ext2_unlink("/__fsperm_a", &root);
+    ext2_unlink("/__fsperm_f", &root);
+    ext2_unlink("/__fsperm_d/c", &root);
+    ext2_unlink("/__fsperm_s", &root);
+    ext2_unlink("/__fsperm_t", &root);
+    ext2_rmdir("/__fsperm_d", &root);
+
     // create -> resolves -> unlink -> gone.
     if (!ext2_create("/__fsperm_a", &root))      fails++;
     if (!path_to_inode("/__fsperm_a"))           fails++;
     if (!ext2_unlink("/__fsperm_a", &root))      fails++;
     if (path_to_inode("/__fsperm_a"))            fails++;
 
-    // mkdir -> resolves (no rmdir primitive; the dir is harmless this boot).
-    if (!ext2_mkdir("/__fsperm_d", &root))       fails++;
+    // mkdir -> resolves.  Tolerant of a leftover /__fsperm_d (mkdir returns 0 if
+    // it already exists): the success condition is "the dir exists afterwards",
+    // so the test stays reboot-safe even if rmdir cleanup ever failed.
+    ext2_mkdir("/__fsperm_d", &root);
     if (!path_to_inode("/__fsperm_d"))           fails++;
+
+    // rmdir negative cases: it must REFUSE a regular file and a non-empty dir.
+    if (!ext2_create("/__fsperm_f", &root))      fails++;
+    if (ext2_rmdir("/__fsperm_f", &root))        fails++;   // not a directory
+    if (!ext2_unlink("/__fsperm_f", &root))      fails++;
+    if (!ext2_create("/__fsperm_d/c", &root))    fails++;
+    if (ext2_rmdir("/__fsperm_d", &root))        fails++;   // non-empty
+    if (!ext2_unlink("/__fsperm_d/c", &root))    fails++;
+
+    // rmdir positive: the now-empty dir is removed and gone (cleans up the
+    // leftover the test used to leak, and exercises the new primitive).
+    if (!ext2_rmdir("/__fsperm_d", &root))       fails++;
+    if (path_to_inode("/__fsperm_d"))            fails++;
 
     // create -> rename a->b -> old gone, new present -> unlink b.
     if (!ext2_create("/__fsperm_s", &root))                fails++;
@@ -3302,7 +3445,7 @@ void ext2_perm_op_selftest(void) {
     if (!ext2_unlink("/__fsperm_t", &root))               fails++;
 
     kprintf_atomic(fails ? "[fs_permop] SELF-TEST FAILED\n"
-                  : "[fs_permop] SELF-TEST PASSED (root create/unlink/mkdir/rename via in-op perm check)\n");
+                  : "[fs_permop] SELF-TEST PASSED (root create/unlink/mkdir/rmdir/rename, empty+negative, reboot-safe)\n");
 }
 
 // Deterministic guard for the ext2_vfs_pread EOF-clamp fix (F150): a pread that
@@ -3329,6 +3472,9 @@ void ext2_pread_eof_selftest(void) {
 
     int fails = 0;
     vfs_file_t* f = NULL;
+    // Clear any leftover from a prior boot of the same disk so the write below
+    // always starts from a clean slate (reboot-idempotent).
+    ext2_unlink("/__pread_eof", &root);
     if (!ext2_write_file("/__pread_eof", wbuf, fsize, &root)) {
         fails++;
     } else {

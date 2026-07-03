@@ -2148,6 +2148,39 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
     return ext2_mkdir(path, &g_current->cred) ? 0 : (uint64_t)-EIO;
 }
 
+// ── sys_rmdir ─────────────────────────────────────────────────────────────
+// rmdir(path_ptr, pathlen) -> 0 or -errno.  Removes an EMPTY directory.
+static uint64_t sys_rmdir(uint64_t path_ptr, uint64_t pathlen) {
+    if (!g_current || pathlen == 0 || pathlen > 255) return (uint64_t)-EINVAL;
+
+    char path[256];
+    const char* upath = (const char*)path_ptr;
+    if (copy_from_user(path, upath, pathlen) != 0) return (uint64_t)-EFAULT;
+    path[pathlen] = '\0';
+    normalize_path(path);
+    if (!unveil_ok(path, UNVEIL_CREATE)) return (uint64_t)-ENOENT;   // sandbox
+
+    // Require write+exec on the parent directory (ext2_rmdir re-checks on the
+    // resolved parent_ino to close the path-TOCTOU, as mkdir/unlink do).
+    char rd_parent[256];
+    if (!path_split(path, rd_parent, sizeof(rd_parent))) return (uint64_t)-ENAMETOOLONG;
+
+    int rd_err = 0;
+    uint32_t rdp_ino = ext2_lookup_path(rd_parent, &g_current->cred, &rd_err);
+    if (!rdp_ino) return rd_err ? (uint64_t)(int64_t)rd_err : (uint64_t)-ENOENT;
+    ext2_inode_t rdp_inode;
+    if (!ext2_read_inode(rdp_ino, &rdp_inode)) return (uint64_t)-ENOENT;
+    inode_perm_t rdp_ip = {
+        .uid = rdp_inode.i_uid, .gid = rdp_inode.i_gid,
+        .mode = rdp_inode.i_mode & 0x1FF,
+        .inode_nr = rdp_ino, .dev = 0, .nosuid = 0,
+    };
+    int rdpr = vfs_check_perm(&rdp_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
+    if (rdpr != 0) return (uint64_t)(int64_t)rdpr;
+
+    return ext2_rmdir(path, &g_current->cred) ? 0 : (uint64_t)-EIO;
+}
+
 // ── sys_dup ───────────────────────────────────────────────────────────────
 // dup(oldfd) → new fd sharing the same file description, or -errno.
 static uint64_t sys_dup(uint64_t oldfd) {
@@ -5775,6 +5808,9 @@ static uint64_t w_sys_chdir(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
 static uint64_t w_sys_mkdir(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)c; (void)d; return sys_mkdir(a, b);
 }
+static uint64_t w_sys_rmdir(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_rmdir(a, b);
+}
 static uint64_t w_sys_lseek(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)d; return sys_lseek(a, b, c);
 }
@@ -6689,6 +6725,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_GETCWD]              = w_sys_getcwd,
     [SYS_CHDIR]               = w_sys_chdir,
     [SYS_MKDIR]               = w_sys_mkdir,
+    [SYS_RMDIR]               = w_sys_rmdir,
     [SYS_LSEEK]               = w_sys_lseek,
     [SYS_GETPPID]             = w_sys_getppid,
     [SYS_DUP]                 = w_sys_dup,

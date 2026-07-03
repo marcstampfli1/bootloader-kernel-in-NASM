@@ -165,6 +165,11 @@ int ext2_mkdir(const char* path, const void* cred);
 // on the resolved parent dir.
 int ext2_unlink(const char* path, const void* cred);
 
+// Remove an EMPTY directory at `path`.  Returns 1 on success, 0 on failure
+// (missing, not a directory, non-empty, or permission denied).  `cred` (a
+// cred_t*) is checked for write+exec on the resolved parent dir.
+int ext2_rmdir(const char* path, const void* cred);
+
 // Rename/move `src` to `dst` (both must be on the same volume).  `cred` (a
 // cred_t*) is checked for write+exec on BOTH resolved parent dirs.
 int ext2_rename(const char* src, const char* dst, const void* cred);
