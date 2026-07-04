@@ -6530,54 +6530,15 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
         ret = (uint64_t)-EFAULT; goto out;
     }
 
-    // ── Drain any pending fds into a single SCM_RIGHTS cmsg ────────
-    // We dequeue up to the userland-sized control buffer.  Any fd
-    // installed here must be closed if we later fault on copyout.
-    uint64_t cmsg_written = 0;
-    uint64_t n_inst = 0;
-    if (mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t)
-        && is_unix_sock(sock)) {
-        uint64_t hdr_pad = K_CMSG_ALIGN(sizeof(k_cmsghdr_t));
-        uint64_t max_fds = (mh.msg_controllen - hdr_pad) / sizeof(int32_t);
-        if (max_fds > SCM_MAX_FD) max_fds = SCM_MAX_FD;
-        while (n_inst < max_fds) {
-            // Non-blocking drain: take only what is already queued.
-            // The blocking recvfd here parked the caller until an fd
-            // ARRIVED -- on a connection that never passes fds, that
-            // is forever, with payload sitting unread.
-            vfs_file_t* rf = unix_sock_recvfd_nb(sock);
-            if (!rf) break;
-            // Allocate inst_fds lazily on the first arriving fd, so the
-            // common no-fd recvmsg never pays for this ~1 KiB buffer.
-            if (!inst_fds) {
-                inst_fds = kmalloc(SCM_MAX_FD * sizeof(int32_t));
-                if (!inst_fds) {
-                    vfs_close(rf); ret = (uint64_t)-ENOMEM; goto out;
-                }
-            }
-            int64_t new_fd = fd_install(rf);
-            if (new_fd < 0) { vfs_close(rf); break; }
-            inst_fds[n_inst++] = (int32_t)new_fd;
-        }
-        if (n_inst) {
-            k_cmsghdr_t ch;
-            ch.cmsg_len   = hdr_pad + n_inst * sizeof(int32_t);
-            ch.cmsg_level = SOL_SOCKET;
-            ch.cmsg_type  = SCM_RIGHTS;
-            if (copy_to_user((void*)mh.msg_control, &ch, sizeof(ch)) != 0
-                || copy_to_user((void*)(mh.msg_control + hdr_pad),
-                                 inst_fds, n_inst * sizeof(int32_t)) != 0) {
-                // Faulted mid-write -> close everything we installed
-                // so the fd table isn't leaked.
-                for (uint64_t i = 0; i < n_inst; i++)
-                    (void)sys_close((uint64_t)(int)inst_fds[i]);
-                ret = (uint64_t)-EFAULT; goto out;
-            }
-            cmsg_written = ch.cmsg_len;
-        }
-    }
-
-    // ── Gather payload into msg_iov ────────────────────────────────
+    // ── Gather payload FIRST ───────────────────────────────────────
+    // Draining fds before the payload let a recvmsg hand back an fd with
+    // ZERO data: sendmsg enqueues each fd one step ahead of its bytes
+    // (fd-before-payload, Linux order), so a reader racing that gap took the
+    // fd but read no data and returned 0.  libwayland reads len==0 as an
+    // orderly close and tore foot's Wayland socket down ("Broken pipe" on the
+    // keymap fd sway hands every keyboard client).  Read the data first; fds
+    // are then delivered only alongside the bytes they ride with, and a
+    // no-data poll returns EAGAIN with the fds left queued for later.
     uint64_t total = 0;
     for (uint64_t i = 0; i < mh.msg_iovlen; i++) {
         k_iovec_t iv;
@@ -6598,14 +6559,12 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
                     ? unix_sock_recv_ex(sock, bounce, chunk, nonblock)
                     : (int)sock->read(sock, bounce, chunk);
             if (r < 0) {
-                // First read returning an error propagates; a later
-                // partial read returns bytes already gathered.  A
-                // drained SCM_RIGHTS cmsg counts as progress -- return
-                // it with 0 payload rather than erroring it away.
-                if (total == 0 && n_inst == 0) { ret = (uint64_t)(int64_t)r; goto out; }
-                goto done_gather;
+                // No bytes yet: propagate EAGAIN/error and leave any queued
+                // fds untouched for a later call that also carries their data.
+                if (total == 0) { ret = (uint64_t)(int64_t)r; goto out; }
+                goto done_gather;   // partial gather already made progress
             }
-            if (r == 0) goto done_gather;
+            if (r == 0) goto done_gather;   // orderly EOF
             if (copy_to_user((void*)(iv.iov_base + done), bounce,
                               (uint64_t)r) != 0) {
                 ret = (uint64_t)-EFAULT; goto out;
@@ -6615,7 +6574,50 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
             if ((uint64_t)r < chunk) goto done_gather;
         }
     }
-done_gather:
+done_gather:;
+    // ── Drain pending fds into a single SCM_RIGHTS cmsg ─────────────
+    // ONLY when we are returning payload: an fd handed back with 0 bytes
+    // reads as EOF to libwayland (see above).  Over-draining an fd whose
+    // message's bytes arrive in a later recvmsg is fine -- fds ride a FIFO
+    // and libwayland pops them per fd-bearing message in order.  Any fd
+    // installed here must be closed if we later fault on copyout.
+    uint64_t cmsg_written = 0;
+    uint64_t n_inst = 0;
+    if (total > 0 && mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t)
+        && is_unix_sock(sock)) {
+        uint64_t hdr_pad = K_CMSG_ALIGN(sizeof(k_cmsghdr_t));
+        uint64_t max_fds = (mh.msg_controllen - hdr_pad) / sizeof(int32_t);
+        if (max_fds > SCM_MAX_FD) max_fds = SCM_MAX_FD;
+        while (n_inst < max_fds) {
+            // Non-blocking drain: take only what is already queued.
+            vfs_file_t* rf = unix_sock_recvfd_nb(sock);
+            if (!rf) break;
+            if (!inst_fds) {
+                inst_fds = kmalloc(SCM_MAX_FD * sizeof(int32_t));
+                if (!inst_fds) {
+                    vfs_close(rf); ret = (uint64_t)-ENOMEM; goto out;
+                }
+            }
+            int64_t new_fd = fd_install(rf);
+            if (new_fd < 0) { vfs_close(rf); break; }
+            inst_fds[n_inst++] = (int32_t)new_fd;
+        }
+        if (n_inst) {
+            k_cmsghdr_t ch;
+            ch.cmsg_len   = hdr_pad + n_inst * sizeof(int32_t);
+            ch.cmsg_level = SOL_SOCKET;
+            ch.cmsg_type  = SCM_RIGHTS;
+            if (copy_to_user((void*)mh.msg_control, &ch, sizeof(ch)) != 0
+                || copy_to_user((void*)(mh.msg_control + hdr_pad),
+                                 inst_fds, n_inst * sizeof(int32_t)) != 0) {
+                for (uint64_t i = 0; i < n_inst; i++)
+                    (void)sys_close((uint64_t)(int)inst_fds[i]);
+                ret = (uint64_t)-EFAULT; goto out;
+            }
+            cmsg_written = ch.cmsg_len;
+        }
+    }
+
     // Write back msg_controllen so caller knows how much we used.
     mh.msg_controllen = cmsg_written;
     mh.msg_flags      = 0;
