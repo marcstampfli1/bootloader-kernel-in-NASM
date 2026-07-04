@@ -34,8 +34,11 @@
 #include "assert.h"
 
 /* Per-subsystem debug gate.  Keep at 1 while diagnosing wlroots DRM
- * path; flip to 0 once the pipeline is stable.  See DEBUGGING.md §2.3. */
-#define CONFIG_DEBUG_DRM 1
+ * path; flip to 0 once the pipeline is stable.  See DEBUGGING.md §2.3.
+ * Off in normal builds: at 1 it logs two serial lines PER cursor move /
+ * page flip, and every serial byte is an inb/outb VM-exit, so the ~80
+ * exits/move throttled the hardware cursor into visible lag/teleporting. */
+#define CONFIG_DEBUG_DRM 0
 
 #if CONFIG_DEBUG_DRM
 #define drm_dbg(fmt, ...) pr_debug("drm", fmt, ##__VA_ARGS__)
