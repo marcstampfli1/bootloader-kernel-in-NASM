@@ -1779,7 +1779,14 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     }
     raw[pathlen] = '\0';
 
-    resolve_at_path(path, sizeof(path), g_current ? g_current->cwd : "/", raw);
+    // resolve_at_path's bound is the DESTINATION buffer's byte size.  `path` is
+    // a kmalloc'd pointer here, so sizeof(path) is 8 (a pointer), NOT the 512
+    // the buffer was allocated with -- that truncated every resolved path to 7
+    // bytes, so any readdir on a path longer than that (e.g. fontconfig
+    // scanning /usr/share/fonts/truetype/dejavu -> "/usr/sh") hit a bogus dir
+    // and returned nothing: ports found zero fonts and rendered tofu.  Pass the
+    // real allocation size.  (The stack-array callers correctly get sizeof.)
+    resolve_at_path(path, 512, g_current ? g_current->cwd : "/", raw);
     kfree(raw);
 
     ext2_entry_t* kbuf = kmalloc(max_entries * sizeof(ext2_entry_t));
