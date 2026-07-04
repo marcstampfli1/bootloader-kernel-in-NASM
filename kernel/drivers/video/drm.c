@@ -854,16 +854,23 @@ static int drm_commit_apply(const drm_commit_t* commit) {
 
     for (uint32_t i = 0; i < commit->n; i++) {
         const drm_commit_entry_t* e = &commit->entries[i];
+        // Transfer the guest content into the host resource BEFORE pointing the
+        // scanout at it.  With SET_SCANOUT first, a page flip to a new buffer
+        // exposed that buffer's stale host content on the next QEMU refresh (a
+        // brief flicker).  transfer -> set-scanout -> flush means the resource
+        // is already fresh the instant the display starts scanning it out.
+        if (e->resource_id) {
+            if (b->resource_transfer(e->resource_id, e->w, e->h) != 0) {
+                pr_err("drm", "commit: resource_transfer(res=%u) failed", e->resource_id);
+                goto rollback;
+            }
+        }
         if (b->scanout_set(e->scanout, e->resource_id, e->w, e->h) != 0) {
             pr_err("drm", "commit: backend scanout_set(sc=%u res=%u) failed",
                    e->scanout, e->resource_id);
             goto rollback;
         }
         if (e->resource_id) {
-            if (b->resource_transfer(e->resource_id, e->w, e->h) != 0) {
-                pr_err("drm", "commit: resource_transfer(res=%u) failed", e->resource_id);
-                goto rollback;
-            }
             if (b->resource_flush   (e->resource_id, e->w, e->h) != 0) {
                 pr_err("drm", "commit: resource_flush(res=%u) failed", e->resource_id);
                 goto rollback;
