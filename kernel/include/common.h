@@ -157,6 +157,14 @@ static inline void serial_hex_dbg(uint64_t v)      { (void)v; }
 #define PAGE_SIZE  (1ULL << PAGE_SHIFT)
 #define PAGE_MASK  (PAGE_SIZE - 1)
 
+// Upper bound on the number of CPUs the kernel is compiled to support.  Per-CPU
+// arrays (g_cpus[], the per-CPU GDT/TSS slots) are sized to this; raising it
+// only costs BSS.  Lives here, in the universal leaf header, so cpu.h and
+// tss.h can size their tables without pulling in smp.h -- which, now that
+// spin_lock disables preemption, includes preempt.h -> cpu.h and would form a
+// cycle back through tss.h.
+#define MAX_CPUS 64
+
 // Round a byte address up / down to the nearest PAGE_SIZE boundary.  64-bit,
 // pow2 PAGE_SIZE.  One source of truth for the mm allocators (pmm + kheap each
 // hand-rolled an identical copy).

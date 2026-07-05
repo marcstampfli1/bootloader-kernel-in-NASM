@@ -1,6 +1,8 @@
 #pragma once
 #include "common.h"
-#include "smp.h"
+#include "spinlock_types.h"   // spinlock_t for cpu_t::rq_lock -- NOT smp.h, which
+                              // (once spin_lock disables preemption) includes
+                              // preempt.h -> cpu.h and would form a cycle.
 #include "tss.h"
 
 // MLFQ levels — must match sched.c.  Kept as a compile-time constant
