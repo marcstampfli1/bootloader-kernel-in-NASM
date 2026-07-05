@@ -951,8 +951,14 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # status pipe) — fixed in kernel/fs/pipe.c, so a live text status is safe.
     # The explicit `font pango:DejaVu Sans Mono` below avoids the unreliable
     # generic "monospace" fontconfig match (which renders the bar text as tofu).
-    sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* — disabled on MakaOS (no glob in wordexp yet)|' \
+    # Also bind Alt+Return (Mod1) to the terminal, in addition to the default
+    # Super+Return.  When MakaOS runs in a window under a host desktop, the host
+    # WM globally grabs the Super/Windows key for its own launcher, so it never
+    # reaches the guest and $mod+Return silently does nothing.  Alt is not
+    # grabbed that way, so Alt+Return always reaches sway.  Both bindings coexist.
+    sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* -- disabled on MakaOS (no glob in wordexp yet)|' \
         -e 's|^output \* bg .*|output * bg /usr/share/backgrounds/sway/wallpaper.png fill|' \
+        -e '/bindsym .mod+Return exec .term/a\    bindsym Mod1+Return exec $term' \
         -e 's|^set \$menu .*|set $menu swaymsg exec -- $(ls /bin \| tofi --font /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf)|' \
         -e 's|^[[:space:]]*status_command .*|    status_command /bin/makaclock|' \
         -e 's|^[[:space:]]*font .*|    font pango:DejaVu Sans Mono 11|' \
