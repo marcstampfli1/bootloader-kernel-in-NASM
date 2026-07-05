@@ -407,6 +407,17 @@ int hda_write(const void* buf, uint32_t len) {
     return (int)done;
 }
 
+// Non-blocking writability test for poll().  Ready when the FIFO can absorb
+// a half-FIFO write in one shot (the default SDL playback buffer is one
+// half-FIFO, 4 KiB, so its PlayDevice write() never blocks under the audio
+// device lock).  A larger app-chosen buffer still works -- hda_write() just
+// blocks for the tail -- but the common path is block-free.  fifo_free() is a
+// plain read of the two ring indices; safe to call lockless from poll.
+int hda_poll_writable(void) {
+    if (!s_ok) return 0;
+    return fifo_free() >= (FIFO_BYTES / 2u);
+}
+
 // ── Initialisation ────────────────────────────────────────────────────────
 
 int hda_init(void) {

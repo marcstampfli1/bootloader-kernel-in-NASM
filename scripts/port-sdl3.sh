@@ -121,6 +121,7 @@ configure() {
         -DSDL_DUMMYVIDEO=ON \
         -DSDL_OFFSCREEN=ON \
         -DSDL_AUDIO=ON \
+        -DSDL_MAKAOSAUDIO=ON \
         -DSDL_DUMMYAUDIO=ON \
         -DSDL_DISKAUDIO=ON \
         -DSDL_ALSA=OFF \
@@ -211,10 +212,84 @@ if 'shm_framebuffer' not in w:
 PYEOF
 }
 
+# MakaOS: SDL3 3.2.0 ships no audio backend that targets MakaOS -- the only
+# portable ones built here are dummy (silent) and disk (to a file); OSS/ALSA/
+# Pulse are all absent.  Install a native backend that drives /dev/dsp (the
+# kernel Intel HDA node) and wire it into the build + the bootstrap probe list
+# AHEAD of disk/dummy so SDL selects it automatically.  Idempotent (every edit
+# is guarded by a marker).
+patch_sdl_audio() {
+    local dst="$SRC_DIR/src/audio/makaos"
+    log "installing native /dev/dsp audio backend into the audio subsystem"
+    mkdir -p "$dst"
+    cp "$REPO_ROOT/scripts/sdl3-makaos-audio/SDL_makaosaudio.c" "$dst/"
+    cp "$REPO_ROOT/scripts/sdl3-makaos-audio/SDL_makaosaudio.h" "$dst/"
+    python3 - "$SRC_DIR" <<'PYEOF'
+import sys, os
+root = sys.argv[1]
+
+def patch(rel, needle, find, repl):
+    p = os.path.join(root, rel)
+    s = open(p).read()
+    if needle in s:
+        return
+    assert find in s, "%s: anchor not found -- SDL layout changed" % rel
+    s = s.replace(find, repl, 1)
+    assert needle in s, "%s: patch did not apply" % rel
+    open(p, 'w').write(s)
+
+# 1. bootstrap[] probe array -- MakaOS before disk/dummy so it wins auto-probe.
+patch('src/audio/SDL_audio.c', 'MAKAOSAUDIO_bootstrap',
+      '#ifdef SDL_AUDIO_DRIVER_DISK\n    &DISKAUDIO_bootstrap,',
+      '#ifdef SDL_AUDIO_DRIVER_MAKAOS\n    &MAKAOSAUDIO_bootstrap,\n#endif\n'
+      '#ifdef SDL_AUDIO_DRIVER_DISK\n    &DISKAUDIO_bootstrap,')
+
+# 2. extern bootstrap declaration.
+patch('src/audio/SDL_sysaudio.h', 'MAKAOSAUDIO_bootstrap',
+      'extern AudioBootStrap DISKAUDIO_bootstrap;',
+      'extern AudioBootStrap MAKAOSAUDIO_bootstrap;\n'
+      'extern AudioBootStrap DISKAUDIO_bootstrap;')
+
+# 3a. CMake option.
+patch('CMakeLists.txt', 'SDL_MAKAOSAUDIO',
+      'dep_option(SDL_DISKAUDIO           "Support the disk writer audio driver" ON "SDL_AUDIO" OFF)',
+      'dep_option(SDL_MAKAOSAUDIO         "Support the MakaOS native (/dev/dsp) audio driver" ON "SDL_AUDIO" OFF)\n'
+      'dep_option(SDL_DISKAUDIO           "Support the disk writer audio driver" ON "SDL_AUDIO" OFF)')
+
+# 3b. CMake option -> config define + source glob.
+patch('CMakeLists.txt', 'SDL_AUDIO_DRIVER_MAKAOS 1',
+      '  if(SDL_DISKAUDIO)\n'
+      '    set(SDL_AUDIO_DRIVER_DISK 1)\n'
+      '    sdl_glob_sources("${SDL3_SOURCE_DIR}/src/audio/disk/*.c")\n'
+      '    set(HAVE_DISKAUDIO TRUE)\n'
+      '    set(HAVE_SDL_AUDIO TRUE)\n'
+      '  endif()',
+      '  if(SDL_MAKAOSAUDIO)\n'
+      '    set(SDL_AUDIO_DRIVER_MAKAOS 1)\n'
+      '    sdl_glob_sources("${SDL3_SOURCE_DIR}/src/audio/makaos/*.c")\n'
+      '    set(HAVE_MAKAOSAUDIO TRUE)\n'
+      '    set(HAVE_SDL_AUDIO TRUE)\n'
+      '  endif()\n'
+      '  if(SDL_DISKAUDIO)\n'
+      '    set(SDL_AUDIO_DRIVER_DISK 1)\n'
+      '    sdl_glob_sources("${SDL3_SOURCE_DIR}/src/audio/disk/*.c")\n'
+      '    set(HAVE_DISKAUDIO TRUE)\n'
+      '    set(HAVE_SDL_AUDIO TRUE)\n'
+      '  endif()')
+
+# 4. config header substitution (#cmakedefine -> #define when the var is set).
+patch('include/build_config/SDL_build_config.h.cmake', 'SDL_AUDIO_DRIVER_MAKAOS',
+      '#cmakedefine SDL_AUDIO_DRIVER_DISK 1',
+      '#cmakedefine SDL_AUDIO_DRIVER_MAKAOS 1\n'
+      '#cmakedefine SDL_AUDIO_DRIVER_DISK 1')
+PYEOF
+}
+
 main() {
     fetch
     patch_sdl
     patch_sdl_framebuffer
+    patch_sdl_audio
     configure
     build_install
 }

@@ -382,6 +382,23 @@ if [ -f "$SYSROOT/usr/lib/libSDL3.a" ]; then
         -o "$BUILD_DIR/user_sdl3_hello.elf"
 fi
 
+# ── sdl3_audio -- end-to-end SDL3 audio smoke test (native /dev/dsp backend) ──
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ]; then
+    "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+        -I "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/sdl3_audio/sdl3_audio.c" \
+        -o "$BUILD_DIR/user_sdl3_audio.o"
+    "$USER_CC" "${USER_CFLAGS[@]}" --sysroot="$SYSROOT" \
+        -nostartfiles -Wl,--build-id=none \
+        "$SYSROOT/usr/lib/crt0.o" \
+        "$BUILD_DIR/user_sdl3_audio.o" \
+        -Wl,--start-group \
+        -lSDL3 -lwayland-client -lwayland-cursor -lxkbcommon -lffi \
+        -lc -lm -lrt -lpthread -ldl \
+        -Wl,--end-group \
+        -o "$BUILD_DIR/user_sdl3_audio.elf"
+fi
+
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/shell" -c "$USERLAND_DIR/apps/shell/shell.c" -o "$BUILD_DIR/user_shell.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_shell.o" \
    -o "$BUILD_DIR/user_shell.elf"
@@ -822,6 +839,10 @@ fi
 if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello
     echo "[+] sdl3_hello ELF installed at bin/sdl3_hello (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_sdl3_audio.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_audio.elf" bin/sdl3_audio
+    echo "[+] sdl3_audio ELF installed at bin/sdl3_audio (root:root 0755)"
 fi
 if [ -f "$BUILD_DIR/user_shell.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_shell.elf" bin/shell

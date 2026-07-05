@@ -3,6 +3,8 @@
 #include "evdev.h"
 #include "mouse.h"
 #include "hda.h"
+#include "irq_wait.h"   // irq_waitq() -- the HDA IRQ slot backs /dev/dsp poll
+#include "syscall.h"    // POLLOUT for dsp_poll
 #include "common.h"
 #include "fb.h"
 #include "kheap.h"
@@ -150,11 +152,29 @@ static int64_t dsp_write(vfs_file_t* self, const void* buf, uint64_t len) {
     return (int64_t)hda_write(buf, (uint32_t)len);
 }
 
+// Write-only PCM device: report POLLOUT when the FIFO has room for a normal
+// playback buffer, so an SDL/OSS-style audio thread can block in poll()
+// (outside its device lock) instead of blocking inside write().  Never
+// readable, never a hangup.
+static int dsp_poll(vfs_file_t* self, int events) {
+    (void)self;
+    if (events & POLLOUT) return hda_poll_writable();
+    return 0;
+}
+
 vfs_file_t* vfs_dsp_open(void) {
     vfs_file_t* f = vfs_alloc_file();
     if (!f) return NULL;
     f->write = dsp_write;
     f->close = generic_close;
+    f->poll  = dsp_poll;
+    // Hang poll/epoll waiters on the HDA IRQ slot: the DMA-completion ISR
+    // drains that queue (via irq_notify) exactly as it frees FIFO space, so
+    // a POLLOUT waiter is re-checked at precisely the right moment with no
+    // second wake site.  g_hda_irq is 0xFF until hda_init succeeds; the
+    // matching slot is simply never woken then, and hda_poll_writable()
+    // returns 0, so a device with no HDA never falsely reports writable.
+    f->secondary_waitq = irq_waitq(g_hda_irq);
     return f;
 }
 
