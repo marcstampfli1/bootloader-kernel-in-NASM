@@ -17,6 +17,8 @@
 #include "uaccess.h" // copy_from_user / copy_to_user (shared decls)
 #include "sched.h"
 #include "process.h"
+#include "preempt.h"   // preempt_disable/enable -- input_device_emit must hold
+                       // d->lock non-preemptibly (see the comment there)
 #include "signal.h"
 #include "tsc.h"
 #include "common.h"
@@ -165,9 +167,23 @@ void input_device_emit(input_device_t* d,
     // Fan out to every non-grabbed client, OR only to the grabber.  Hold the
     // device lock (IRQ-safe) across the whole walk so a concurrent close()
     // cannot unlink+free a client while we push into / wake it, and so the
-    // ring head/tail update cannot race a reader's drain.  The wakes do not
-    // sleep and the lock order (d->lock -> rq/waitq locks) is acyclic, so it is
-    // safe to wake under the lock (no snapshot array needed for the fan-out).
+    // ring head/tail update cannot race a reader's drain.
+    //
+    // preempt_disable() around the locked section is MANDATORY: the wakes below
+    // go through wait_queue_wake_all, which brackets its walk in
+    // rcu_read_lock()/rcu_read_unlock() (== preempt_disable()/preempt_enable()),
+    // and sched_wake() sets this CPU's reschedule_pending.  spin_lock_irqsave
+    // masks IRQs but does NOT raise preempt_depth, so without this the nested
+    // rcu_read_unlock's preempt_enable() would see depth hit 0 and run
+    // sched_preempt() -- context-switching this producer thread away WHILE it
+    // still holds d->lock.  The lock then leaks (the descheduled holder never
+    // reaches the unlock below), and any reader -- e.g. sway's evdev read --
+    // dead-spins acquiring d->lock forever, wedging the whole compositor (foot
+    // never gets accepted, nothing renders).  Keeping preempt_depth >= 1 for
+    // the whole section defers the switch until after the unlock, when the lock
+    // is free.  (A spinlock section must always be non-preemptible; this is the
+    // one producer path that both holds a lock and drives the scheduler.)
+    preempt_disable();
     uint64_t flags = spin_lock_irqsave(&d->lock);
     evdev_client_t* grabber = NULL;
     if (d->grabbed) {
@@ -189,6 +205,8 @@ void input_device_emit(input_device_t* d,
         }
     }
     spin_unlock_irqrestore(&d->lock, flags);
+    preempt_enable();   // deferred resched (from the wakes above) fires here,
+                        // now that d->lock is released -- switching is safe.
 }
 
 // ── Keyboard bridge from input_core ──────────────────────────────────────
