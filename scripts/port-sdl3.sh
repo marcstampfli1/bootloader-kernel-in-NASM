@@ -163,9 +163,58 @@ build_install() {
     fi
 }
 
+# MakaOS: SDL3 3.2.0's Wayland backend implements no CreateWindowFramebuffer, so
+# SDL_GetWindowSurface() -- and thus the software SDL_Renderer -- only works
+# through the generic texture fallback, which needs a GPU render driver.  With
+# no GL/GLES/Vulkan there is then no software path at all and SDL_CreateRenderer
+# fails ("Couldn't find matching render driver").  Install a native wl_shm
+# software framebuffer and wire it into the Wayland video device so software
+# rendering works with no GPU.  Idempotent (safe to re-run; markers guard it).
+patch_sdl_framebuffer() {
+    local wl="$SRC_DIR/src/video/wayland"
+    log "installing wl_shm software framebuffer into the Wayland backend"
+    cp "$REPO_ROOT/scripts/sdl3-wayland-framebuffer/SDL_waylandframebuffer.c" "$wl/"
+    cp "$REPO_ROOT/scripts/sdl3-wayland-framebuffer/SDL_waylandframebuffer.h" "$wl/"
+    python3 - "$wl/SDL_waylandvideo.c" "$wl/SDL_waylandwindow.h" <<'PYEOF'
+import sys
+video, window = sys.argv[1], sys.argv[2]
+
+s = open(video).read()
+if 'SDL_waylandframebuffer.h' not in s:
+    s = s.replace('#include "SDL_waylandclipboard.h"\n',
+                  '#include "SDL_waylandclipboard.h"\n#include "SDL_waylandframebuffer.h"\n', 1)
+if 'Wayland_CreateWindowFramebuffer' not in s:
+    s = s.replace(
+        '    device->CreateSDLWindow = Wayland_CreateWindow;\n',
+        '    device->CreateSDLWindow = Wayland_CreateWindow;\n'
+        '    // MakaOS: native wl_shm software framebuffer (SDL_waylandframebuffer.c)\n'
+        '    device->CreateWindowFramebuffer = Wayland_CreateWindowFramebuffer;\n'
+        '    device->UpdateWindowFramebuffer = Wayland_UpdateWindowFramebuffer;\n'
+        '    device->DestroyWindowFramebuffer = Wayland_DestroyWindowFramebuffer;\n', 1)
+open(video, 'w').write(s)
+
+w = open(window).read()
+if 'shm_framebuffer' not in w:
+    w = w.replace(
+        'struct SDL_WindowData\n{\n'
+        '    SDL_Window *sdlwindow;\n'
+        '    SDL_VideoData *waylandData;\n'
+        '    struct wl_surface *surface;\n',
+        'struct Wayland_SHMBuffer;   // MakaOS: wl_shm software framebuffer\n\n'
+        'struct SDL_WindowData\n{\n'
+        '    SDL_Window *sdlwindow;\n'
+        '    SDL_VideoData *waylandData;\n'
+        '    struct wl_surface *surface;\n'
+        '    struct Wayland_SHMBuffer *shm_framebuffer;   // MakaOS: non-NULL when software-rendered\n', 1)
+    assert 'shm_framebuffer' in w, "SDL_WindowData head not matched -- SDL layout changed"
+    open(window, 'w').write(w)
+PYEOF
+}
+
 main() {
     fetch
     patch_sdl
+    patch_sdl_framebuffer
     configure
     build_install
 }
