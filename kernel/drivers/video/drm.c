@@ -1200,10 +1200,20 @@ static int drm_ioctl_version(uint64_t arg) {
     static const char name[] = "virtio_gpu";
     static const char date[] = "20260420";
     static const char desc[] = "MakaOS virtio-gpu DRM layer";
-    // Match the real virtio-gpu DRM driver: 0.1.0.  Mesa's virgl winsys
-    // (virgl_drm_get_version) REJECTS any version_major != 0, so this must be 0.
+    // Report 0.0.0.  Mesa's virgl winsys (virgl_drm_get_version) REJECTS any
+    // version_major != 0, so major must be 0.  The MINOR is the fence-FD
+    // capability signal: real virtio_gpu bumped it to 0.1 when it added
+    // EXECBUF sync_file fence FDs, and Mesa keys supports_fences off
+    // (minor >= 1).  We do NOT implement sync_file FDs -- EXECBUFFER returns
+    // fence_fd = -1 -- so advertising minor 1 makes Mesa take the fence-FD
+    // path and glFinish blocks forever in sync_wait(poll(fd=-1, -1)).  Our
+    // submit is fully SYNCHRONOUS (vgpu_send_ctrl polls the used ring to
+    // completion), so the GPU work is already done when EXECBUFFER returns and
+    // there is nothing to async-wait on.  Reporting minor 0 is the truthful
+    // capability level and routes glFinish through the legacy resource-wait
+    // path (DRM_IOCTL_VIRTGPU_WAIT), which our synchronous submit supports.
     v.version_major     = 0;
-    v.version_minor     = 1;
+    v.version_minor     = 0;
     v.version_patchlevel = 0;
 
     // name_len / date_len / desc_len are in (caller's buffer size) and out
@@ -2687,7 +2697,13 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
     drm_virtgpu_resource_create_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
     if (!virtio_gpu_3d_available()) return -ENODEV;
-    if (a.width == 0 || a.height == 0 || a.width > 16384 || a.height > 16384) return -EINVAL;
+    // A PIPE_BUFFER (target 0) uses `width` as a byte size, so the 16384
+    // texture-dimension limit does not apply to it -- Mesa's virgl creates
+    // multi-MB vertex/constant buffers.  The size cap below is the real memory
+    // guard for every resource type.
+    if (a.width == 0) return -EINVAL;
+    if (a.target != 0 && (a.height == 0 || a.width > 16384 || a.height > 16384))
+        return -EINVAL;
 
     int rc = drm_virgl_ensure_ctx(c, 0);   // default virgl context if not inited
     if (rc != 0) return rc;
@@ -2775,7 +2791,9 @@ static int drm_ioctl_virtgpu_execbuffer(vfs_file_t* f, uint64_t arg) {
     drm_virtgpu_execbuffer_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
     if (!c->virgl_ctx_id) return -EINVAL;                       // context first
-    if (a.size == 0 || (a.size & 3u) || a.size > 4096u) return -EINVAL;
+    // 64 KiB matches the virtio-gpu control request window; virtio_gpu_3d_submit
+    // enforces the exact device limit.  virgl command streams are multi-KiB.
+    if (a.size == 0 || (a.size & 3u) || a.size > 65536u) return -EINVAL;
     void* cmds = kmalloc(a.size);
     if (!cmds) return -ENOMEM;
     if (copy_from_user(cmds, (void*)a.command, a.size) != 0) { kfree(cmds); return -EFAULT; }
