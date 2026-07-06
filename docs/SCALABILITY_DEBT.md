@@ -436,3 +436,31 @@ advance + publish sq_head), release the lock, then dispatch the copy outside it;
 the IO_LINK chain logic must claim the whole chain under the lock.  Deferred to
 keep F105 surgical on the boot-critical io_uring path; the memory-safety bugs
 are fully closed.
+
+---
+
+## DRM: GEM handles are monotonic (never recycled), so the res3d array can grow with churn
+
+Phase 2c unified each drm_file's GEM handle namespace onto one c->next_handle
+counter (dumb + res3d) so a handle names exactly one object.  The counter is
+monotonic: a create-then-destroy cycle never reuses a handle number.  Two
+consequences, both bounded and neither a correctness bug:
+
+1. find_res3d indexes an array by handle-1.  Because res3d handles now interleave
+   with dumb handles (a render fd that PRIME-imports N dumbs then makes a res3d
+   gets a res3d handle ~N), the array can be sparser than the live res3d count --
+   res3d_cap tracks the max res3d HANDLE, not the live count.  For real workloads
+   (Mesa render fd: mostly res3d + a handful of PRIME imports; compositor card
+   fd: mostly dumbs + ~0 res3d) this is a few KB at most.
+
+2. A long-lived fd that churns many res3d over its lifetime grows res3d_cap
+   without bound (handles keep climbing).  This predates 2c -- the old
+   next_res3d_handle was already monotonic.
+
+The scalable fix is Linux's model: a single per-fd handle allocator with
+recycling (idr / small hash keyed by handle) mapping handle -> {type, object},
+replacing BOTH the dumb linked list and the res3d array.  Recycling needs a
+generation tag to keep a stale userspace handle from aliasing a new object.
+Deferred: handles are per-fd and bounded by that fd's lifetime allocation count;
+no real client hits this, and the O(1) res3d lookup + unified-namespace
+correctness are both preserved today.

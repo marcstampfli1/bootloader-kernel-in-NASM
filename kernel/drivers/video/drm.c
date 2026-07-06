@@ -457,7 +457,14 @@ typedef struct drm_res3d {
 typedef struct drm_client {
     drm_dumb_t* dumbs;
     drm_fb_t*   fbs;
-    uint32_t    next_dumb_handle;      // starts at 1
+    // ONE GEM handle namespace per fd (Linux's model): a handle names exactly
+    // one object -- a dumb OR a res3d, never both -- so find_dumb and find_res3d
+    // can never both match it.  Two independent counters used to hand out the
+    // same small values to both, which collided the moment a render fd owned
+    // both a res3d and a PRIME-imported dumb (they share the mmap offset space
+    // and the ioctl handle argument).  One monotonic counter makes that
+    // unrepresentable.  Monotonic (never recycled) -- see SCALABILITY_DEBT.
+    uint32_t    next_handle;           // starts at 1
     uint32_t    next_fb_id;            // starts at 1
     // Event ring (byte buffer).  head/tail are unbounded counters;
     // (tail - head) is live bytes.  Wrap with DRM_EVQ_MASK.
@@ -468,7 +475,6 @@ typedef struct drm_client {
     uint32_t     virgl_ctx_id;         // device-global 3D context; 0 = uninit
     drm_res3d_t* res3d;                // O(1) handle-indexed array (grows)
     uint32_t     res3d_cap;            // allocated slot count
-    uint32_t     next_res3d_handle;    // dense, starts at 1
 } drm_client_t;
 
 // Device-global resource id allocator.  Never returns 0 (reserved).
@@ -518,10 +524,17 @@ static drm_res3d_t* find_res3d(drm_client_t* c, uint32_t handle) {
 }
 
 // Free one 3D bo: unref the device resource + release backing pages + clear slot.
+// Pages are released via per-page pmm_ref_dec (NOT pmm_buddy_free): a PRIME
+// export / import shares these pages and holds its own per-page refs, so a
+// block free here would pull them out from under a live dma-buf.  The buddy
+// allocator stamps rc=1 at alloc, so ref_dec frees only when the last holder
+// (this bo + every dma-buf/import) has let go.
 static void res3d_free(drm_res3d_t* r) {
     if (!r || r->handle == 0) return;
-    virtio_gpu_resource_unref(r->res_id);
-    if (r->phys) pmm_buddy_free(r->phys, r->order);
+    if (r->res_id) virtio_gpu_resource_unref(r->res_id);
+    if (r->phys)
+        for (uint32_t i = 0; i < r->bytes / 4096u; i++)
+            pmm_ref_dec(r->phys + (phys_addr_t)i * 4096u);
     __builtin_memset(r, 0, sizeof(*r));   // handle=0 marks the slot free
 }
 
@@ -642,7 +655,7 @@ static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
         return -ENOMEM;
     }
     drm_client_t* c = client_of(f);
-    d->handle      = c->next_dumb_handle++;
+    d->handle      = c->next_handle++;
     d->width       = a.width;
     d->height      = a.height;
     d->pitch       = pitch;
@@ -1158,8 +1171,8 @@ int64_t drm_resolve_dumb_mmap(vfs_file_t* f, uint64_t offset,
         *out_phys = d->phys; *out_bytes = d->bytes_alloc;
         return 0;
     }
-    // Render-node (renderD128) 3D resource backing shares the same offset
-    // scheme; a render fd has no dumbs so the handle resolves here instead.
+    // Not a dumb: try res3d.  dumb and res3d handles come from one namespace
+    // (c->next_handle), so a handle names exactly one -- no ambiguity here.
     drm_res3d_t* r = find_res3d(c, handle);
     if (r) {
         if (len > r->bytes) return -EINVAL;
@@ -1470,13 +1483,26 @@ static int drm_ioctl_gem_close(vfs_file_t* self, uint64_t arg) {
 // is recovered.  The dmabuf fd does NOT keep the underlying buffer alive
 // — lifetime is managed by the DRM client's GEM handle table, matching
 // Linux semantics where handle + PRIME fd are independent refs.
+// A real dma-buf: a STANDALONE, refcounted view of a buffer's backing pages.
+// Unlike the old shim (a back-ref to the exporter's GEM handle), the fd OWNS a
+// reference on every backing page, so the buffer stays alive after the exporter
+// closes its handle -- true Linux dma-buf semantics.  Works for both dumb (2D)
+// and res3d (render-node/virgl) buffers, so a GPU-rendered buffer can be shared
+// to the scanout path (Phase 2c, docs/VIRGL_BRINGUP.md).
 typedef struct {
-    drm_client_t* owner;   // back-ref to the DRM client that exported us
-    uint32_t      handle;
-} drm_prime_ctx_t;
+    phys_addr_t phys;      // backing pages -- this fd holds a per-page ref
+    uint32_t    bytes;     // page-rounded allocation
+    uint8_t     order;
+    uint32_t    width, height, format;
+} drm_dmabuf_t;
 
 static void drm_prime_close(vfs_file_t* self) {
-    if (self->ctx) kfree(self->ctx);
+    drm_dmabuf_t* db = (drm_dmabuf_t*)self->ctx;
+    if (db) {
+        for (uint32_t i = 0; i < db->bytes / 4096u; i++)
+            pmm_ref_dec(db->phys + (phys_addr_t)i * 4096u);
+        kfree(db);
+    }
     kfree(self);
 }
 
@@ -1510,35 +1536,61 @@ static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
 
     drm_client_t* c = client_of(drm_f);
-    if (!find_dumb(c, a.handle)) return -ENOENT;
+    // Export a dumb (2D) OR a res3d (render-node/virgl) buffer.
+    phys_addr_t phys; uint32_t bytes, w, h, fmt; uint8_t order;
+    drm_dumb_t* d = find_dumb(c, a.handle);
+    if (d) {
+        phys = d->phys; bytes = d->bytes_alloc; order = d->order;
+        w = d->width; h = d->height; fmt = 0;
+    } else {
+        drm_res3d_t* r = find_res3d(c, a.handle);
+        if (!r) return -ENOENT;
+        phys = r->phys; bytes = r->bytes; order = r->order;
+        w = r->width; h = r->height; fmt = r->format;
+    }
 
-    // Allocate the PRIME vfs_file_t.
     vfs_file_t* pf = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!pf) return -ENOMEM;
     pf->close  = drm_prime_close;
     pf->rights = 0xFFFFFFFFu;   // non-default: DRM PRIME fd carries all rights
 
-    drm_prime_ctx_t* pc = (drm_prime_ctx_t*)kmalloc(sizeof(*pc));
-    if (!pc) { kfree(pf); return -ENOMEM; }
-    pc->owner  = c;
-    pc->handle = a.handle;
-    pf->ctx = pc;
+    drm_dmabuf_t* db = (drm_dmabuf_t*)kmalloc(sizeof(*db));
+    if (!db) { kfree(pf); return -ENOMEM; }
+    db->phys = phys; db->bytes = bytes; db->order = order;
+    db->width = w; db->height = h; db->format = fmt;
+    // Own a reference to every backing page: the dma-buf keeps the memory alive
+    // even after the exporter destroys its handle.
+    for (uint32_t i = 0; i < bytes / 4096u; i++)
+        pmm_ref_inc(phys + (phys_addr_t)i * 4096u);
+    pf->ctx = db;
 
     int fd = drm_install_fd(pf);
-    if (fd < 0) { kfree(pc); kfree(pf); return fd; }
+    if (fd < 0) {
+        for (uint32_t i = 0; i < bytes / 4096u; i++)
+            pmm_ref_dec(phys + (phys_addr_t)i * 4096u);
+        kfree(db); kfree(pf); return fd;
+    }
 
     a.fd = fd;
-    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) {
+        // arg was raced-unmapped after we installed the fd: unwind cleanly so we
+        // don't leak a live PRIME fd the caller never learned the number of.
+        // sys_close clears the slot and drops the ref -> drm_prime_close frees db
+        // and ref_decs the pages.
+        extern uint64_t sys_close(uint64_t fd);
+        sys_close((uint64_t)fd);
+        return -EFAULT;
+    }
     return 0;
 }
 
-// Cross-fd PRIME import: wlroots reopens /dev/dri/card0 for its dumb
-// allocator, then passes the exported dmabuf fd to the DRM backend's
-// original fd for scan-out.  Those fds are different drm_client_t's
-// backed by the same device, so importing must CLONE the underlying
-// dumb buffer into the destination client's handle table (sharing the
-// phys pages, with refcounts bumped per page).  Same-client import
-// just returns the original handle.
+// Cross-fd PRIME import: mint a fresh GEM handle in the destination client over
+// the dma-buf's backing pages (shared, per-page refcounted).  Because the
+// dma-buf is STANDALONE (owns its page refs), this works even after the
+// exporter closed its own handle -- wlroots' export-then-import-on-another-fd
+// and Mesa's share-a-rendered-buffer-to-scanout both rely on that.  The clone
+// carries vgpu_res_id=0 (a handle around shared pages, not a second owner of a
+// virtio-gpu resource); ADDFB2 mints its own resource over the same pages.
 static int drm_ioctl_prime_fd_to_handle(vfs_file_t* drm_f, uint64_t arg) {
     struct { uint32_t handle; uint32_t flags; int32_t fd; } a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
@@ -1547,39 +1599,30 @@ static int drm_ioctl_prime_fd_to_handle(vfs_file_t* drm_f, uint64_t arg) {
     if (!tf || a.fd < 0 || (uint32_t)a.fd >= tf->ft->cap) return -EBADF;
     vfs_file_t* pf = tf->ft->fd_table[a.fd];
     if (!drm_prime_is_ours(pf)) return -EINVAL;
-
-    drm_prime_ctx_t* pc = (drm_prime_ctx_t*)pf->ctx;
+    drm_dmabuf_t* db = (drm_dmabuf_t*)pf->ctx;
     drm_client_t* dst = client_of(drm_f);
 
-    if (pc->owner == dst) {
-        a.handle = pc->handle;
-    } else {
-        // Different DRM client — import.  Locate the source dumb in the
-        // exporting client's list; clone a drm_dumb_t in the destination
-        // referencing the same phys pages.  Bump per-page refcounts so
-        // destroy_dumb on either side leaves the other's view intact.
-        drm_dumb_t* src = find_dumb(pc->owner, pc->handle);
-        if (!src) return -ENOENT;
-        // Charge the importer: dumb_free unconditionally uncharges, so
-        // an uncharged clone would drift the quota negative over time.
-        if (drm_charge(g_current, src->bytes_alloc) != 0) return -ENOMEM;
-        drm_dumb_t* nd = (drm_dumb_t*)kmalloc(sizeof(*nd));
-        if (!nd) { drm_uncharge(g_current, src->bytes_alloc); return -ENOMEM; }
-        *nd = *src;
-        nd->handle = dst->next_dumb_handle++;
-        // The clone is a HANDLE around shared pages, not a second
-        // owner of the source's virtio-gpu resource: if it inherited
-        // vgpu_res_id, GEM_CLOSE of the clone would destroy the
-        // source's host resource, and the source's own destroy would
-        // then double-UNREF it.  ADDFB2 mints its own resource anyway.
-        nd->vgpu_res_id = 0;
-        nd->next   = dst->dumbs;
-        dst->dumbs = nd;
-        for (uint32_t i = 0; i < nd->bytes_alloc / 4096u; i++)
-            pmm_ref_inc(nd->phys + (phys_addr_t)i * 4096u);
-        a.handle = nd->handle;
-    }
+    // Charge the importer: dumb_free unconditionally uncharges, so an uncharged
+    // clone would drift the quota negative over time.
+    if (drm_charge(g_current, db->bytes) != 0) return -ENOMEM;
+    drm_dumb_t* nd = (drm_dumb_t*)kmalloc(sizeof(*nd));
+    if (!nd) { drm_uncharge(g_current, db->bytes); return -ENOMEM; }
+    __builtin_memset(nd, 0, sizeof(*nd));
+    nd->handle      = dst->next_handle++;
+    nd->width       = db->width;
+    nd->height      = db->height;
+    nd->pitch       = db->width * 4u;
+    nd->size        = (uint64_t)db->bytes;
+    nd->vgpu_res_id = 0;
+    nd->phys        = db->phys;
+    nd->bytes_alloc = db->bytes;
+    nd->order       = db->order;
+    nd->next        = dst->dumbs;
+    dst->dumbs      = nd;
+    for (uint32_t i = 0; i < db->bytes / 4096u; i++)
+        pmm_ref_inc(db->phys + (phys_addr_t)i * 4096u);
 
+    a.handle = nd->handle;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
     return 0;
 }
@@ -2250,7 +2293,7 @@ static int drm_ioctl_mode_getfb(vfs_file_t* self, uint64_t arg) {
         if (drm_charge(g_current, fb->bytes_alloc) != 0) return -ENOMEM;
         drm_dumb_t* nd = (drm_dumb_t*)kmalloc(sizeof(*nd));
         if (!nd) { drm_uncharge(g_current, fb->bytes_alloc); return -ENOMEM; }
-        nd->handle      = c->next_dumb_handle++;
+        nd->handle      = c->next_handle++;
         nd->width       = fb->width;
         nd->height      = fb->height;
         nd->pitch       = fb->pitch;
@@ -2660,8 +2703,12 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
         return rc;
     }
 
-    // Record in the O(1) handle-indexed array, growing on demand.
-    uint32_t h = c->next_res3d_handle ? c->next_res3d_handle : 1u;
+    // Record in the O(1) handle-indexed array, growing on demand.  The handle
+    // is drawn from the fd's single GEM namespace (shared with dumbs), so it can
+    // be sparse vs the array (dumb handles consume counter values without a slot)
+    // -- the grow-to-at-least-h below covers that.  Peek here, commit below only
+    // on success so a grow-OOM doesn't burn a handle number.
+    uint32_t h = c->next_handle;
     if (h > c->res3d_cap) {
         uint32_t ncap = c->res3d_cap ? c->res3d_cap * 2u : 8u;
         if (ncap < h) ncap = h;
@@ -2678,7 +2725,7 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
     drm_res3d_t* r = &c->res3d[h - 1];
     r->handle = h; r->res_id = res_id; r->width = a.width; r->height = a.height;
     r->format = a.format; r->bytes = bytes; r->phys = phys; r->order = order;
-    c->next_res3d_handle = h + 1u;
+    c->next_handle = h + 1u;
 
     a.bo_handle = h; a.res_handle = res_id; a.size = (uint32_t)size64; a.stride = stride;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
@@ -2701,9 +2748,9 @@ static int drm_ioctl_virtgpu_map(vfs_file_t* f, uint64_t arg) {
     drm_virtgpu_map_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
     if (!find_res3d(c, a.handle)) return -ENOENT;
-    // Same magic-offset scheme as dumb buffers; the mmap resolver looks a render
-    // fd's handle up in res3d.  Handle spaces can't collide: a render fd has no
-    // dumbs and a card0 fd has no res3d.
+    // Same magic-offset scheme as dumb buffers; the mmap resolver looks the
+    // handle up in dumbs then res3d.  Exactly one can match: dumb and res3d
+    // handles are drawn from the fd's single GEM namespace (c->next_handle).
     a.offset = DRM_DUMB_OFFSET_MARK | ((uint64_t)a.handle << DRM_DUMB_OFFSET_SHIFT);
     a.pad = 0;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
@@ -2924,9 +2971,8 @@ static vfs_file_t* vfs_drm_open_minor(uint32_t minor) {
     drm_client_t* c = (drm_client_t*)kmalloc(sizeof(*c));
     if (!c) return NULL;
     __builtin_memset(c, 0, sizeof(*c));
-    c->next_dumb_handle  = 1;
+    c->next_handle  = 1;
     c->next_fb_id        = 1;
-    c->next_res3d_handle = 1;
 
     vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired (poll-ready), refcount=1
     if (!f) { kfree(c); return NULL; }

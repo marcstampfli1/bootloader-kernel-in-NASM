@@ -153,8 +153,28 @@ workqueue).  Safe/additive: the poll stays authoritative so a bad MSI-X can't
 stall.  NOTE: under QEMU's synchronous virglrenderer commands retire before
 their used-ring entry, so submit==done and WAIT is immediate -- the mechanism is
 the correct O(1) foundation for an async-submit path, not a parallelism win
-here.  REMAINING: real dma-buf PRIME (today PRIME is the dumb-handle shim), the
-prerequisite for sharing a rendered buffer between the render node and scanout.
+here.
+
+2c DONE -- real dma-buf PRIME.  PRIME is no longer a back-ref shim to the
+exporter's GEM handle: a PRIME fd is now a STANDALONE, page-refcounted dma-buf
+(drm_dmabuf_t) that holds its own ref on every backing page, so the buffer
+outlives the exporter's handle -- true Linux dma-buf lifetime.  Export works for
+both dumb (2D) and res3d (render-node) buffers; import mints a fresh GEM handle
+over the shared pages.  Unified the fd's GEM handle namespace (one c->next_handle
+feeds dumb + res3d) so a handle names exactly one object -- the two independent
+counters used to collide once a render fd owned both a res3d and a PRIME-imported
+dumb (they share the mmap offset + ioctl handle space).  Verified by virgltest:
+GPU-render a 16x16 res3d to magenta, PRIME-export it, import on a SECOND fd,
+MAP_DUMB+mmap that handle, read back byte-exact magenta -- zero-copy cross-fd
+sharing (the Mesa render-node -> compositor path).  16/16 reject probes
+fail-closed with exact errno.
+
+This 2c work surfaced and fixed a latent regression from the spinlock-preempt
+fold: call_rcu_expedited (reached by fd_table_grow under files->lock) hid a
+synchronize_rcu_expedited that PANICS with preemption disabled -- and the panic
+was a compiled-out serial_puts_dbg + cli;hlt, i.e. a SILENT wedge.  Fixed at the
+RCU layer (defer async via call_rcu_head when preempt_depth>0) and made the rail
+panic loudly.  See kernel/proc/rcu.c.
 
 Goal: expose the virtio-gpu 3D uAPI Mesa's virgl winsys actually calls, on a
 render node.
@@ -165,8 +185,10 @@ render node.
   kernel primitives.
 - Add a `renderD128` device node (currently only `dri/card0` exists,
   `kernel/fs/virtfs.c:37`) and route it to a render-node open path.
-- Make PRIME real: dma-buf export/import backed by GEM objects a 3D context can
-  import, not the current dumb-handle shim (drm.c:1442/1476).
+- Make PRIME real: dma-buf export/import backed by standalone page-refcounted
+  buffers a 3D context can import, not a dumb-handle back-ref shim. DONE (2c) --
+  drm_dmabuf_t + unified GEM handle namespace; see drm_ioctl_prime_handle_to_fd /
+  drm_ioctl_prime_fd_to_handle.
 - Undo the `MAKAOS_NO_RENDER_NODE` patch in `scripts/port-libdrm.sh:113-124` and
   build `libdrm_virtgpu`.
 - Gate: a userland test using libdrm_virtgpu directly (VIRTGPU_GET_CAPS +
