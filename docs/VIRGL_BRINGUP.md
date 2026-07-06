@@ -223,7 +223,19 @@ winsys, producing `libgbm`, `libEGL`, `libGLESv2` (and `libGL`).
 
 STATUS (in progress):
 
-DONE this pass:
+3a/3b DONE -- the static Mesa GL stack BUILDS and installs on MakaOS:
+libEGL.a, libGLESv2.a, libgbm.a, libglapi.a, and libgallium_dri (a static
+archive carrying the virgl gallium driver + virtio_gpu entrypoint), plus the
+EGL/GLES2/gbm headers, all in the sysroot. Getting there needed: hosted
+libstdc++ (Phase 3-0, done), the static_library conversions (libc.a is non-PIC),
+the loader static-DRI shim, virgl disk-cache stub, and a long tail of libc gaps
+(C++ runtime + extern "C" headers, float/fused math, gettid/sched_getcpu/
+setpriority/syscall shim, elf.h, alloca-via-stdlib, PRIi* macros, libsync.h).
+REMAINING (3c): a userland EGL+GLES2 test app that creates a context on the
+Wayland platform and draws, verified via the host virgl renderer string + a
+screendump; then wire wlroots/SDL (Phase 4).
+
+DONE earlier this pass:
 - Feasibility CONFIRMED from Mesa 24.0.9 source: a fully STATIC virgl+EGL+GBM+
   GLES2 build is viable with no dynamic loader. The static pipe-loader
   (GALLIUM_STATIC_TARGETS) matches virgl's descriptor by DRM driver name
