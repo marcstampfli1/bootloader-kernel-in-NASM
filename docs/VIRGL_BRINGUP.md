@@ -139,6 +139,16 @@ a tiny in-kernel selftest that submits a trivial virgl clear.
 
 ### Phase 2 - DRM render node uAPI
 
+STATUS: 2a DONE (commit 0ea7fc8) -- /dev/dri/renderD128 + the DRM_IOCTL_VIRTGPU_*
+ioctls (GETPARAM, GET_CAPS, CONTEXT_INIT, RESOURCE_CREATE, RESOURCE_INFO, MAP,
+EXECBUFFER, TRANSFER_TO/FROM_HOST, WAIT), byte-exact with libdrm's
+drm/virtgpu_drm.h, on the synchronous command path.  O(1) handle-indexed 3D bo
+table (no idr).  Verified by userland virgltest driving a GPU clear through the
+ioctls + mmap and reading back byte-exact magenta (283/283), reject paths
+included; 2D path byte-identical.  REMAINING: 2b the O(1) async fence
+(EXECBUFFER out-fence + WAIT), and real dma-buf PRIME (today PRIME is the
+dumb-handle shim).
+
 Goal: expose the virtio-gpu 3D uAPI Mesa's virgl winsys actually calls, on a
 render node.
 
