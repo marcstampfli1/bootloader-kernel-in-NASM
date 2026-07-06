@@ -221,6 +221,45 @@ winsys, producing `libgbm`, `libEGL`, `libGLESv2` (and `libGL`).
   chunk; expect toolchain/dependency friction).
 - Effort: very large (own multi-session sub-project).
 
+STATUS (in progress):
+
+DONE this pass:
+- Feasibility CONFIRMED from Mesa 24.0.9 source: a fully STATIC virgl+EGL+GBM+
+  GLES2 build is viable with no dynamic loader. The static pipe-loader
+  (GALLIUM_STATIC_TARGETS) matches virgl's descriptor by DRM driver name
+  "virtio_gpu"; EGL/GBM both load the DRI driver through loader_open_driver,
+  which we shim to return the statically-linked __driDriverGetExtensions_
+  virtio_gpu directly (no dlopen). GBM has a builtin_backends[] static table.
+- Kernel prereq: renderD128 reports DRM version name "virtio_gpu" (commit
+  04ba531); libdrm drmGetRenderDeviceNameFromFd returns /dev/dri/renderD128.
+- scripts/port-mesa.sh written: meson CONFIGURE SUCCEEDS with
+  default_library=static, gallium-drivers=virgl, platforms=wayland, egl/gbm/
+  gles2 enabled, llvm/vulkan/glx disabled. Patches applied: static DRI shim
+  (loader.c), static DRI target (targets/dri/meson.build), system_has_kms_drm
+  += makaos, -D__linux__ (MakaOS is Linux-source/ABI compatible), wayland-egl-
+  backend header+pc, shader-cache disabled.
+- MakaOS libc gaps filled (all additive, POSIX/C99, boot-verified): <endian.h>,
+  rint/rintf/nearbyint/lrint/lrintf/llrint (math.c), pthread_barrier (mutex+cond
+  generation barrier), <sys/param.h>, <sys/syscall.h> (minimal, no asm),
+  clock_nanosleep, _SC_PHYS_PAGES/_SC_AVPHYS_PAGES sysconf. The C portion of
+  Mesa's util layer compiles.
+
+BLOCKER (hard prerequisite, own sub-project) -- HOSTED libstdc++:
+  Mesa's compiler/GLSL/NIR/util layers are heavily C++ and need a HOSTED C++
+  standard library: std::vector, std::string, std::unordered_map, std::mutex,
+  std::thread, ... The MakaOS toolchain (x86_64-pc-makaos) ships only a
+  FREESTANDING libstdc++ subset (type_traits, atomic, memory, algorithm --
+  header-only, no-OS parts); <vector>/<string>/<mutex>/<thread>/<unordered_map>
+  are absent (a trivial STL TU fails to compile). This is why harfbuzz (which
+  sticks to the freestanding subset) builds but Mesa cannot.
+  PATH: build GCC's libstdc++-v3 hosted for x86_64-pc-makaos. _GLIBCXX_HAS_
+  GTHREADS is already 1 and MakaOS pthreads exist (now incl. pthread_barrier),
+  so the gthreads model is feasible; the work is a real toolchain build --
+  configure libstdc++-v3 with the MakaOS gthr/OS glue, exception unwinding
+  (libgcc), and whatever <fstream>/locale bits Mesa pulls in. Treat as
+  "Phase 3-0: hosted libstdc++", a prerequisite before the Mesa build proceeds
+  past its C++ files.
+
 ### Phase 4 - wire the clients
 
 Goal: the compositor and SDL use the GL stack.
