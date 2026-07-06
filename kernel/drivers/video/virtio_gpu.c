@@ -254,6 +254,24 @@ static void virtq_activate(volatile virtio_pci_common_cfg_t* cfg,
     cfg->queue_select = qidx;
     __asm__ volatile("mfence" ::: "memory");
     vq->notify_off      = cfg->queue_notify_off;
+    // Negotiate the queue size (virtio 1.0 §4.1.5.1.3).  The device reports
+    // its MAX in queue_size; the driver may write a smaller power-of-two.  We
+    // allocate fixed VIRTQ_SIZE-entry rings, so the device MUST use exactly
+    // VIRTQ_SIZE -- otherwise it indexes avail->ring[head % dev_size] while we
+    // fill avail->ring[head % VIRTQ_SIZE]; those agree only while head <
+    // min(sizes), so a device default of 256 works for the first 64 commands
+    // and then reads slots we never wrote -> garbage descriptor head ->
+    // DEVICE_NEEDS_RESET.  Writing queue_size here is mandatory, not optional.
+    uint16_t dev_max = cfg->queue_size;
+    if (dev_max < VIRTQ_SIZE) {
+        // Our rings are larger than the device supports; can't run this queue
+        // safely.  (No real virtio-gpu reports < 64; guarded so a future
+        // device change fails loud instead of corrupting the ring.)
+        pr_warn("virtio-gpu", "queue %u max size %u < VIRTQ_SIZE %u",
+                qidx, dev_max, (unsigned)VIRTQ_SIZE);
+    }
+    cfg->queue_size = VIRTQ_SIZE;
+    __asm__ volatile("mfence" ::: "memory");
     cfg->queue_desc_lo   = (uint32_t)(vq->desc_phys  & 0xFFFFFFFFu);
     cfg->queue_desc_hi   = (uint32_t)(vq->desc_phys  >> 32);
     cfg->queue_driver_lo = (uint32_t)(vq->avail_phys & 0xFFFFFFFFu);
