@@ -16,6 +16,12 @@
 // sched_get_priority_{min,max}.  Match glibc for compatibility.
 #include <sched.h>
 
+// C linkage in C++: libstdc++'s gthr-posix layer calls pthread_* from C++ TUs;
+// without this the calls would be name-mangled and miss libc.a's C symbols.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // pthread_t is a pointer to the thread's descriptor (struct __pthread,
 // defined privately in pthread.c) — the handle IS the object, glibc/NPTL
 // style, so join/detach/kill/equal need NO lookup table.  Opaque to apps.
@@ -193,5 +199,9 @@ int pthread_getname_np(pthread_t tid, char* name, size_t n);
 // that probe for real-time priorities don't explode at link time.
 int pthread_setschedparam(pthread_t tid, int policy, const struct sched_param* p);
 int pthread_getschedparam(pthread_t tid, int* policy, struct sched_param* p);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

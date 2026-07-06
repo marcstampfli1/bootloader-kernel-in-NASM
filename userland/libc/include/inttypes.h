@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Format-string macros for int8/16/32/64 and ptr-sized integers.
 // x86_64 ABI: int32_t is "int", int64_t is "long long".
 #define PRId8  "d"
@@ -48,5 +52,9 @@
 
 intmax_t  strtoimax(const char* s, char** endptr, int base);
 uintmax_t strtoumax(const char* s, char** endptr, int base);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

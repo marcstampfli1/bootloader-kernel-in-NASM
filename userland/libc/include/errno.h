@@ -62,8 +62,13 @@ extern "C" {
 #define EADDRNOTAVAIL 99
 #define ENETDOWN    100
 #define ENETUNREACH 101
+#define ENETRESET   102
 #define ECONNABORTED 103
 #define EDESTADDRREQ 89
+// Robust-mutex / POSIX 2008 codes. The kernel never returns these; they exist
+// so userland (e.g. libstdc++ <system_error> -> std::errc) can name them.
+#define EOWNERDEAD      130
+#define ENOTRECOVERABLE 131
 #define ECONNREFUSED 111
 #define EHOSTUNREACH 113
 #define EALREADY    114

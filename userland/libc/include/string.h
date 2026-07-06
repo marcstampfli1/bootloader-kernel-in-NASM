@@ -24,6 +24,8 @@ size_t strlen(const char* s);
 size_t strnlen(const char* s, size_t max);
 int    strcmp(const char* a, const char* b);
 int    strncmp(const char* a, const char* b, size_t n);
+int    strcoll(const char* a, const char* b);          // "C" locale: == strcmp
+size_t strxfrm(char* dst, const char* src, size_t n);  // "C" locale: plain copy
 // strcasecmp/strncasecmp come from <strings.h> above — declaring them
 // twice trips ports that compile -Werror=redundant-decls (pango).
 char*  strcpy(char* dst, const char* src);

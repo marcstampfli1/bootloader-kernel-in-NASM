@@ -4,6 +4,13 @@
 #include <stddef.h>    // compiler-provided wchar_t
 #include <stdarg.h>
 
+// C library declarations must have C linkage in C++, or they conflict with the
+// same functions declared (in <stdlib.h> etc.) inside extern "C" -- which is
+// exactly what libstdc++'s <cwchar>/<cstdlib> trip over.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef unsigned int wint_t;
 typedef int          mbstate_t;  // single-locale, state-less
 
@@ -55,5 +62,9 @@ wint_t btowc(int c);
 int    wctob(wint_t c);
 int    wcwidth(wchar_t c);
 int    wcswidth(const wchar_t* s, size_t n);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -157,6 +157,20 @@ int strncmp(const char* a, const char* b, size_t n) {
     return (int)(unsigned char)*a - (int)(unsigned char)*b;
 }
 
+// strxfrm -- locale collation transform.  MakaOS has only the "C" locale, where
+// the transformed key compares byte-wise the same as the source, so this is a
+// plain bounded copy.  (strcoll lives further down; both are now declared in
+// <string.h> so libstdc++'s <cstring> finds them in ::.)
+size_t strxfrm(char* dst, const char* src, size_t n) {
+    size_t len = strlen(src);
+    if (n) {
+        size_t c = len < n - 1 ? len : n - 1;   // leave room for the NUL
+        for (size_t i = 0; i < c; i++) dst[i] = src[i];
+        dst[c] = '\0';
+    }
+    return len;   // length of src, per C99 (NOT counting the NUL)
+}
+
 char* strcpy(char* dst, const char* src) {
     char* r = dst;
     while ((*dst++ = *src++));
