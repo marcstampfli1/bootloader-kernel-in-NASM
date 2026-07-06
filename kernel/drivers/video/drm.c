@@ -2741,12 +2741,14 @@ static int drm_ioctl_virtgpu_transfer(vfs_file_t* f, uint64_t arg, int to_host) 
 }
 
 static int drm_ioctl_virtgpu_wait(vfs_file_t* f, uint64_t arg) {
-    (void)f;
+    drm_client_t* c = client_of(f);
     drm_virtgpu_3d_wait_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
-    // Submission is synchronous today: a command has already retired by the time
-    // its ioctl returned, so any resource is idle here.  Phase 2b makes this a
-    // real fence wait once submission goes async.
+    if (!find_res3d(c, a.handle)) return -ENOENT;
+    // Wait until every command submitted so far has retired (conservative
+    // resource-idle).  Rides the real fence counter + control-queue MSI-X wait
+    // queue; returns immediately on today's synchronous submit path.
+    virtio_gpu_3d_fence_wait(virtio_gpu_3d_fence_barrier());
     return 0;
 }
 

@@ -76,6 +76,11 @@ int virtio_gpu_3d_transfer(int to_host, uint32_t ctx_id, uint32_t res_id,
                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                             uint64_t offset, uint32_t level);
 int virtio_gpu_3d_submit(uint32_t ctx_id, const void* cmds, uint32_t size);
+// GPU fence (Phase 2b): fence_barrier() snapshots all-submitted-so-far;
+// fence_wait(target) blocks until that many commands have retired (immediate on
+// the synchronous path).  The WAIT ioctl uses these for resource-idle waits.
+uint64_t virtio_gpu_3d_fence_barrier(void);
+int      virtio_gpu_3d_fence_wait(uint64_t target);
 
 // Called at subsys init after virtio_gpu_init succeeds.  Registers
 // this device as the DRM core's active backend via drm_backend_register.

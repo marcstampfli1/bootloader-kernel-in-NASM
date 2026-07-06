@@ -23,6 +23,9 @@
 #include "smp.h"
 #include "common.h"
 #include "checked.h"   // mul_within_u32: overflow-safe bounded multiply
+#include "idt.h"       // idt_irq_register -- Phase 2b control-queue MSI-X
+#include "lapic.h"     // VEC_VIRTIO_GPU, lapic_msi_addr / lapic_msi_data
+#include "irq_wait.h"  // irq_wait / irq_notify -- the GPU fence wait queue
 
 // ── PCI IDs ─────────────────────────────────────────────────────────
 // Generic virtio-PCI transport constants (VIRTIO_VENDOR, VIRTIO_PCI_CAP_*,
@@ -177,6 +180,29 @@ static int s_ok = 0;
 static int s_virgl = 0;   // 1 if VIRTIO_GPU_F_VIRGL negotiated (host has 3D)
 static void virtio_gpu_virgl_selftest(void);        // Phase 1a: 3D data path
 static void virtio_gpu_virgl_clear_selftest(void);  // Phase 1b: GPU render (clear)
+
+// ── GPU fence -- Phase 2b (docs/VIRGL_BRINGUP.md) ───────────────────────────
+// A monotonic completion counter, NOT Linux's per-fence objects + pending list
+// + signalling workqueue.  s_gpu_fence_submit counts commands published to the
+// control queue; s_gpu_fence_done counts completions.  On the synchronous path
+// they stay equal (one command outstanding under s_ctrl_lock), so a fence WAIT
+// is satisfied immediately -- the counter + control-queue MSI-X + wait queue are
+// the O(1) mechanism a future async-submit path (async host GL) would ride.
+extern void virtio_gpu_irq_entry(void);
+uint8_t g_virtio_gpu_irq = 0xFFu;               // logical irq_wait slot; set at init
+static volatile uint64_t s_gpu_fence_submit = 0;
+static volatile uint64_t s_gpu_fence_done   = 0;
+static volatile uint64_t s_gpu_irq_count    = 0;   // diagnostic: MSI-X deliveries
+
+// Control-queue MSI-X handler.  It deliberately does NOT drain the used ring
+// (vgpu_send_ctrl owns that under s_ctrl_lock; draining here would race it) --
+// it only wakes fence waiters.  So a misconfigured MSI-X can never stall a
+// command: vgpu_send_ctrl's poll stays authoritative and this IRQ is a pure
+// wakeup.  Called from irq_stubs.asm after LAPIC EOI.
+void virtio_gpu_irq_handler(void) {
+    s_gpu_irq_count++;
+    if (g_virtio_gpu_irq != 0xFFu) irq_notify(g_virtio_gpu_irq);
+}
 static pci_device_t                         s_dev;
 static volatile virtio_pci_common_cfg_t*    s_common      = NULL;
 static volatile uint8_t*                    s_notify      = NULL;
@@ -294,6 +320,7 @@ static int vgpu_send_ctrl(const void* req, uint32_t req_len,
     __asm__ volatile("mfence" ::: "memory");
     vq->avail_idx++;
     vq->avail->idx = vq->avail_idx;
+    __atomic_add_fetch(&s_gpu_fence_submit, 1, __ATOMIC_ACQ_REL);   // fence: submitted
     __asm__ volatile("mfence" ::: "memory");
 
     // Notify the device.
@@ -313,6 +340,11 @@ static int vgpu_send_ctrl(const void* req, uint32_t req_len,
             vq->desc[d1].next = vq->free_head;
             vq->desc[d0].next = d1;
             vq->free_head = d0;
+            // Fence: this command retired.  Wake any WAITer directly (the MSI-X
+            // handler also wakes, but the poll is authoritative so completion is
+            // never lost if the IRQ is slow/misconfigured).
+            __atomic_add_fetch(&s_gpu_fence_done, 1, __ATOMIC_ACQ_REL);
+            if (g_virtio_gpu_irq != 0xFFu) irq_notify(g_virtio_gpu_irq);
             spin_unlock(&s_ctrl_lock);
             return 1;
         }
@@ -504,6 +536,40 @@ int virtio_gpu_init(void) {
                               VIRTIO_STATUS_DRIVER_OK;
     __asm__ volatile("mfence" ::: "memory");
 
+    // ── Control-queue MSI-X (Phase 2b) ───────────────────────────────────
+    // Wire an interrupt for control-queue completions so a GPU fence WAIT can
+    // sleep instead of spin.  Additive + SAFE: vgpu_send_ctrl's poll stays
+    // authoritative, so a failed setup here degrades to poll-only, never a
+    // stall.  Mirrors the virtio-net MSI-X path.
+    {
+        uint8_t msix_cap = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x11u);
+        if (msix_cap) {
+            uint32_t tbl_dw  = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msix_cap + 4u);
+            uint32_t bir     = tbl_dw & 0x7u;
+            uint32_t tbl_off = tbl_dw & ~0x7u;
+            uint64_t bar_phys = pci_bar_base(dev.bus, dev.dev, dev.fn, (uint8_t)bir);
+            volatile uint32_t* msix_table =
+                (volatile uint32_t*)vmm_map_mmio(bar_phys + tbl_off, 0x1000u);
+            if (msix_table) {
+                msix_table[0] = (uint32_t)lapic_msi_addr();      // addr_lo
+                msix_table[1] = 0;                                // addr_hi
+                msix_table[2] = lapic_msi_data(VEC_VIRTIO_GPU);   // data
+                msix_table[3] = 0;                                // vector_ctrl: unmask
+                uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msix_cap);
+                mc = (mc | (1u << 31)) & ~(1u << 30);             // enable MSI-X, clear fn-mask
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, msix_cap, mc);
+                s_common->queue_select      = VQ_CONTROLQ;
+                s_common->queue_msix_vector = 0;                  // control queue -> vector 0
+                __asm__ volatile("mfence" ::: "memory");
+                g_virtio_gpu_irq = 5u;   // logical irq_wait slot (net=4, gpu=5)
+                idt_irq_register(VEC_VIRTIO_GPU, (uint64_t)virtio_gpu_irq_entry);
+                kprintf("[virtio-gpu] control-queue MSI-X on vector 0x%x\n", VEC_VIRTIO_GPU);
+            }
+        }
+        // No MSI-X / map fail -> g_virtio_gpu_irq stays 0xFF; the fence path
+        // falls back to the poll (synchronous, always correct).
+    }
+
     // Probe displays.
     virtio_gpu_ctrl_hdr_t req = { .type = VIRTIO_GPU_CMD_GET_DISPLAY_INFO };
     virtio_gpu_resp_display_info_t resp;
@@ -568,6 +634,11 @@ int virtio_gpu_init(void) {
         virtio_gpu_virgl_selftest();        // Phase 1a: 3D resource data path
         virtio_gpu_virgl_clear_selftest();  // Phase 1b: GPU renders (clear)
     }
+    // Phase 2b diagnostic: after the boot-time control commands, report how many
+    // control-queue MSI-X interrupts were delivered (0 = IRQ not firing, running
+    // poll-only; >0 = the fence wake path is live).
+    kprintf("[virtio-gpu] control-queue IRQs delivered: %lu\n",
+            (unsigned long)s_gpu_irq_count);
     return 1;
 }
 
@@ -1048,6 +1119,23 @@ int virtio_gpu_3d_submit(uint32_t ctx_id, const void* cmds, uint32_t size) {
     if (size == 0 || (size & 3u)) return -EINVAL;    // dword-aligned command stream
     if (size > VGPU_SUBMIT_MAX) return -EINVAL;
     return vgpu_submit_3d(ctx_id, (const uint32_t*)cmds, size / 4u) ? 0 : -EIO;
+}
+
+// Snapshot of "all work submitted so far" -- WAIT for this to become `done`.
+uint64_t virtio_gpu_3d_fence_barrier(void) {
+    return __atomic_load_n(&s_gpu_fence_submit, __ATOMIC_ACQUIRE);
+}
+
+// Block until the control queue has retired `target` commands.  Woken by the
+// control-queue MSI-X AND by vgpu_send_ctrl's own completion notify -- so a
+// waiter wakes even if the device IRQ never fires (poll authoritative).  On the
+// synchronous path `done` has already caught up, so this returns immediately.
+int virtio_gpu_3d_fence_wait(uint64_t target) {
+    while (__atomic_load_n(&s_gpu_fence_done, __ATOMIC_ACQUIRE) < target) {
+        if (g_virtio_gpu_irq == 0xFFu) break;   // no IRQ wired: poll already retired it
+        irq_wait(g_virtio_gpu_irq);
+    }
+    return 0;
 }
 
 int virtio_gpu_set_scanout(uint32_t scanout_id, uint32_t res_id,
