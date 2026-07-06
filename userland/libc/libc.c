@@ -773,6 +773,12 @@ int sprintf(char* buf, const char* fmt, ...) {
     return r;
 }
 
+// vsprintf: unbounded vsnprintf (caller guarantees buf size).  libstdc++'s
+// locale __convert_from_v uses it.
+int vsprintf(char* buf, const char* fmt, va_list ap) {
+    return vsnprintf_impl(buf, (size_t)-1, fmt, ap);
+}
+
 // ── Math helpers ──────────────────────────────────────────────────────────
 // abs/labs/llabs: integer absolute value.
 int       abs(int x)          { return x < 0 ? -x : x; }

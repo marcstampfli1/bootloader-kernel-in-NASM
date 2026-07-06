@@ -231,9 +231,31 @@ libstdc++ (Phase 3-0, done), the static_library conversions (libc.a is non-PIC),
 the loader static-DRI shim, virgl disk-cache stub, and a long tail of libc gaps
 (C++ runtime + extern "C" headers, float/fused math, gettid/sched_getcpu/
 setpriority/syscall shim, elf.h, alloca-via-stdlib, PRIi* macros, libsync.h).
-REMAINING (3c): a userland EGL+GLES2 test app that creates a context on the
-Wayland platform and draws, verified via the host virgl renderer string + a
-screendump; then wire wlroots/SDL (Phase 4).
+3c IN PROGRESS -- userland/apps/gltest links the whole static stack (libEGL +
+libGLESv2 + libgbm + libgallium_dri) and drives GBM+EGL+GLES2 on the render node.
+First-light debugging fixed a CHAIN of real bugs and got EGL init most of the way
+through; gbm_create_device now SUCCEEDS, which means Mesa's virgl gallium driver
+fully initialises against our kernel render node (GET_CAPS/CONTEXT_INIT/winsys).
+Fixes landed on the way:
+ - kernel DRM_IOCTL_VERSION: the length protocol was wrong (only copied the name
+   when caller_len >= actual+1, but libdrm's drmGetVersion passes caller_len ==
+   actual on the fill call) -> Mesa saw an empty driver name and fell to swrast.
+   Now copies min(caller_len, actual), Linux-style.
+ - kernel DRM version is 0.1.0 (was 1.0.0): Mesa's virgl_drm_get_version REJECTS
+   version_major != 0.
+ - libdrm drmGetNodeTypeFromFd derives the node type from the fd's minor
+   (renderD128 => DRM_NODE_RENDER) instead of always PRIMARY.
+ - loader.c (port-mesa.sh): loader_open_driver_lib returns NULL (no dlopen, and
+   no NULL-search-path crash); loader_is_device_render_capable uses the node type
+   instead of drmGetDevice2 (which needs sysfs).
+
+REMAINING (3c): eglInitialize still fails at dri2_setup_device -> _eglFindDevice,
+which needs drmGetDevice2 / drmGetDevices2 to enumerate the device. Those are
+deeply sysfs-based (dozens of /sys/dev/char reads) and MakaOS has no sysfs, so
+the next step is a minimal libdrm drmGetDevice2/drmGetDevices2 that SYNTHESISES
+the single virtio-gpu device (nodes card0+renderD128, available_nodes, a virtio
+PCI bus/deviceinfo) so _eglFindDevice matches it. After that: EGL config
+creation, then the first magenta readback; then wire wlroots/SDL (Phase 4).
 
 DONE earlier this pass:
 - Feasibility CONFIRMED from Mesa 24.0.9 source: a fully STATIC virgl+EGL+GBM+

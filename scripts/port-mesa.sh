@@ -85,6 +85,41 @@ if 'MAKAOS_STATIC_DRI' not in s:
     s = s.replace(anchor, shim, 1)
     open(p, 'w').write(s)
     print("patched loader_open_driver (static DRI shim)")
+
+# loader_open_driver_lib only ever dlopens; on MakaOS return NULL so GBM's
+# backend_from_driver_name falls through to its builtin backend (and it can't
+# crash on a NULL default_search_path).
+if 'MAKAOS_STATIC_DRI' not in s.split('loader_open_driver_lib')[1][:400]:
+    anchor2 = ('{\n   char path[PATH_MAX];\n'
+               '   const char *search_paths, *next, *end;\n\n'
+               '   search_paths = NULL;\n')
+    add2 = ('{\n   char path[PATH_MAX];\n'
+            '   const char *search_paths, *next, *end;\n\n'
+            '#ifdef MAKAOS_STATIC_DRI\n'
+            '   (void)driver_name; (void)lib_suffix; (void)search_path_vars;\n'
+            '   (void)default_search_path; (void)warn_on_fail;\n'
+            '   return NULL;\n'
+            '#endif\n\n'
+            '   search_paths = NULL;\n')
+    assert anchor2 in s, "loader_open_driver_lib anchor not found"
+    s = s.replace(anchor2, add2, 1)
+    open(p, 'w').write(s)
+    print("patched loader_open_driver_lib (no dlopen)")
+
+# loader_is_device_render_capable uses drmGetDevice2 (needs sysfs, absent on
+# MakaOS); use the DRM node type (our drmGetNodeTypeFromFd derives it from the
+# fd minor -- renderD128 => DRM_NODE_RENDER).
+if 'MAKAOS_STATIC_DRI' not in s.split('loader_is_device_render_capable')[1][:200]:
+    anchor3 = 'loader_is_device_render_capable(int fd)\n{\n   drmDevicePtr dev_ptr;'
+    add3 = ('loader_is_device_render_capable(int fd)\n{\n'
+            '#ifdef MAKAOS_STATIC_DRI\n'
+            '   return drmGetNodeTypeFromFd(fd) == DRM_NODE_RENDER;\n'
+            '#endif\n'
+            '   drmDevicePtr dev_ptr;')
+    assert anchor3 in s, "loader_is_device_render_capable anchor not found"
+    s = s.replace(anchor3, add3, 1)
+    open(p, 'w').write(s)
+    print("patched loader_is_device_render_capable (node type)")
 PY
 
     # Patch 2: the DRI megadriver target must be a STATIC lib on MakaOS so

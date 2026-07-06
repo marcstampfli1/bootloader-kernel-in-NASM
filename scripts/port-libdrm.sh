@@ -95,20 +95,32 @@ if marker in s and 'MAKAOS_DRM_FIXED_DEVNAME' not in s:
     with open(p, 'w') as f: f.write(s)
     print('patched drmGetDeviceNameFromFd2')
 "
-    # Patch drmGetNodeTypeFromFd — on Linux it stats the fd and checks
-    # the character major/minor against the DRM device allocation
-    # (226:0..127).  Our fstat surface doesn't reproduce those numbers,
-    # so force DRM_NODE_PRIMARY (0) for any valid DRM fd.  wlroots'
-    # dumb-buffer allocator explicitly rejects non-primary nodes.
+    # Patch drmGetNodeTypeFromFd -- Linux stats the fd and derives the node
+    # type from the DRM minor (0-63 primary, 64-127 control, 128+ render).
+    # MakaOS DOES expose the minor via st_rdev (rdev=(226<<8)|minor), so derive
+    # it the real way: renderD128 (minor 128) MUST report DRM_NODE_RENDER, or
+    # Mesa's loader_is_device_render_capable rejects it and GL init falls back
+    # to (unavailable) software.  card0 (minor 0) stays DRM_NODE_PRIMARY.
     python3 -c "
 p='$DRM_SRC/xf86drm.c'
 with open(p) as f: s = f.read()
 marker = 'drm_public int drmGetNodeTypeFromFd(int fd)\n{'
-if marker in s and 'MAKAOS_FIXED_NODE_TYPE' not in s:
-    replacement = marker + '\n    /* MAKAOS_FIXED_NODE_TYPE: single card, always primary. */\n    (void)fd;\n    return 0; /* DRM_NODE_PRIMARY */'
+if marker in s and 'MAKAOS_NODE_TYPE_FROM_MINOR' not in s:
+    body = ('\n    /* MAKAOS_NODE_TYPE_FROM_MINOR: derive from the DRM minor. */\n'
+            '    {\n'
+            '        struct stat _sb;\n'
+            '        if (fstat(fd, &_sb) == 0) {\n'
+            '            unsigned _mn = minor(_sb.st_rdev);\n'
+            '            if (_mn >= 128) return DRM_NODE_RENDER;\n'
+            '            if (_mn >= 64)  return DRM_NODE_CONTROL;\n'
+            '            return DRM_NODE_PRIMARY;\n'
+            '        }\n'
+            '        return DRM_NODE_PRIMARY;\n'
+            '    }')
+    replacement = marker + body
     s = s.replace(marker, replacement, 1)
     with open(p, 'w') as f: f.write(s)
-    print('patched drmGetNodeTypeFromFd')
+    print('patched drmGetNodeTypeFromFd (from minor)')
 "
     # Patch drmGetRenderDeviceNameFromFd — same sysfs walk we can't do.
     # We DO have a render node now (Phase 2: /dev/dri/renderD128), and it is

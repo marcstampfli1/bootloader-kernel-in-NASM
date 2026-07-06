@@ -22,6 +22,7 @@ OBJCOPY="objcopy"
 # Built by scripts/build-toolchain.sh; falls back to host gcc if absent
 # (early-development convenience only — production path is the cross).
 USER_CC="$(pwd)/toolchain/bin/x86_64-pc-makaos-gcc"
+USER_CXX="$(pwd)/toolchain/bin/x86_64-pc-makaos-g++"   # for C++ ports (Mesa GL stack)
 if [ ! -x "$USER_CC" ]; then
   echo "[!] cross-toolchain missing — run scripts/build-toolchain.sh"
   echo "    falling back to host gcc for userland (legacy path)"
@@ -337,6 +338,34 @@ USER_LINK="$USERLAND_DIR/link.ld"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/virgltest/virgltest.c" -o "$BUILD_DIR/user_virgltest.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_virgltest.o" \
    -o "$BUILD_DIR/user_virgltest.elf"
+
+# gltest -- first light through the ported Mesa GL stack (EGL + GLES2 + gbm +
+# the static virgl gallium driver).  Only build it if the Mesa libs are ported
+# into the sysroot (scripts/port-mesa.sh); otherwise skip cleanly.
+GL_L="$SYSROOT/usr/lib"
+if [ -f "$GL_L/libEGL.a" ] && [ -f "$GL_L/dri/virtio_gpu_dri.so" ]; then
+    # Compile against the sysroot public + Mesa headers only (NOT userland/libc,
+    # whose internal size_t typedef conflicts with the ABI stddef.h).
+    "$USER_CC" -ffreestanding -m64 -mno-red-zone -fno-pie -fno-pic -fno-plt \
+        -fno-stack-protector -fno-builtin -O0 -Wall -isystem "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/gltest/gltest.c" -o "$BUILD_DIR/user_gltest.o"
+    # Link with g++ (libstdc++ for Mesa's C++), the megadriver + Mesa archives in
+    # one group (they cross-reference), libffi after wayland, allow-multiple-def
+    # for the math functions Mesa ships that MakaOS's libc also provides.
+    # -s (strip) + --gc-sections: the unstripped static Mesa binary is ~80 MB
+    # (mostly debug info); stripped it is ~15 MB.
+    "$USER_CXX" --sysroot="$SYSROOT" -m64 -mno-red-zone -no-pie -s \
+        "$BUILD_DIR/user_gltest.o" \
+        -Wl,--gc-sections -Wl,--allow-multiple-definition -Wl,--start-group \
+        "$GL_L/dri/virtio_gpu_dri.so" \
+        "$GL_L/libEGL.a" "$GL_L/libGLESv2.a" "$GL_L/libgbm.a" "$GL_L/libglapi.a" \
+        "$GL_L/libdrm.a" "$GL_L/libexpat.a" \
+        "$GL_L/libwayland-client.a" "$GL_L/libwayland-server.a" "$GL_L/libffi.a" \
+        -Wl,--end-group \
+        "$GL_L/libz.a" -lm -lpthread \
+        -o "$BUILD_DIR/user_gltest.elf"
+    echo "[build] gltest linked against the static Mesa GL stack"
+fi
 
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
 ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
@@ -820,6 +849,10 @@ fi
 if [ -f "$BUILD_DIR/user_virgltest.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_virgltest.elf" bin/virgltest
     echo "[+] virgltest ELF installed at bin/virgltest (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_gltest.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_gltest.elf" bin/gltest
+    echo "[+] gltest ELF installed at bin/gltest (static Mesa GL stack)"
 fi
 if [ -f "$BUILD_DIR/user_helloraw.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_helloraw.elf" bin/helloraw
