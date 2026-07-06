@@ -37,7 +37,12 @@
 #define VIRTIO_GPU_F_RESOURCE_BLOB     (1ULL << 3)
 #define VIRTIO_GPU_F_CONTEXT_INIT      (1ULL << 4)
 
-#define DRIVER_FEATURES                (VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID)
+// VIRGL is requested but only NEGOTIATED when the host offers it (want =
+// DRIVER_FEATURES & device_features).  A plain virtio-gpu-pci device never
+// offers it, so the 2D path is unchanged; virtio-gpu-gl offers it and we then
+// light up the 3D command layer.  s_virgl records the outcome.
+#define DRIVER_FEATURES                (VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID | \
+                                        VIRTIO_GPU_F_VIRGL)
 
 // ── Queue indices (§5.7.2) ──────────────────────────────────────────
 #define VQ_CONTROLQ  0
@@ -57,6 +62,19 @@
 #define VIRTIO_GPU_CMD_GET_CAPSET_INFO         0x0108
 #define VIRTIO_GPU_CMD_GET_CAPSET              0x0109
 #define VIRTIO_GPU_CMD_GET_EDID                0x010a
+
+// ── 3D (virgl) control commands (§5.7.6.8) -- Phase 1 (docs/VIRGL_BRINGUP.md) ─
+#define VIRTIO_GPU_CMD_CTX_CREATE              0x0200
+#define VIRTIO_GPU_CMD_CTX_DESTROY             0x0201
+#define VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE     0x0202
+#define VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE     0x0203
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_3D      0x0204
+#define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D     0x0205
+#define VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D   0x0206
+#define VIRTIO_GPU_CMD_SUBMIT_3D               0x0207
+
+// ctrl_hdr.flags: request a fence; response arrives after the command retires.
+#define VIRTIO_GPU_FLAG_FENCE                  (1u << 0)
 
 #define VIRTIO_GPU_RESP_OK_NODATA              0x1100
 #define VIRTIO_GPU_RESP_OK_DISPLAY_INFO        0x1101
@@ -156,6 +174,8 @@ typedef struct __attribute__((packed)) {
 
 // ── Driver state ────────────────────────────────────────────────────
 static int s_ok = 0;
+static int s_virgl = 0;   // 1 if VIRTIO_GPU_F_VIRGL negotiated (host has 3D)
+static void virtio_gpu_virgl_selftest(void);   // defined below; Phase 1a 3D check
 static pci_device_t                         s_dev;
 static volatile virtio_pci_common_cfg_t*    s_common      = NULL;
 static volatile uint8_t*                    s_notify      = NULL;
@@ -443,6 +463,7 @@ int virtio_gpu_init(void) {
     uint32_t dfhi = s_common->device_feature;
     uint64_t dfeat = ((uint64_t)dfhi << 32) | dflo;
     uint64_t want  = DRIVER_FEATURES & dfeat;
+    s_virgl = (want & VIRTIO_GPU_F_VIRGL) != 0;   // 3D lit up only if host offers it
 
     s_common->driver_feature_select = 0;
     s_common->driver_feature        = (uint32_t)(want & 0xFFFFFFFFu);
@@ -542,6 +563,7 @@ int virtio_gpu_init(void) {
 
     s_ok = 1;
     kprintf("[virtio-gpu] initialised (%u scanouts)\n", s_num_scanouts);
+    if (s_virgl) virtio_gpu_virgl_selftest();   // Phase 1a: exercise the 3D path
     return 1;
 }
 
@@ -652,6 +674,188 @@ int virtio_gpu_resource_attach_backing_single(uint32_t res_id,
     virtio_gpu_ctrl_hdr_t resp = {0};
     if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
     return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+// ── 3D (virgl) command layer -- Phase 1 (docs/VIRGL_BRINGUP.md) ──────────────
+// Thin wrappers over the same synchronous vgpu_send_ctrl the 2D path uses: the
+// control queue completes commands in FIFO order, so a later command's response
+// proves every earlier one retired -- no fence object, no fence list, no
+// completion workqueue (Linux carries all three).  The async fence path
+// (VIRTIO_GPU_FLAG_FENCE + an O(1) monotonic completion counter woken from the
+// control-queue IRQ) lands in Phase 2, where userland EXECBUFFER/WAIT needs it.
+
+typedef struct __attribute__((packed)) {
+    virtio_gpu_ctrl_hdr_t hdr;      // hdr.ctx_id = the context being created
+    uint32_t nlen;
+    uint32_t context_init;          // 0 = default virgl context
+    char     debug_name[64];
+} vgpu_ctx_create_t;
+
+typedef struct __attribute__((packed)) {
+    virtio_gpu_ctrl_hdr_t hdr;      // hdr.ctx_id
+} vgpu_ctx_only_t;                  // CTX_DESTROY
+
+typedef struct __attribute__((packed)) {
+    virtio_gpu_ctrl_hdr_t hdr;      // hdr.ctx_id
+    uint32_t resource_id;
+    uint32_t padding;
+} vgpu_ctx_resource_t;              // CTX_ATTACH_RESOURCE / CTX_DETACH_RESOURCE
+
+typedef struct __attribute__((packed)) {
+    virtio_gpu_ctrl_hdr_t hdr;
+    uint32_t resource_id;
+    uint32_t target;               // pipe_texture_target (PIPE_TEXTURE_2D = 2)
+    uint32_t format;               // VIRGL_FORMAT_* (B8G8R8A8_UNORM = 1)
+    uint32_t bind;                 // VIRGL_BIND_* mask
+    uint32_t width, height, depth;
+    uint32_t array_size;
+    uint32_t last_level;
+    uint32_t nr_samples;
+    uint32_t flags;
+    uint32_t padding;
+} vgpu_resource_create_3d_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t x, y, z, w, h, d;
+} vgpu_box_t;
+
+typedef struct __attribute__((packed)) {
+    virtio_gpu_ctrl_hdr_t hdr;      // hdr.ctx_id
+    vgpu_box_t box;
+    uint64_t offset;
+    uint32_t resource_id;
+    uint32_t level;
+    uint32_t stride;
+    uint32_t layer_stride;
+} vgpu_transfer_host_3d_t;
+
+// virgl constants (virglrenderer virgl_hw.h + gallium p_defines.h).
+#define VIRGL_FORMAT_B8G8R8A8_UNORM   1u
+#define PIPE_TEXTURE_2D               2u
+#define VIRGL_BIND_RENDER_TARGET      (1u << 1)   // 2
+#define VIRGL_BIND_SAMPLER_VIEW       (1u << 3)   // 8
+
+static int vgpu_ctx_create(uint32_t ctx_id) {
+    vgpu_ctx_create_t req = {0};
+    req.hdr.type   = VIRTIO_GPU_CMD_CTX_CREATE;
+    req.hdr.ctx_id = ctx_id;
+    static const char nm[] = "makaos-virgl";
+    uint32_t n = 0;
+    while (nm[n] && n < sizeof(req.debug_name) - 1) { req.debug_name[n] = nm[n]; n++; }
+    req.nlen = n;
+    virtio_gpu_ctrl_hdr_t resp = {0};
+    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
+    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+static int vgpu_ctx_destroy(uint32_t ctx_id) {
+    vgpu_ctx_only_t req = {0};
+    req.hdr.type   = VIRTIO_GPU_CMD_CTX_DESTROY;
+    req.hdr.ctx_id = ctx_id;
+    virtio_gpu_ctrl_hdr_t resp = {0};
+    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
+    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+static int vgpu_ctx_attach_resource(uint32_t ctx_id, uint32_t res_id) {
+    vgpu_ctx_resource_t req = {0};
+    req.hdr.type    = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+    req.hdr.ctx_id  = ctx_id;
+    req.resource_id = res_id;
+    virtio_gpu_ctrl_hdr_t resp = {0};
+    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
+    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+static int vgpu_resource_create_3d(uint32_t res_id, uint32_t target, uint32_t format,
+                                   uint32_t bind, uint32_t w, uint32_t h, uint32_t depth) {
+    vgpu_resource_create_3d_t req = {0};
+    req.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    req.resource_id = res_id;
+    req.target      = target;
+    req.format      = format;
+    req.bind        = bind;
+    req.width       = w;
+    req.height      = h;
+    req.depth       = depth ? depth : 1u;
+    req.array_size  = 1;
+    virtio_gpu_ctrl_hdr_t resp = {0};
+    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
+    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+// TRANSFER_TO_HOST_3D (cmd) or TRANSFER_FROM_HOST_3D: copy the full [w x h]
+// box between the guest backing (at offset 0, tightly packed) and the host
+// resource.  stride/layer_stride 0 => tightly packed (host computes them).
+static int vgpu_transfer_3d(uint32_t cmd, uint32_t ctx_id, uint32_t res_id,
+                            uint32_t w, uint32_t h) {
+    vgpu_transfer_host_3d_t req = {0};
+    req.hdr.type    = cmd;
+    req.hdr.ctx_id  = ctx_id;
+    req.box.w       = w;
+    req.box.h       = h;
+    req.box.d       = 1;
+    req.resource_id = res_id;
+    virtio_gpu_ctrl_hdr_t resp = {0};
+    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
+    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+// ── virgl self-test (Phase 1a: 3D command layer + guest<->host data path) ────
+// Proves the 3D control commands and BOTH transfer directions work end to end,
+// with no GPU rendering yet: create a context + a 3D BGRA texture, upload a
+// distinctive pattern (TRANSFER_TO_HOST_3D), wipe the guest backing so a stale
+// copy cannot masquerade as success, download it back (TRANSFER_FROM_HOST_3D),
+// and verify every pixel round-trips.  Runs once at init when VIRGL negotiated.
+// Fixed handles (a real id allocator is a Phase 2 concern once userland creates
+// resources); cleans up the context + resource + page afterwards.
+#define VIRGL_TEST_CTX   0xF000u
+#define VIRGL_TEST_RES   0xF001u
+#define VIRGL_TEST_W     16u
+#define VIRGL_TEST_H     16u
+
+static void virtio_gpu_virgl_selftest(void) {
+    const uint32_t npix  = VIRGL_TEST_W * VIRGL_TEST_H;
+    const uint32_t bytes = npix * 4u;                     // BGRA8
+    phys_addr_t bp = pmm_buddy_alloc(0);
+    if (!PMM_ALLOC_OK(bp)) { kprintf("[virtio-gpu] virgl selftest: no mem\n"); return; }
+    volatile uint32_t* back = (volatile uint32_t*)((uintptr_t)bp + HHDM_OFFSET);
+
+    for (uint32_t i = 0; i < npix; i++) back[i] = 0xFF000000u | i;   // every pixel unique
+
+    int ok = vgpu_ctx_create(VIRGL_TEST_CTX)
+          && vgpu_resource_create_3d(VIRGL_TEST_RES, PIPE_TEXTURE_2D,
+                                     VIRGL_FORMAT_B8G8R8A8_UNORM,
+                                     VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW,
+                                     VIRGL_TEST_W, VIRGL_TEST_H, 1)
+          && virtio_gpu_resource_attach_backing_single(VIRGL_TEST_RES, bp, bytes)
+          && vgpu_ctx_attach_resource(VIRGL_TEST_CTX, VIRGL_TEST_RES);
+    if (!ok) { kprintf("[virtio-gpu] virgl selftest: setup FAILED\n"); goto out; }
+
+    if (!vgpu_transfer_3d(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D, VIRGL_TEST_CTX,
+                          VIRGL_TEST_RES, VIRGL_TEST_W, VIRGL_TEST_H)) {
+        kprintf("[virtio-gpu] virgl selftest: TO_HOST_3D FAILED\n"); goto out;
+    }
+    for (uint32_t i = 0; i < npix; i++) back[i] = 0xDEADBEEFu;       // wipe
+    __asm__ volatile("mfence" ::: "memory");
+    if (!vgpu_transfer_3d(VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D, VIRGL_TEST_CTX,
+                          VIRGL_TEST_RES, VIRGL_TEST_W, VIRGL_TEST_H)) {
+        kprintf("[virtio-gpu] virgl selftest: FROM_HOST_3D FAILED\n"); goto out;
+    }
+    __asm__ volatile("mfence" ::: "memory");
+
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < npix; i++) if (back[i] != (0xFF000000u | i)) bad++;
+    if (bad == 0)
+        kprintf("[virtio-gpu] virgl selftest: PASS (3D resource round-trip %ux%u)\n",
+                VIRGL_TEST_W, VIRGL_TEST_H);
+    else
+        kprintf("[virtio-gpu] virgl selftest: FAIL (%u/%u px wrong, first=%x)\n",
+                bad, npix, back[0]);
+out:
+    virtio_gpu_resource_unref(VIRGL_TEST_RES);   // harmless if never created
+    vgpu_ctx_destroy(VIRGL_TEST_CTX);
+    pmm_buddy_free(bp, 0);
 }
 
 int virtio_gpu_set_scanout(uint32_t scanout_id, uint32_t res_id,
