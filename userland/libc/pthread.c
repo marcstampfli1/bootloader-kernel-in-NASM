@@ -548,6 +548,45 @@ int pthread_condattr_init(pthread_condattr_t* a)          { if (!a) return EINVA
 int pthread_condattr_destroy(pthread_condattr_t* a)       { (void)a; return 0; }
 int pthread_condattr_setclock(pthread_condattr_t* a, clockid_t clk) { if (!a) return EINVAL; a->clock = (int)clk; return 0; }
 
+// ── Barrier ──────────────────────────────────────────────────────────
+// Standard generation-counter barrier: the last arrival bumps `gen` and
+// broadcasts, releasing exactly the cohort that was waiting on that gen.
+// The gen guard makes a spurious cond wakeup, and immediate barrier reuse,
+// both safe -- a waiter only leaves when its own generation has advanced.
+int pthread_barrier_init(pthread_barrier_t* b, const pthread_barrierattr_t* a,
+                         unsigned count) {
+    (void)a;
+    if (!b || count == 0) return EINVAL;
+    pthread_mutex_init(&b->m, 0);
+    pthread_cond_init(&b->c, 0);
+    b->count = count;
+    b->waiting = 0;
+    b->gen = 0;
+    return 0;
+}
+int pthread_barrier_destroy(pthread_barrier_t* b) {
+    if (!b) return EINVAL;
+    pthread_mutex_destroy(&b->m);
+    pthread_cond_destroy(&b->c);
+    return 0;
+}
+int pthread_barrier_wait(pthread_barrier_t* b) {
+    if (!b) return EINVAL;
+    pthread_mutex_lock(&b->m);
+    unsigned g = b->gen;
+    if (++b->waiting == b->count) {
+        b->gen++;                       // release this cohort, arm the next
+        b->waiting = 0;
+        pthread_cond_broadcast(&b->c);
+        pthread_mutex_unlock(&b->m);
+        return PTHREAD_BARRIER_SERIAL_THREAD;   // exactly one thread gets this
+    }
+    while (g == b->gen)
+        pthread_cond_wait(&b->c, &b->m);
+    pthread_mutex_unlock(&b->m);
+    return 0;
+}
+
 // ── Once ─────────────────────────────────────────────────────────────
 
 int pthread_once(pthread_once_t* once, void (*init)(void)) {

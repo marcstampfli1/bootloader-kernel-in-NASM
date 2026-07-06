@@ -1677,6 +1677,8 @@ static inline int setrlimit(int resource, const struct rlimit* rlim) {
 // every name sysconf() implements.
 #define _SC_NPROCESSORS_CONF 10
 #define _SC_NPROCESSORS_ONLN 11
+#define _SC_PHYS_PAGES      85
+#define _SC_AVPHYS_PAGES    86
 long sysconf(int name);
 long pathconf(const char* path, int name);
 int  confstr(int name, char* buf, size_t len);

@@ -1834,6 +1834,14 @@ long sysconf(int name) {
         long n = (long)syscall0(113 /* SYS_NPROC */);
         return n > 0 ? n : 1;
     }
+    case _SC_PHYS_PAGES:
+    case _SC_AVPHYS_PAGES:
+        // Total/available physical RAM in pages.  MakaOS exposes no meminfo
+        // syscall yet, so report a sane default (1 GiB) rather than -1: callers
+        // like Mesa use this only to size caches/pools, and a negative here
+        // would make total-memory math wrap.  TODO: back this with a real PMM
+        // page-count syscall when one exists.
+        return (1024L * 1024 * 1024) / 4096;
     default:             return -1;
     }
 }

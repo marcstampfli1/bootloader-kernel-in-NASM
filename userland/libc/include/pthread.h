@@ -76,6 +76,18 @@ typedef struct { int kind; } pthread_rwlockattr_t;
 
 typedef struct { volatile int flag; } pthread_spinlock_t;
 
+// ── Barrier ──────────────────────────────────────────────────────────
+// Generation-counter barrier over the existing mutex+cond (see pthread.c).
+typedef struct {
+    pthread_mutex_t m;
+    pthread_cond_t  c;
+    unsigned        count;    // threads required to trip the barrier
+    unsigned        waiting;  // threads currently blocked at it
+    unsigned        gen;      // bumped each trip so cohorts never mix
+} pthread_barrier_t;
+typedef struct { int unused; } pthread_barrierattr_t;
+#define PTHREAD_BARRIER_SERIAL_THREAD (-1)
+
 // ── Attr ─────────────────────────────────────────────────────────────
 int pthread_attr_init(pthread_attr_t* a);
 int pthread_attr_destroy(pthread_attr_t* a);
@@ -125,6 +137,12 @@ int pthread_cond_broadcast(pthread_cond_t* c);
 int pthread_condattr_init(pthread_condattr_t* a);
 int pthread_condattr_destroy(pthread_condattr_t* a);
 int pthread_condattr_setclock(pthread_condattr_t* a, clockid_t clk);
+
+// ── Barrier ──────────────────────────────────────────────────────────
+int pthread_barrier_init(pthread_barrier_t* b, const pthread_barrierattr_t* a,
+                         unsigned count);
+int pthread_barrier_destroy(pthread_barrier_t* b);
+int pthread_barrier_wait(pthread_barrier_t* b);
 
 // ── Once ─────────────────────────────────────────────────────────────
 int pthread_once(pthread_once_t* once, void (*init)(void));

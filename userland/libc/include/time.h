@@ -52,6 +52,11 @@ typedef int clockid_t;
 int clock_gettime(clockid_t id, struct timespec* ts);
 int clock_getres(clockid_t id, struct timespec* res);
 
+// clock_nanosleep — relative (flags==0) or absolute (TIMER_ABSTIME) sleep.
+#define TIMER_ABSTIME 1
+int clock_nanosleep(clockid_t id, int flags,
+                    const struct timespec* req, struct timespec* rem);
+
 struct tm* gmtime(const time_t* t);
 struct tm* localtime(const time_t* t);
 // Thread-safe reentrant variants — preferred for new code.  Write

@@ -53,6 +53,8 @@ size_t confstr(int name, char* buf, size_t len);
 #define _SC_NPROCESSORS_ONLN  11
 #define _SC_PAGESIZE          30
 #define _SC_PAGE_SIZE         _SC_PAGESIZE
+#define _SC_PHYS_PAGES        85
+#define _SC_AVPHYS_PAGES      86
 #define _SC_CLK_TCK           2
 #define _SC_OPEN_MAX          4
 int     ftruncate(int fd, off_t len);

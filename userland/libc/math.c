@@ -424,6 +424,31 @@ float roundf(float x) {
     return               (float)ceil ((double)x - 0.5);
 }
 
+// rint / nearbyint: round to nearest integer, ties to EVEN (the C default
+// FE_TONEAREST rounding mode).  This is NOT round() -- round() is ties-away.
+// Built on the existing trunc/fabs/fmod so it needs no SSE4.1 (matches this
+// file's no-__builtin, SSE2-friendly policy).  nearbyint == rint except it
+// must not raise FE_INEXACT; we don't track that flag, so they're identical.
+double rint(double x) {
+    double t = trunc(x);
+    double d = fabs(x - t);
+    if (d < 0.5) return t;
+    double away = t + (x < 0.0 ? -1.0 : 1.0);   // step toward +/-inf
+    if (d > 0.5) return away;
+    // Exactly halfway: pick whichever of {t, away} is even.
+    return (fmod(t, 2.0) == 0.0) ? t : away;
+}
+float rintf(float x) { return (float)rint((double)x); }
+double nearbyint(double x) { return rint(x); }
+float  nearbyintf(float x) { return rintf(x); }
+
+// lrint / llrint: rint() then convert to integer.  rint already produced an
+// integral value, so the cast is exact (no double-rounding).
+long      lrint(double x)   { return (long)rint(x); }
+long      lrintf(float x)   { return (long)rintf(x); }
+long long llrint(double x)  { return (long long)rint(x); }
+long long llrintf(float x)  { return (long long)rintf(x); }
+
 double fmin(double a, double b) { return a < b ? a : b; }
 double fmax(double a, double b) { return a > b ? a : b; }
 float  fminf(float a, float b)  { return a < b ? a : b; }
