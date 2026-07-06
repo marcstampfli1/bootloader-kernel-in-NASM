@@ -319,7 +319,10 @@ double fma(double a, double b, double c)  { return a * b + c; }
 float  fmaf(float a, float b, float c)    { return a * b + c; }
 
 float frexpf(float x, int* ep) { return (float)frexp((double)x, ep); }
-long  lroundf(float x)         { return (long)roundf(x); }
+long      lround(double x)     { return (long)round(x); }
+long      lroundf(float x)     { return (long)roundf(x); }
+long long llround(double x)    { return (long long)round(x); }
+long long llroundf(float x)    { return (long long)roundf(x); }
 float modff(float x, float* ip) {
     double i; float r = (float)modf((double)x, &i);
     if (ip) *ip = (float)i;

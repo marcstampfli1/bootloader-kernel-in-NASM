@@ -60,6 +60,7 @@ size_t confstr(int name, char* buf, size_t len);
 int     ftruncate(int fd, off_t len);
 int     truncate(const char* path, off_t len);
 int     fsync(int fd);
+void    sync(void);
 int     fdatasync(int fd);
 
 // Path ops

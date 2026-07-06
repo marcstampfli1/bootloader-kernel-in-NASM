@@ -485,3 +485,4 @@ int gethostname(char* name, size_t len) {
 // apps (databases, journal files) can actually force a flush.
 int fsync(int fd)     { (void)fd; return 0; }
 int fdatasync(int fd) { (void)fd; return 0; }
+void sync(void)       { }   // no-op until SYS_FSYNC exists (matches fsync above)

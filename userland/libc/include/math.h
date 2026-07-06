@@ -88,7 +88,10 @@ double frexp(double, int*);
 float  frexpf(float, int*);
 double modf(double, double*);
 float  modff(float, float*);
-long   lroundf(float);
+long      lround(double);
+long      lroundf(float);
+long long llround(double);
+long long llroundf(float);
 
 // long double variants — alias to double on MakaOS (no 80-bit x87).
 long double sqrtl(long double);
