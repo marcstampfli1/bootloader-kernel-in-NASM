@@ -23,6 +23,7 @@ struct sched_param {
 #define SCHED_IDLE  5
 
 int sched_yield(void);
+int sched_getcpu(void);            // current CPU; MakaOS hint -> always 0
 int sched_get_priority_min(int policy);
 int sched_get_priority_max(int policy);
 int sched_getscheduler(pid_t pid);

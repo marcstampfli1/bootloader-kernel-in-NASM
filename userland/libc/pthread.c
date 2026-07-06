@@ -135,6 +135,14 @@ static int self_tid(void) {
     return g_self_tid;
 }
 
+// pthread_getcpuclockid: MakaOS has one system clock; per-thread CPU time is
+// not separated, so hand back CLOCK_THREAD_CPUTIME_ID (routed to that clock).
+int pthread_getcpuclockid(pthread_t tid, clockid_t* clk) {
+    (void)tid;
+    if (clk) *clk = CLOCK_THREAD_CPUTIME_ID;
+    return 0;
+}
+
 // ── Thread lifecycle ─────────────────────────────────────────────────
 
 int pthread_attr_init(pthread_attr_t* a) {

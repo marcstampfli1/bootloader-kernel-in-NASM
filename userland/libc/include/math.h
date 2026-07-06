@@ -79,8 +79,16 @@ double tanh(double);
 double hypot(double, double);
 double copysign(double, double);
 double ldexp(double, int);
+float  ldexpf(float, int);
+double exp2(double);
+float  exp2f(float);
+double fma(double, double, double);
+float  fmaf(float, float, float);
 double frexp(double, int*);
+float  frexpf(float, int*);
 double modf(double, double*);
+float  modff(float, float*);
+long   lroundf(float);
 
 // long double variants — alias to double on MakaOS (no 80-bit x87).
 long double sqrtl(long double);

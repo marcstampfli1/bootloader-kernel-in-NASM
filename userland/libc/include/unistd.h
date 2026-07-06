@@ -82,6 +82,8 @@ ssize_t pwrite(int fd, const void* buf, size_t n, off_t off);
 pid_t  fork(void);
 pid_t  getpid(void);
 pid_t  getppid(void);
+int    gettid(void);               // calling thread's kernel task id
+long   syscall(long number, ...);  // Linux-number compat shim (see sys/syscall.h)
 int    execve(const char* path, char* const argv[], char* const envp[]);
 int    execv(const char* path, char* const argv[]);
 int    execvp(const char* file, char* const argv[]);

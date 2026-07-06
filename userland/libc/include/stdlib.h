@@ -6,6 +6,8 @@ extern "C" {
 #endif
 
 #include <stddef.h>
+#include <alloca.h>   // glibc exposes alloca() via <stdlib.h>; portable code
+                      // (Mesa's c99_alloca.h) relies on that. Match it.
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1

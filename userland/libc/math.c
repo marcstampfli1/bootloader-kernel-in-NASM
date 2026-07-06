@@ -305,6 +305,26 @@ double ldexp(double x, int e) {
     bits = (bits & 0x800FFFFFFFFFFFFFULL) | ((uint64_t)ex << 52);
     return bits2d(bits);
 }
+float ldexpf(float x, int e) { return (float)ldexp((double)x, e); }
+
+// exp2 / exp2f: 2^x, built on pow (there is no dedicated hardware path here).
+double exp2(double x)  { return pow(2.0, x); }
+float  exp2f(float x)  { return powf(2.0f, x); }
+
+// fma / fmaf: multiply-add.  MakaOS targets baseline x86-64 (no guaranteed FMA3),
+// so this is the plain a*b+c form (one extra rounding vs a true fused op) --
+// matches what most soft-float and non-FMA builds use; adequate for the GLSL
+// constant folding and shader math that call it.
+double fma(double a, double b, double c)  { return a * b + c; }
+float  fmaf(float a, float b, float c)    { return a * b + c; }
+
+float frexpf(float x, int* ep) { return (float)frexp((double)x, ep); }
+long  lroundf(float x)         { return (long)roundf(x); }
+float modff(float x, float* ip) {
+    double i; float r = (float)modf((double)x, &i);
+    if (ip) *ip = (float)i;
+    return r;
+}
 
 double frexp(double x, int* ep) {
     if (x == 0.0) { *ep = 0; return 0.0; }

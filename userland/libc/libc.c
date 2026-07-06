@@ -1862,6 +1862,35 @@ long sysconf(int name) {
 long pathconf(const char* path, int name) { (void)path; (void)name; return -1; }
 int  confstr(int name, char* buf, size_t len) { (void)name; (void)buf; (void)len; return 0; }
 
+// ── scheduling / priority hints ──────────────────────────────────────────
+// sched_getcpu: which CPU the caller runs on.  MakaOS exposes no getcpu, so
+// report 0 -- callers (Mesa's u_thread) use it only for cache/affinity hints.
+int sched_getcpu(void) { return 0; }
+
+// Priority (nice) is a no-op: MakaOS has no nice levels.  Accept and report the
+// default so code that lowers worker-thread priority degrades to a harmless
+// no-op rather than failing.
+int setpriority(int which, int who, int prio) { (void)which; (void)who; (void)prio; return 0; }
+int getpriority(int which, int who) { (void)which; (void)who; return 0; }
+
+// syscall(2) compatibility shim.  MakaOS is Linux-SOURCE compatible but NOT
+// syscall-NUMBER compatible, so we must NOT forward the raw number to the
+// kernel (that would invoke a different call).  Map the specific Linux numbers
+// portable code passes to their MakaOS libc equivalents; anything else is
+// ENOSYS.  Extend the switch as new callers appear.  <sys/syscall.h> defines
+// the matching SYS_* tags.
+// gettid(2): the calling thread's kernel task id.  MakaOS makes every thread a
+// task, so SYS_GETPID already returns the per-thread id (what pthread caches as
+// its tid).  Self-contained here so syscall() below has no cross-object dep.
+int gettid(void) { return (int)syscall0(SYS_GETPID); }
+
+long syscall(long n, ...) {
+    switch (n) {
+    case 186: return gettid();   // SYS_gettid
+    default:  errno = ENOSYS; return -1;
+    }
+}
+
 // ── mkstemp / mktemp ─────────────────────────────────────────────────────
 int mkstemp(char* tmpl) {
     if (mkdtemp_r(tmpl) < 0) return -1;

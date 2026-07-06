@@ -11,4 +11,10 @@
 
 #include <unistd.h>   // syscall() prototype
 
+// Linux syscall-number TAGS recognised by libc's syscall() compat shim (which
+// maps them to MakaOS libc calls, NOT to raw kernel numbers -- MakaOS is
+// source- but not ABI-number-compatible). Values match Linux/x86-64 so ported
+// code that hardcodes them works. Add a tag here only when the shim handles it.
+#define SYS_gettid 186
+
 #endif // _SYS_SYSCALL_H

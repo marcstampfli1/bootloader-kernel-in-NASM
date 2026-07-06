@@ -35,10 +35,14 @@ extern "C" {
 #define PRIX64 "llX"
 
 #define PRIdMAX  PRId64
+#define PRIiMAX  PRIi64
+#define PRIoMAX  PRIo64
 #define PRIuMAX  PRIu64
 #define PRIxMAX  PRIx64
 #define PRIXMAX  PRIX64
 #define PRIdPTR  PRId64
+#define PRIiPTR  PRIi64
+#define PRIoPTR  PRIo64
 #define PRIuPTR  PRIu64
 #define PRIxPTR  PRIx64
 #define PRIXPTR  PRIX64

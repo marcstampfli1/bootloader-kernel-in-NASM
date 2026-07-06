@@ -199,6 +199,7 @@ int pthread_getname_np(pthread_t tid, char* name, size_t n);
 // that probe for real-time priorities don't explode at link time.
 int pthread_setschedparam(pthread_t tid, int policy, const struct sched_param* p);
 int pthread_getschedparam(pthread_t tid, int* policy, struct sched_param* p);
+int pthread_getcpuclockid(pthread_t tid, clockid_t* clock_id);
 
 #ifdef __cplusplus
 }
