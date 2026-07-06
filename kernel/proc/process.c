@@ -218,12 +218,13 @@ void task_files_release(task_files_t* f) {
 // PRIMITIVE: drop a task's fd table on exit, in the ONE correct order.
 // task_files_release RCU-defers the table-struct free (a /proc/<pid>/fd reader
 // snapshots files_shared, then tf->ft, then a fd, under rcu_read_lock), and
-// call_rcu_expedited runs the grace period + frees INLINE.  So the caller MUST
-// unpublish files_shared with a RELEASE store BEFORE the release: otherwise the
-// inline grace period elapses while the pointer is still published, and a reader
-// that opens its rcu_read_lock section just after it loads an already-freed
-// table -> cross-process UAF (freed task_files_t / fdtable_t, and vfs_tryget on
-// a freed vfs_file_t vtable).  Both exit paths (sys_exit and the fatal-signal
+// call_rcu_expedited frees after a full grace period (inline when preemptible,
+// async when under a lock).  Either way the caller MUST unpublish files_shared
+// with a RELEASE store BEFORE the release: otherwise the grace period elapses
+// while the pointer is still published, and a reader that opens its
+// rcu_read_lock section just after it loads an already-freed table ->
+// cross-process UAF (freed task_files_t / fdtable_t, and vfs_tryget on a freed
+// vfs_file_t vtable).  Both exit paths (sys_exit and the fatal-signal
 // SIG_DFL terminate) go through here so the unpublish-before-release order is a
 // single source of truth and cannot drift -- it previously HAD drifted: the
 // signal path freed first and NULLed after (a plain store), reopening the UAF on

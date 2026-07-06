@@ -3,6 +3,9 @@
 #include "sched.h"
 #include "common.h"
 #include "ipi.h"
+#include "kheap.h"    // kmalloc/kfree for the under-spinlock deferral (see call_rcu_expedited)
+#include "kprintf.h"
+#include "panic.h"    // loud panic instead of a silent cli;hlt on the preempt-disabled rail
 
 // ── RCU — QSBR implementation ────────────────────────────────────────────
 //
@@ -41,10 +44,9 @@ void synchronize_rcu(void) {
     // Safety rail: calling this with preempt disabled would self-deadlock.
     // The caller's own CPU could never reach a quiescent state because
     // its preempt_depth is stuck > 0.
-    if (this_cpu()->preempt_depth > 0) {
-        serial_puts_dbg("[rcu] PANIC: synchronize_rcu with preempt disabled\n");
-        for (;;) __asm__ volatile("cli; hlt");
-    }
+    if (this_cpu()->preempt_depth > 0)
+        panic("synchronize_rcu with preempt disabled (depth=%d): a spinlock "
+              "section cannot busy-wait a grace period", this_cpu()->preempt_depth);
 
     unsigned n = num_cpus();
     uint64_t snap[MAX_CPUS];
@@ -137,10 +139,15 @@ static void rcu_expedited_cb(void* arg) {
 }
 
 void synchronize_rcu_expedited(void) {
-    if (this_cpu()->preempt_depth > 0) {
-        serial_puts_dbg("[rcu] PANIC: synchronize_rcu_expedited with preempt disabled\n");
-        for (;;) __asm__ volatile("cli; hlt");
-    }
+    // A loud panic, NOT a silent halt: this used to serial_puts_dbg + cli;hlt,
+    // which compiles to a bare hang at KERNEL_DEBUG_SERIAL=0 -- a spinlock caller
+    // (via call_rcu_expedited) once wedged the machine invisibly this way.
+    // call_rcu_expedited now defers instead of reaching here under a lock, but a
+    // direct caller that violates the rule must fail loudly, not silently.
+    if (this_cpu()->preempt_depth > 0)
+        panic("synchronize_rcu_expedited with preempt disabled (depth=%d): "
+              "call it after dropping the spinlock, or use call_rcu_expedited",
+              this_cpu()->preempt_depth);
 
     unsigned n = num_cpus();
     uint64_t snap[MAX_CPUS];
@@ -242,11 +249,39 @@ _Static_assert(__builtin_offsetof(pmm_rcu_head_t, data) ==
                __builtin_offsetof(rcu_head_t,     data),
                "rcu_head data offset mismatch");
 
+// Async fallback node for call_rcu_expedited when it cannot synchronize.
+typedef struct { rcu_head_t head; rcu_func_t func; void* data; } rcu_defer_t;
+static void rcu_defer_cb(void* p) {
+    rcu_defer_t* d = (rcu_defer_t*)p;
+    d->func(d->data);
+    kfree(d);
+}
+
 void call_rcu_expedited(rcu_func_t func, void* data) {
-    // Expedited is still synchronous by design — IPI-forced grace
-    // period, intended for latency-sensitive user-syscall-return
-    // paths that want the callback before they unblock.  Not used
-    // by the pmm slab path.
+    // This is a deferred FREE: the caller does not consume a result, it just
+    // wants `data` reclaimed after a grace period.  If preemption is disabled
+    // we are inside a spinlock (post spinlock-fold), and synchronize_rcu_
+    // expedited() would panic -- busy-waiting a grace period with preemption off
+    // both trips that guard and risks a reader-holds-our-lock deadlock.  So fall
+    // back to the async per-CPU callback list (drained by the GP kthread):
+    // identical reclaim semantics, only the "expedited" latency is lost.  This
+    // is exactly the case that hit fd_table_grow (under files->lock) once
+    // spinlocks became non-preemptible.  kmalloc never sleeps here (returns NULL
+    // on OOM), so it is safe under the lock.
+    if (this_cpu()->preempt_depth > 0) {
+        rcu_defer_t* d = (rcu_defer_t*)kmalloc(sizeof(*d));
+        if (d) {
+            d->func = func;
+            d->data = data;
+            call_rcu_head(&d->head, rcu_defer_cb, d);
+            return;
+        }
+        // OOM under a spinlock: we cannot synchronize (would panic) and cannot
+        // queue.  Leak this one small reclaim rather than crash -- survivable,
+        // and loud so it is not silent.
+        kprintf("[rcu] WARN: call_rcu_expedited OOM under lock; leaking one node\n");
+        return;
+    }
     synchronize_rcu_expedited();
     func(data);
 }
