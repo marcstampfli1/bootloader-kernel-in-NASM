@@ -124,6 +124,50 @@ if "'makaos'" not in s:
     print("patched system_has_kms_drm += makaos")
 PY
 
+    # Patch 5: every library MakaOS builds must be STATIC -- libc.a is non-PIC
+    # (static TLS uses R_X86_64_TPOFF32), so a shared object cannot link it.
+    # These targets are explicit shared_library() (unaffected by
+    # default_library=static), so convert them and drop the shared-only kwargs.
+    python3 - "$MESA_SRC" <<'PY'
+import sys, re, os
+root = sys.argv[1]
+targets = [
+    "src/mapi/shared-glapi/meson.build", "src/egl/meson.build",
+    "src/mapi/es2api/meson.build", "src/mapi/es1api/meson.build",
+    "src/gbm/meson.build",
+]
+kw = [r"^\s*version\s*:\s*[a-zA-Z_][a-zA-Z0-9_]*\s*,?\s*$\n",
+      r"^\s*version\s*:\s*'[0-9][^\n]*\n",
+      r"^\s*soversion\s*:.*\n", r"^\s*darwin_versions\s*:.*\n",
+      r"^\s*vs_module_defs\s*:.*\n"]
+for rel in targets:
+    p = os.path.join(root, rel); s = open(p).read()
+    if "MAKAOS_STATIC_LIB" in s: continue
+    o = s; s = s.replace("shared_library(", "static_library(")
+    for pat in kw: s = re.sub(pat, "", s, flags=re.M)
+    if s != o:
+        open(p, 'w').write("# MAKAOS_STATIC_LIB: shared_library -> static (no PIC libc)\n" + s)
+        print("static_library:", rel)
+PY
+
+    # Patch 6: virgl's shader disk cache uses build_id, which needs
+    # dl_iterate_phdr (absent on static MakaOS). shader-cache is disabled anyway,
+    # so run without a disk cache.
+    python3 - "$MESA_SRC/src/gallium/drivers/virgl/virgl_screen.c" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+if 'MAKAOS_NO_DISK_CACHE' not in s:
+    start = ("   const struct build_id_note *note =\n"
+             "      build_id_find_nhdr_for_addr(virgl_disk_cache_create);")
+    end = '   screen->disk_cache = disk_cache_create("virgl", timestamp, 0);'
+    i = s.find(start); j = s.find(end)
+    assert i != -1 and j != -1, "virgl_disk_cache_create body not found"
+    s = s[:i] + ("   /* MAKAOS_NO_DISK_CACHE: no dl_iterate_phdr for build_id and\n"
+                 "    * shader-cache is disabled -- run without a disk cache. */\n"
+                 "   screen->disk_cache = NULL;") + s[j + len(end):]
+    open(p, 'w').write(s); print("stubbed virgl_disk_cache_create")
+PY
+
 }
 
 # ── Sysroot scaffolding (same pattern as the other meson ports) ───────
@@ -161,6 +205,11 @@ Description: Wayland EGL backend interface
 Version: 3
 Cflags: -I${includedir}
 PC
+    fi
+    # Mesa's util/libsync.h is self-contained (sync_file structs inlined) but a
+    # few TUs include it with <> instead of "". Put it on the sysroot path.
+    if [ -f "$MESA_SRC/src/util/libsync.h" ]; then
+        cp "$MESA_SRC/src/util/libsync.h" "$SYSROOT/usr/include/libsync.h"
     fi
     "$REPO_ROOT/scripts/gen-pkgconfig.sh" >/dev/null
 }
