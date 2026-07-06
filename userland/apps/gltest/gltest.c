@@ -90,10 +90,13 @@ int main(void) {
 
     if (!eglBindAPI(EGL_OPENGL_ES_API)) return fail(4, "eglBindAPI");
 
+    // We render surfaceless to an FBO, so the surface type is irrelevant to us;
+    // GBM/virgl expose window configs, so ask for EGL_WINDOW_BIT (the default)
+    // rather than pbuffer, and don't over-constrain the color sizes.
     const EGLint cfg_attr[] = {
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
         EGL_NONE
     };
     EGLConfig config; EGLint n = 0;
@@ -127,14 +130,18 @@ int main(void) {
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         return fail(8, "FBO incomplete");
 
+    ioctl(drmfd, 0xC1000001UL, (void*)0);   /* progress: FBO complete, about to clear */
     glViewport(0, 0, W, H);
     glClearColor(1.0f, 0.0f, 1.0f, 1.0f);   /* magenta */
     glClear(GL_COLOR_BUFFER_BIT);
+    ioctl(drmfd, 0xC1000002UL, (void*)0);   /* progress: cleared, about to finish */
     glFinish();
+    ioctl(drmfd, 0xC1000003UL, (void*)0);   /* progress: finished, about to readpixels */
 
     unsigned char* px = (unsigned char*)malloc(W * H * 4);
     if (!px) return fail(9, "malloc");
     glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    ioctl(drmfd, 0xC1000004UL, (void*)0);   /* progress: readpixels done */
 
     GLenum err = glGetError();
     unsigned bad = 0, first = ((unsigned)px[0]) | ((unsigned)px[1] << 8) |
