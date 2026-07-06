@@ -137,6 +137,23 @@ typedef struct __attribute__((packed)) {
     } pmodes[VIRTIO_GPU_MAX_SCANOUTS];
 } virtio_gpu_resp_display_info_t;
 
+// Capset query (§5.7.6.7).  Read-only: reports which 3D command sets (virgl,
+// virgl2, ...) the host offers.  capset_id: 1=VIRGL, 2=VIRGL2.  Used by the
+// Phase 0 probe (docs/VIRGL_BRINGUP.md); no 3D command is issued.
+typedef struct __attribute__((packed)) {
+    virtio_gpu_ctrl_hdr_t hdr;
+    uint32_t capset_index;
+    uint32_t padding;
+} virtio_gpu_get_capset_info_t;
+
+typedef struct __attribute__((packed)) {
+    virtio_gpu_ctrl_hdr_t hdr;
+    uint32_t capset_id;
+    uint32_t capset_max_version;
+    uint32_t capset_max_size;
+    uint32_t padding;
+} virtio_gpu_resp_capset_info_t;
+
 // ── Driver state ────────────────────────────────────────────────────
 static int s_ok = 0;
 static pci_device_t                         s_dev;
@@ -487,6 +504,39 @@ int virtio_gpu_init(void) {
         if (resp.pmodes[i].enabled) {
             kprintf("[virtio-gpu] scanout %u: %ux%u\n",
                     i, resp.pmodes[i].r.width, resp.pmodes[i].r.height);
+        }
+    }
+
+    // ── Phase 0 virgl probe (read-only; does NOT enable 3D) ──────────────
+    // Report whether the host offers 3D (virgl) and enumerate its capsets so
+    // the virgl bring-up (docs/VIRGL_BRINGUP.md) knows what the host supports.
+    // We do NOT negotiate VIRTIO_GPU_F_VIRGL and issue NO 3D command -- the 2D
+    // path is byte-identical.  GET_CAPSET_INFO is a plain query available
+    // whenever the device advertises capsets (num_capsets > 0, set by the host
+    // when launched with virtio-gpu-gl + virglrenderer).
+    {
+        int virgl_offered = (dfeat & VIRTIO_GPU_F_VIRGL) != 0;
+        uint32_t ncaps = s_devcfg->num_capsets;
+        kprintf("[virtio-gpu] virgl(3D) offered by host: %s; num_capsets=%u\n",
+                virgl_offered ? "yes" : "no", ncaps);
+        for (uint32_t ci = 0; ci < ncaps; ci++) {
+            virtio_gpu_get_capset_info_t creq = {
+                .hdr.type     = VIRTIO_GPU_CMD_GET_CAPSET_INFO,
+                .capset_index = ci,
+            };
+            virtio_gpu_resp_capset_info_t cresp;
+            if (!vgpu_send_ctrl(&creq, sizeof(creq), &cresp, sizeof(cresp))) {
+                kprintf("[virtio-gpu] GET_CAPSET_INFO[%u] timeout\n", ci);
+                continue;
+            }
+            if (cresp.hdr.type != VIRTIO_GPU_RESP_OK_CAPSET_INFO) {
+                kprintf("[virtio-gpu] GET_CAPSET_INFO[%u] bad resp=%x\n",
+                        ci, cresp.hdr.type);
+                continue;
+            }
+            kprintf("[virtio-gpu] capset[%u]: id=%u max_version=%u max_size=%u\n",
+                    ci, cresp.capset_id, cresp.capset_max_version,
+                    cresp.capset_max_size);
         }
     }
 
