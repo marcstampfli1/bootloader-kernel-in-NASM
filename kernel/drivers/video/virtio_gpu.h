@@ -52,6 +52,31 @@ int virtio_gpu_set_scanout(uint32_t scanout_id, uint32_t res_id,
 int virtio_gpu_transfer_to_host_2d(uint32_t res_id, uint32_t w, uint32_t h);
 int virtio_gpu_resource_flush(uint32_t res_id, uint32_t w, uint32_t h);
 
+// ── 3D (virgl) API for the render-node DRM uAPI (Phase 2) ───────────────────
+// All return 0 on success, negative errno on failure.  Available only when the
+// host negotiated VIRTIO_GPU_F_VIRGL; callers gate on virtio_gpu_3d_available().
+// These wrap the internal virgl command layer for kernel/drivers/video/drm.c's
+// DRM_IOCTL_VIRTGPU_* handlers.  (TODO: fold into drm_backend_ops_t for full
+// backend-agnosticism, as the 2D path is; direct for now -- 3D has no mock.)
+int virtio_gpu_3d_available(void);   // 1 if virgl (3D) negotiated, else 0
+// Capset `idx` (0..num_capsets-1): fills id / max_version / max_size.
+int virtio_gpu_3d_capset(uint32_t idx, uint32_t* id, uint32_t* max_ver,
+                          uint32_t* max_size);
+// Fetch up to `size` bytes of capset `capset_id` v`version` into `out` (the
+// blob Mesa parses for host GL limits).  Returns 0 or -errno.
+int virtio_gpu_3d_get_capset(uint32_t capset_id, uint32_t version,
+                              void* out, uint32_t size);
+int virtio_gpu_3d_context_create(uint32_t ctx_id, uint32_t capset_id);
+int virtio_gpu_3d_context_destroy(uint32_t ctx_id);
+int virtio_gpu_3d_resource_create(uint32_t res_id, uint32_t target, uint32_t format,
+                                   uint32_t bind, uint32_t w, uint32_t h, uint32_t depth);
+int virtio_gpu_3d_ctx_attach_resource(uint32_t ctx_id, uint32_t res_id);
+// TRANSFER_TO/FROM_HOST_3D of box [x,y..x+w,y+h] at `offset` in the backing.
+int virtio_gpu_3d_transfer(int to_host, uint32_t ctx_id, uint32_t res_id,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                            uint64_t offset, uint32_t level);
+int virtio_gpu_3d_submit(uint32_t ctx_id, const void* cmds, uint32_t size);
+
 // Called at subsys init after virtio_gpu_init succeeds.  Registers
 // this device as the DRM core's active backend via drm_backend_register.
 void virtio_gpu_register_backend(void);

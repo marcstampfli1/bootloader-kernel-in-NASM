@@ -333,6 +333,11 @@ USER_LINK="$USERLAND_DIR/link.ld"
    -o "$BUILD_DIR/user_hello.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_hello.elf" "$BUILD_DIR/user_hello.bin"
 
+# virgltest -- drives the virtio-gpu 3D render-node uAPI (/dev/dri/renderD128)
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/virgltest/virgltest.c" -o "$BUILD_DIR/user_virgltest.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_virgltest.o" \
+   -o "$BUILD_DIR/user_virgltest.elf"
+
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
 ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
    -o "$BUILD_DIR/user_helloraw.elf"
@@ -811,6 +816,10 @@ if [ -f "$BUILD_DIR/user_home.elf" ]; then
 fi
 if [ -f "$BUILD_DIR/user_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_hello.elf" bin/hello
+fi
+if [ -f "$BUILD_DIR/user_virgltest.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_virgltest.elf" bin/virgltest
+    echo "[+] virgltest ELF installed at bin/virgltest (root:root 0755)"
 fi
 if [ -f "$BUILD_DIR/user_helloraw.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_helloraw.elf" bin/helloraw

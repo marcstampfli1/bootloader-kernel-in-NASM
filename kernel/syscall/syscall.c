@@ -468,6 +468,10 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_dri0   = (dev[0]=='d' && dev[1]=='r' && dev[2]=='i' && dev[3]=='/'
                              && dev[4]=='c' && dev[5]=='a' && dev[6]=='r' && dev[7]=='d'
                              && dev[8]=='0' && dev[9]=='\0');
+        uint8_t match_render = (dev[0]=='d' && dev[1]=='r' && dev[2]=='i' && dev[3]=='/'
+                             && dev[4]=='r' && dev[5]=='e' && dev[6]=='n' && dev[7]=='d'
+                             && dev[8]=='e' && dev[9]=='r' && dev[10]=='D' && dev[11]=='1'
+                             && dev[12]=='2' && dev[13]=='8' && dev[14]=='\0');  // renderD128
         uint8_t match_ptmx   = (dev[0]=='p' && dev[1]=='t' && dev[2]=='m'
                              && dev[3]=='x' && dev[4]=='\0');
         // /dev/pts/<N>: claim the slave side of an existing pty.
@@ -483,6 +487,7 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         else if (match_kbdraw) f = vfs_kbdraw_open();
         else if (match_eventn >= 0) { extern vfs_file_t* evdev_open_device(uint32_t); f = evdev_open_device((uint32_t)match_eventn); }
         else if (match_dri0)   { extern vfs_file_t* vfs_drm_open(void); f = vfs_drm_open(); }
+        else if (match_render) { extern vfs_file_t* vfs_drm_render_open(void); f = vfs_drm_render_open(); }
         else if (match_ptmx)   { extern vfs_file_t* pty_open_master(void); f = pty_open_master(); }
         else if (match_ptsn >= 0) { extern vfs_file_t* pty_open_slave_by_index(int); f = pty_open_slave_by_index(match_ptsn); }
         else if (match_kbd)    f = vfs_kbd_open();

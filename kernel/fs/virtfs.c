@@ -35,6 +35,7 @@ static const dev_node_t s_dev_nodes[] = {
     { "input/event2",  0, 0, 0660, FS_TYPE_CHAR },
     { "dri",           0, 0, 0755, FS_TYPE_DIR  },
     { "dri/card0",     0, 0, 0660, FS_TYPE_CHAR },
+    { "dri/renderD128",0, 0, 0666, FS_TYPE_CHAR },  // virgl 3D render node (Phase 2)
     { "ptmx",          0, 0, 0666, FS_TYPE_CHAR },
     { "pts",           0, 0, 0755, FS_TYPE_DIR  },
     { NULL, 0, 0, 0, 0 }

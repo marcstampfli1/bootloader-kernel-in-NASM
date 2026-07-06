@@ -175,6 +175,21 @@ static void drm_uncharge(task_t* t, uint64_t bytes) {
 #define DRM_IOCTL_MODE_GET_LEASE            0xC01064C8
 #define DRM_IOCTL_MODE_REVOKE_LEASE         0xC00464C9
 
+// ── virtio-gpu 3D (virgl) render-node ioctls -- Phase 2 (VIRGL_BRINGUP.md) ──
+// DRM_IOWR(DRM_COMMAND_BASE + n, struct), byte-exact with libdrm's
+// drm/virtgpu_drm.h (size byte = sizeof(arg struct)) so Mesa's virgl driver
+// binds unmodified.  Verified against /usr/include/drm/virtgpu_drm.h.
+#define DRM_IOCTL_VIRTGPU_MAP               0xC0106441  // drm_virtgpu_map (16)
+#define DRM_IOCTL_VIRTGPU_EXECBUFFER        0xC0406442  // drm_virtgpu_execbuffer (64)
+#define DRM_IOCTL_VIRTGPU_GETPARAM          0xC0106443  // drm_virtgpu_getparam (16)
+#define DRM_IOCTL_VIRTGPU_RESOURCE_CREATE   0xC0386444  // drm_virtgpu_resource_create (56)
+#define DRM_IOCTL_VIRTGPU_RESOURCE_INFO     0xC0106445  // drm_virtgpu_resource_info (16)
+#define DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST 0xC02C6446 // drm_virtgpu_3d_transfer_from_host (44)
+#define DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST  0xC02C6447  // drm_virtgpu_3d_transfer_to_host (44)
+#define DRM_IOCTL_VIRTGPU_WAIT              0xC0086448  // drm_virtgpu_3d_wait (8)
+#define DRM_IOCTL_VIRTGPU_GET_CAPS          0xC0186449  // drm_virtgpu_get_caps (24)
+#define DRM_IOCTL_VIRTGPU_CONTEXT_INIT      0xC010644B  // drm_virtgpu_context_init (16)
+
 // ── DRM capability IDs ──────────────────────────────────────────────
 #define DRM_CAP_DUMB_BUFFER          0x1
 #define DRM_CAP_VBLANK_HIGH_CRTC     0x2
@@ -425,6 +440,20 @@ typedef struct drm_event_vblank {
     uint32_t    crtc_id;
 } __attribute__((packed)) drm_event_vblank_t;
 
+// A 3D (virgl) render-node buffer object.  Unlike dumb buffers (linked list +
+// linear find), 3D bo handles are dense from 1 so we index an array directly by
+// (handle-1): O(1) create AND lookup, no idr/xarray tree (better than Linux's
+// virtio-gpu, which idr's every object).  handle==0 marks a freed slot.
+typedef struct drm_res3d {
+    uint32_t    handle;         // per-fd bo handle (1..); 0 = free slot
+    uint32_t    res_id;         // device-global virtio-gpu resource id
+    uint32_t    width, height;
+    uint32_t    format;         // virgl format
+    uint32_t    bytes;          // page-rounded backing allocation
+    phys_addr_t phys;           // backing pages (physically contiguous)
+    uint8_t     order;          // buddy order used
+} drm_res3d_t;
+
 typedef struct drm_client {
     drm_dumb_t* dumbs;
     drm_fb_t*   fbs;
@@ -435,6 +464,11 @@ typedef struct drm_client {
     uint8_t     evq[DRM_EVQ_SIZE];
     uint32_t    evq_head;
     uint32_t    evq_tail;
+    // 3D (virgl) render-node state -- only used on renderD128 fds.
+    uint32_t     virgl_ctx_id;         // device-global 3D context; 0 = uninit
+    drm_res3d_t* res3d;                // O(1) handle-indexed array (grows)
+    uint32_t     res3d_cap;            // allocated slot count
+    uint32_t     next_res3d_handle;    // dense, starts at 1
 } drm_client_t;
 
 // Device-global resource id allocator.  Never returns 0 (reserved).
@@ -466,6 +500,29 @@ static drm_fb_t* find_fb(drm_client_t* c, uint32_t fb_id) {
     for (drm_fb_t* fb = c->fbs; fb; fb = fb->next)
         if (fb->fb_id == fb_id) return fb;
     return NULL;
+}
+
+// Device-global 3D context id allocator (ctx 0 is reserved for the 2D path).
+static uint32_t s_next_ctx_id = 1;
+static uint32_t alloc_ctx_id(void) {
+    uint32_t r;
+    do { r = __atomic_fetch_add(&s_next_ctx_id, 1, __ATOMIC_RELAXED); } while (r == 0);
+    return r;
+}
+
+// O(1) 3D bo lookup: handles are dense from 1, so index straight in.
+static drm_res3d_t* find_res3d(drm_client_t* c, uint32_t handle) {
+    if (handle == 0 || handle > c->res3d_cap) return NULL;
+    drm_res3d_t* r = &c->res3d[handle - 1];
+    return (r->handle == handle) ? r : NULL;   // handle==0 => freed slot
+}
+
+// Free one 3D bo: unref the device resource + release backing pages + clear slot.
+static void res3d_free(drm_res3d_t* r) {
+    if (!r || r->handle == 0) return;
+    virtio_gpu_resource_unref(r->res_id);
+    if (r->phys) pmm_buddy_free(r->phys, r->order);
+    __builtin_memset(r, 0, sizeof(*r));   // handle=0 marks the slot free
 }
 
 // ── CREATE_DUMB ──────────────────────────────────────────────────────
@@ -1096,11 +1153,20 @@ int64_t drm_resolve_dumb_mmap(vfs_file_t* f, uint64_t offset,
     uint32_t handle = (uint32_t)(offset >> DRM_DUMB_OFFSET_SHIFT) & 0xFFFFFF;
     drm_client_t* c = client_of(f);
     drm_dumb_t* d = find_dumb(c, handle);
-    if (!d) return -ENOENT;
-    if (len > d->bytes_alloc) return -EINVAL;
-    *out_phys  = d->phys;
-    *out_bytes = d->bytes_alloc;
-    return 0;
+    if (d) {
+        if (len > d->bytes_alloc) return -EINVAL;
+        *out_phys = d->phys; *out_bytes = d->bytes_alloc;
+        return 0;
+    }
+    // Render-node (renderD128) 3D resource backing shares the same offset
+    // scheme; a render fd has no dumbs so the handle resolves here instead.
+    drm_res3d_t* r = find_res3d(c, handle);
+    if (r) {
+        if (len > r->bytes) return -EINVAL;
+        *out_phys = r->phys; *out_bytes = r->bytes;
+        return 0;
+    }
+    return -ENOENT;
 }
 
 // Predicate used by sys_mmap to detect a DRM fd without exposing
@@ -2469,6 +2535,221 @@ static int drm_poll_op(vfs_file_t* self, int events) {
 /* Map an ioctl request number to a short human-readable tag.  Used by
  * the dispatcher tracing so serial.txt reads as a commit pipeline
  * rather than a wall of hex. */
+// ── virtio-gpu 3D (virgl) render-node ioctls -- Phase 2 (VIRGL_BRINGUP.md) ──
+// Arg structs are byte-exact with libdrm's drm/virtgpu_drm.h so Mesa's virgl
+// gallium driver binds unmodified.  Handlers drive virtio_gpu.c's exported 3D
+// command layer.  Valid on a renderD128 fd; a 3D context is created on demand.
+typedef struct { uint64_t offset; uint32_t handle, pad; } drm_virtgpu_map_t;
+typedef struct {
+    uint32_t flags, size; uint64_t command, bo_handles;
+    uint32_t num_bo_handles; int32_t fence_fd; uint32_t ring_idx, syncobj_stride;
+    uint32_t num_in_syncobjs, num_out_syncobjs; uint64_t in_syncobjs, out_syncobjs;
+} drm_virtgpu_execbuffer_t;
+typedef struct { uint64_t param, value; } drm_virtgpu_getparam_t;
+typedef struct {
+    uint32_t target, format, bind, width, height, depth, array_size,
+             last_level, nr_samples, flags, bo_handle, res_handle, size, stride;
+} drm_virtgpu_resource_create_t;
+typedef struct { uint32_t bo_handle, res_handle, size, blob_mem; } drm_virtgpu_resource_info_t;
+typedef struct { uint32_t x, y, z, w, h, d; } drm_virtgpu_3d_box_t;
+typedef struct {
+    uint32_t bo_handle; drm_virtgpu_3d_box_t box;
+    uint32_t level, offset, stride, layer_stride;
+} drm_virtgpu_3d_transfer_t;
+typedef struct { uint32_t handle, flags; } drm_virtgpu_3d_wait_t;
+typedef struct { uint32_t cap_set_id, cap_set_ver; uint64_t addr; uint32_t size, pad; } drm_virtgpu_get_caps_t;
+typedef struct { uint32_t num_params, pad; uint64_t ctx_set_params; } drm_virtgpu_context_init_t;
+typedef struct { uint64_t param, value; } drm_virtgpu_ctx_set_param_t;
+
+#define VIRTGPU_PARAM_3D_FEATURES          1
+#define VIRTGPU_PARAM_CAPSET_QUERY_FIX     2
+#define VIRTGPU_PARAM_CONTEXT_INIT         6
+#define VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs 7
+#define VIRTGPU_CONTEXT_PARAM_CAPSET_ID    0x0001
+#define VIRTGPU_EXECBUF_FENCE_FD_OUT       0x02
+
+// A render fd gets one device-global 3D context, created on first use.
+static int drm_virgl_ensure_ctx(drm_client_t* c, uint32_t capset_id) {
+    if (c->virgl_ctx_id) return 0;
+    if (!virtio_gpu_3d_available()) return -ENODEV;
+    uint32_t ctx = alloc_ctx_id();
+    int rc = virtio_gpu_3d_context_create(ctx, capset_id);
+    if (rc != 0) return rc;
+    c->virgl_ctx_id = ctx;
+    return 0;
+}
+
+static int drm_ioctl_virtgpu_getparam(vfs_file_t* f, uint64_t arg) {
+    (void)f;
+    drm_virtgpu_getparam_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    uint64_t v = 0;
+    switch (a.param) {
+    case VIRTGPU_PARAM_3D_FEATURES:          v = virtio_gpu_3d_available() ? 1 : 0; break;
+    case VIRTGPU_PARAM_CAPSET_QUERY_FIX:     v = 1; break;
+    case VIRTGPU_PARAM_CONTEXT_INIT:         v = 1; break;
+    case VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs: v = (1u << 1) | (1u << 2); break; // VIRGL,VIRGL2
+    default: v = 0; break;
+    }
+    // Linux GETPARAM: `value` is a userspace pointer to the u64 to fill.
+    if (copy_to_user((void*)a.value, &v, sizeof(v)) != 0) return -EFAULT;
+    return 0;
+}
+
+static int drm_ioctl_virtgpu_get_caps(vfs_file_t* f, uint64_t arg) {
+    (void)f;
+    drm_virtgpu_get_caps_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (a.size == 0 || a.size > 4096u) return -EINVAL;
+    void* buf = kmalloc(a.size);
+    if (!buf) return -ENOMEM;
+    int rc = virtio_gpu_3d_get_capset(a.cap_set_id, a.cap_set_ver, buf, a.size);
+    if (rc == 0 && copy_to_user((void*)a.addr, buf, a.size) != 0) rc = -EFAULT;
+    kfree(buf);
+    return rc;
+}
+
+static int drm_ioctl_virtgpu_context_init(vfs_file_t* f, uint64_t arg) {
+    drm_client_t* c = client_of(f);
+    drm_virtgpu_context_init_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    uint32_t capset = 0;
+    if (a.num_params && a.num_params <= 8 && a.ctx_set_params) {
+        for (uint32_t i = 0; i < a.num_params; i++) {
+            drm_virtgpu_ctx_set_param_t p;
+            if (copy_from_user(&p, (void*)(a.ctx_set_params + (uint64_t)i * sizeof(p)),
+                               sizeof(p)) != 0) return -EFAULT;
+            if (p.param == VIRTGPU_CONTEXT_PARAM_CAPSET_ID) capset = (uint32_t)p.value;
+        }
+    }
+    if (c->virgl_ctx_id) return -EEXIST;   // one context per fd
+    return drm_virgl_ensure_ctx(c, capset);
+}
+
+static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
+    drm_client_t* c = client_of(f);
+    drm_virtgpu_resource_create_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (!virtio_gpu_3d_available()) return -ENODEV;
+    if (a.width == 0 || a.height == 0 || a.width > 16384 || a.height > 16384) return -EINVAL;
+
+    int rc = drm_virgl_ensure_ctx(c, 0);   // default virgl context if not inited
+    if (rc != 0) return rc;
+
+    uint32_t stride = a.stride ? a.stride : a.width * 4u;   // assume 4bpp if unset
+    uint64_t size64 = a.size ? a.size : (uint64_t)stride * a.height;
+    if (size64 == 0 || size64 > (64u << 20)) return -EINVAL;
+    uint64_t pages = (size64 + 4095) / 4096;
+    uint8_t order = 0; while (((uint64_t)1 << order) < pages) order++;
+    uint32_t bytes = (uint32_t)((uint64_t)1 << order) * 4096u;
+
+    rc = drm_charge(g_current, bytes);
+    if (rc < 0) return rc;
+    phys_addr_t phys = pmm_buddy_alloc(order);
+    if (phys == PMM_INVALID_ADDR) { drm_uncharge(g_current, bytes); return -ENOMEM; }
+    __builtin_memset((void*)((uintptr_t)phys + HHDM_OFFSET), 0, bytes);
+
+    uint32_t res_id = alloc_res_id();
+    rc = virtio_gpu_3d_resource_create(res_id, a.target, a.format, a.bind,
+                                       a.width, a.height, a.depth ? a.depth : 1);
+    if (rc == 0 && !virtio_gpu_resource_attach_backing_single(res_id, phys, bytes)) rc = -EIO;
+    if (rc == 0) rc = virtio_gpu_3d_ctx_attach_resource(c->virgl_ctx_id, res_id);
+    if (rc != 0) {
+        virtio_gpu_resource_unref(res_id);
+        pmm_buddy_free(phys, order); drm_uncharge(g_current, bytes);
+        return rc;
+    }
+
+    // Record in the O(1) handle-indexed array, growing on demand.
+    uint32_t h = c->next_res3d_handle ? c->next_res3d_handle : 1u;
+    if (h > c->res3d_cap) {
+        uint32_t ncap = c->res3d_cap ? c->res3d_cap * 2u : 8u;
+        if (ncap < h) ncap = h;
+        drm_res3d_t* na = (drm_res3d_t*)kmalloc(ncap * sizeof(drm_res3d_t));
+        if (!na) { virtio_gpu_resource_unref(res_id); pmm_buddy_free(phys, order);
+                   drm_uncharge(g_current, bytes); return -ENOMEM; }
+        __builtin_memset(na, 0, ncap * sizeof(drm_res3d_t));
+        if (c->res3d) {
+            __builtin_memcpy(na, c->res3d, c->res3d_cap * sizeof(drm_res3d_t));
+            kfree(c->res3d);
+        }
+        c->res3d = na; c->res3d_cap = ncap;
+    }
+    drm_res3d_t* r = &c->res3d[h - 1];
+    r->handle = h; r->res_id = res_id; r->width = a.width; r->height = a.height;
+    r->format = a.format; r->bytes = bytes; r->phys = phys; r->order = order;
+    c->next_res3d_handle = h + 1u;
+
+    a.bo_handle = h; a.res_handle = res_id; a.size = (uint32_t)size64; a.stride = stride;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+static int drm_ioctl_virtgpu_resource_info(vfs_file_t* f, uint64_t arg) {
+    drm_client_t* c = client_of(f);
+    drm_virtgpu_resource_info_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    drm_res3d_t* r = find_res3d(c, a.bo_handle);
+    if (!r) return -ENOENT;
+    a.res_handle = r->res_id; a.size = r->bytes; a.blob_mem = 0;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+static int drm_ioctl_virtgpu_map(vfs_file_t* f, uint64_t arg) {
+    drm_client_t* c = client_of(f);
+    drm_virtgpu_map_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (!find_res3d(c, a.handle)) return -ENOENT;
+    // Same magic-offset scheme as dumb buffers; the mmap resolver looks a render
+    // fd's handle up in res3d.  Handle spaces can't collide: a render fd has no
+    // dumbs and a card0 fd has no res3d.
+    a.offset = DRM_DUMB_OFFSET_MARK | ((uint64_t)a.handle << DRM_DUMB_OFFSET_SHIFT);
+    a.pad = 0;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+static int drm_ioctl_virtgpu_execbuffer(vfs_file_t* f, uint64_t arg) {
+    drm_client_t* c = client_of(f);
+    drm_virtgpu_execbuffer_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (!c->virgl_ctx_id) return -EINVAL;                       // context first
+    if (a.size == 0 || (a.size & 3u) || a.size > 4096u) return -EINVAL;
+    void* cmds = kmalloc(a.size);
+    if (!cmds) return -ENOMEM;
+    if (copy_from_user(cmds, (void*)a.command, a.size) != 0) { kfree(cmds); return -EFAULT; }
+    int rc = virtio_gpu_3d_submit(c->virgl_ctx_id, cmds, a.size);
+    kfree(cmds);
+    // Fences / syncobjs are Phase 2b; report "no out fence" if one was asked for.
+    if (rc == 0 && (a.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT)) {
+        a.fence_fd = -1;
+        if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    }
+    return rc;
+}
+
+static int drm_ioctl_virtgpu_transfer(vfs_file_t* f, uint64_t arg, int to_host) {
+    drm_client_t* c = client_of(f);
+    drm_virtgpu_3d_transfer_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (!c->virgl_ctx_id) return -EINVAL;
+    drm_res3d_t* r = find_res3d(c, a.bo_handle);
+    if (!r) return -ENOENT;
+    return virtio_gpu_3d_transfer(to_host, c->virgl_ctx_id, r->res_id,
+                                  a.box.x, a.box.y, a.box.w, a.box.h, a.offset, a.level);
+}
+
+static int drm_ioctl_virtgpu_wait(vfs_file_t* f, uint64_t arg) {
+    (void)f;
+    drm_virtgpu_3d_wait_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    // Submission is synchronous today: a command has already retired by the time
+    // its ioctl returned, so any resource is idle here.  Phase 2b makes this a
+    // real fence wait once submission goes async.
+    return 0;
+}
+
 static const char* drm_ioctl_name(uint64_t req) {
     switch (req) {
     case DRM_IOCTL_VERSION:                return "VERSION";
@@ -2554,6 +2835,17 @@ static int64_t drm_ioctl_impl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     case DRM_IOCTL_MODE_REVOKE_LEASE:      return -EOPNOTSUPP;
     case DRM_IOCTL_SET_MASTER:        return 0;  // single-client for now
     case DRM_IOCTL_DROP_MASTER:       return 0;
+    // virtio-gpu 3D (virgl) render-node uAPI (Phase 2).
+    case DRM_IOCTL_VIRTGPU_GETPARAM:      return drm_ioctl_virtgpu_getparam(self, arg);
+    case DRM_IOCTL_VIRTGPU_GET_CAPS:      return drm_ioctl_virtgpu_get_caps(self, arg);
+    case DRM_IOCTL_VIRTGPU_CONTEXT_INIT:  return drm_ioctl_virtgpu_context_init(self, arg);
+    case DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: return drm_ioctl_virtgpu_resource_create(self, arg);
+    case DRM_IOCTL_VIRTGPU_RESOURCE_INFO: return drm_ioctl_virtgpu_resource_info(self, arg);
+    case DRM_IOCTL_VIRTGPU_MAP:           return drm_ioctl_virtgpu_map(self, arg);
+    case DRM_IOCTL_VIRTGPU_EXECBUFFER:    return drm_ioctl_virtgpu_execbuffer(self, arg);
+    case DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST:   return drm_ioctl_virtgpu_transfer(self, arg, 1);
+    case DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: return drm_ioctl_virtgpu_transfer(self, arg, 0);
+    case DRM_IOCTL_VIRTGPU_WAIT:          return drm_ioctl_virtgpu_wait(self, arg);
     default:
         pr_warn("drm", "unknown ioctl req=0x%08x arg=0x%lx → ENOTTY",
                 (uint32_t)req, arg);
@@ -2597,6 +2889,13 @@ static void drm_close(vfs_file_t* self) {
         while (fb) { drm_fb_t* n = fb->next; drm_fb_free(fb); fb = n; }
         drm_dumb_t* d = c->dumbs;
         while (d)  { drm_dumb_t* n = d->next; dumb_free(d, g_current); d = n; }
+        // Tear down 3D (virgl) render-node state: free every live bo, then the
+        // handle array, then destroy the device-global context.
+        if (c->res3d) {
+            for (uint32_t i = 0; i < c->res3d_cap; i++) res3d_free(&c->res3d[i]);
+            kfree(c->res3d);
+        }
+        if (c->virgl_ctx_id) virtio_gpu_3d_context_destroy(c->virgl_ctx_id);
         kfree(c);
         self->ctx = NULL;
     }
@@ -2614,12 +2913,18 @@ static void drm_close(vfs_file_t* self) {
     }
 }
 
-vfs_file_t* vfs_drm_open(void) {
+// Shared open for both DRM nodes.  minor 0 = card0 (KMS), 128 = renderD128
+// (the 3D render node Mesa's virgl driver opens).  Same drm_ioctl/drm_close, so
+// the mmap resolver and last-close scanout-restore treat both identically; the
+// VIRTGPU ioctls simply return -ENODEV/-ENOENT until a 3D context/resource
+// exists, and 3D ops are gated on the host having negotiated VIRGL.
+static vfs_file_t* vfs_drm_open_minor(uint32_t minor) {
     drm_client_t* c = (drm_client_t*)kmalloc(sizeof(*c));
     if (!c) return NULL;
     __builtin_memset(c, 0, sizeof(*c));
-    c->next_dumb_handle = 1;
-    c->next_fb_id       = 1;
+    c->next_dumb_handle  = 1;
+    c->next_fb_id        = 1;
+    c->next_res3d_handle = 1;
 
     vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired (poll-ready), refcount=1
     if (!f) { kfree(c); return NULL; }
@@ -2629,16 +2934,18 @@ vfs_file_t* vfs_drm_open(void) {
     f->close    = drm_close;
     f->ctx      = c;
     f->rights   = 0xFFFFFFFFu;   // non-default: DRM fd carries all rights
-    // Linux DRM major = 226, minor = 0 for card0.  Matches libudev's
-    // advertised devnum so wlroots' fstat-then-udev cross-check
-    // resolves.
-    f->rdev     = (226u << 8) | 0u;
+    // Linux DRM major 226.  minor matches libudev's advertised devnum so
+    // wlroots' / Mesa's fstat-then-udev cross-check resolves.
+    f->rdev     = (226u << 8) | minor;
     // Count the open ONLY once it has fully succeeded -- bumping before the
-    // vfs_file_t alloc (as before) over-counted on a kmalloc failure, so the
-    // last-close restore-default-scanout heuristic could never reach 0.
+    // vfs_file_t alloc over-counted on a kmalloc failure, so the last-close
+    // restore-default-scanout heuristic could never reach 0.
     __atomic_add_fetch(&s_drm_open_count, 1, __ATOMIC_ACQ_REL);
     return f;
 }
+
+vfs_file_t* vfs_drm_open(void)        { return vfs_drm_open_minor(0);   }  // dri/card0
+vfs_file_t* vfs_drm_render_open(void) { return vfs_drm_open_minor(128); }  // dri/renderD128
 
 // ── io_uring DRM commit op (#4) ──────────────────────────────────────
 // Clients submit a drm_mode_atomic-shaped request via an io_uring
