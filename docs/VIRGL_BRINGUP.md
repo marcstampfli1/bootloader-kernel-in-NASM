@@ -252,13 +252,33 @@ BLOCKER (hard prerequisite, own sub-project) -- HOSTED libstdc++:
   header-only, no-OS parts); <vector>/<string>/<mutex>/<thread>/<unordered_map>
   are absent (a trivial STL TU fails to compile). This is why harfbuzz (which
   sticks to the freestanding subset) builds but Mesa cannot.
-  PATH: build GCC's libstdc++-v3 hosted for x86_64-pc-makaos. _GLIBCXX_HAS_
-  GTHREADS is already 1 and MakaOS pthreads exist (now incl. pthread_barrier),
-  so the gthreads model is feasible; the work is a real toolchain build --
-  configure libstdc++-v3 with the MakaOS gthr/OS glue, exception unwinding
-  (libgcc), and whatever <fstream>/locale bits Mesa pulls in. Treat as
-  "Phase 3-0: hosted libstdc++", a prerequisite before the Mesa build proceeds
-  past its C++ files.
+  PATH: hosted libstdc++ was DELIBERATELY disabled -- build-toolchain.sh passes
+  --disable-hosted-libstdcxx (and --disable-wchar_t). _GLIBCXX_HAS_GTHREADS is
+  already 1 and MakaOS pthreads exist (now incl. pthread_barrier), and hosted
+  libstdc++-v3 CONFIGURES cleanly against the current sysroot (it generated
+  <vector> etc.). So Phase 3-0 is "enable hosted + rebuild libstdc++-v3", not
+  "write an STL".
+
+  TWO ways to build it, and the difference matters (learned the hard way):
+   * RIGHT: reconfigure/rebuild ONLY the libstdc++-v3 subdir, reusing the
+     already-built+installed gcc and libgcc. This is the surgical path.
+   * WRONG: re-running the TOP-LEVEL gcc configure in-place marks gcc+libgcc
+     stale and forces a full rebuild -- which then FAILS in libgcc on an errno
+     conflict (see below). Don't do this; if a from-scratch toolchain rebuild is
+     ever needed, the errno issue must be fixed first.
+
+  errno PITFALL (blocks any libgcc rebuild): MakaOS declares `errno` as a bare
+  `extern __thread int errno;` VARIABLE. gcc's libgcc tsystem.h has
+  `#ifndef errno / extern int errno;` -- a fallback that a standard libc skips
+  because it defines errno as a MACRO. MakaOS's variable form doesn't trip that
+  guard, so libgcc's rebuild hits "non-thread-local declaration of 'errno'
+  follows thread-local declaration". The CORRECT fix is POSIX errno-as-macro
+  (`#define errno (*__errno_location())`), but that RENAMES the errno symbol and
+  thus breaks the ABI of every already-compiled port (they reference the bare
+  `errno` symbol) -- so it requires RE-PORTING THE WHOLE USERLAND. That is a
+  planned, deliberate future change (do it, then rebuild every port); it is out
+  of scope for the Mesa bring-up, which only needs the isolated libstdc++-v3
+  build that never rebuilds libgcc.
 
 ### Phase 4 - wire the clients
 
