@@ -1200,25 +1200,34 @@ static int drm_ioctl_version(uint64_t arg) {
     static const char name[] = "virtio_gpu";
     static const char date[] = "20260420";
     static const char desc[] = "MakaOS virtio-gpu DRM layer";
-    v.version_major     = 1;
-    v.version_minor     = 0;
+    // Match the real virtio-gpu DRM driver: 0.1.0.  Mesa's virgl winsys
+    // (virgl_drm_get_version) REJECTS any version_major != 0, so this must be 0.
+    v.version_major     = 0;
+    v.version_minor     = 1;
     v.version_patchlevel = 0;
 
-    // name_len / date_len / desc_len act as both in (buffer size) and
-    // out (actual length).  Linux convention: if the provided buffer
-    // is 0, we fill the *_len out-param so the caller can retry with
-    // a sized buffer.
+    // name_len / date_len / desc_len are in (caller's buffer size) and out
+    // (actual length).  Linux drm_version semantics, which libdrm's drmGetVersion
+    // relies on: on the SECOND call the caller passes name_len = the length it
+    // learned from the first call (NOT length+1) and a name_len+1 byte buffer,
+    // then NUL-terminates at name[name_len] itself.  So copy min(caller_len,
+    // actual) bytes whenever a buffer is provided; the caller adds the NUL.
+    // (The old `>= actual+1` gate never fired for the exact-fit second call and
+    // returned an empty name -> Mesa saw no driver and fell back to swrast.)
     uint64_t n_out = sizeof(name) - 1;
     uint64_t d_out = sizeof(date) - 1;
     uint64_t s_out = sizeof(desc) - 1;
-    if (v.name && v.name_len >= n_out + 1) {
-        if (copy_to_user((void*)v.name, name, n_out + 1) != 0) return -EFAULT;
+    if (v.name && v.name_len) {
+        uint64_t c = v.name_len < n_out ? v.name_len : n_out;
+        if (copy_to_user((void*)v.name, name, c) != 0) return -EFAULT;
     }
-    if (v.date && v.date_len >= d_out + 1) {
-        if (copy_to_user((void*)v.date, date, d_out + 1) != 0) return -EFAULT;
+    if (v.date && v.date_len) {
+        uint64_t c = v.date_len < d_out ? v.date_len : d_out;
+        if (copy_to_user((void*)v.date, date, c) != 0) return -EFAULT;
     }
-    if (v.desc && v.desc_len >= s_out + 1) {
-        if (copy_to_user((void*)v.desc, desc, s_out + 1) != 0) return -EFAULT;
+    if (v.desc && v.desc_len) {
+        uint64_t c = v.desc_len < s_out ? v.desc_len : s_out;
+        if (copy_to_user((void*)v.desc, desc, c) != 0) return -EFAULT;
     }
     v.name_len = n_out;
     v.date_len = d_out;
