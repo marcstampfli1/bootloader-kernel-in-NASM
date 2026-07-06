@@ -288,10 +288,15 @@ static void virtq_activate(volatile virtio_pci_common_cfg_t* cfg,
 // time so single-outstanding-request is fine; concurrency comes
 // later with the DRM ioctl layer.  Returns 1 on success.
 static phys_addr_t s_cmd_phys = 0;
-static uint8_t*    s_cmd_virt = NULL;   // request at +0, response at +2048
+static uint8_t*    s_cmd_virt = NULL;   // request at +0, response at +CMD_RESP_OFF
 
+// The control bounce buffer is 128 KiB: a 64 KiB request window followed by a
+// 64 KiB response window.  Mesa's virgl submits command streams and reads capset
+// blobs much larger than the old single-page (2 KiB req) buffer allowed.
+#define CMD_BUF_ORDER 5u                     // 2^5 = 32 pages = 128 KiB
+#define CMD_BUF_SIZE  (32u * 4096u)          // 131072
 #define CMD_REQ_OFF   0u
-#define CMD_RESP_OFF  2048u
+#define CMD_RESP_OFF  (CMD_BUF_SIZE / 2u)    // 65536: req [0,64K), resp [64K,128K)
 
 // ── Control-queue serialisation ──────────────────────────────────────
 // The bounce buffers + virtqueue state above are global, so two
@@ -306,8 +311,8 @@ static spinlock_t s_ctrl_lock = SPINLOCK_INIT;
 static int vgpu_send_ctrl(const void* req, uint32_t req_len,
                            void* resp, uint32_t resp_len) {
     if (!s_cmd_virt) return 0;
-    if (req_len  > CMD_RESP_OFF)       return 0;
-    if (resp_len > (4096 - CMD_RESP_OFF)) return 0;
+    if (req_len  > CMD_RESP_OFF)                return 0;
+    if (resp_len > (CMD_BUF_SIZE - CMD_RESP_OFF)) return 0;
 
     spin_lock(&s_ctrl_lock);
     __builtin_memcpy(s_cmd_virt + CMD_REQ_OFF, req, req_len);
@@ -367,7 +372,14 @@ static int vgpu_send_ctrl(const void* req, uint32_t req_len,
             return 1;
         }
     }
-    // Timeout → leak descriptors (safer than racing the device).
+    // Timeout → leak descriptors (safer than racing the device).  Log loudly
+    // with the device status: a SILENT return here is exactly what let a
+    // queue-size mismatch (device DEVICE_NEEDS_RESET, status bit 0x40) wedge
+    // the control queue undiagnosed.  This path should never fire in normal
+    // operation now that queue geometry is negotiated in virtq_activate().
+    pr_warn("virtio-gpu", "ctrl timeout reqtype=0x%x len=%u status=0x%x",
+            ((virtio_gpu_ctrl_hdr_t*)s_cmd_virt)->type, req_len,
+            (unsigned)s_common->device_status);
     spin_unlock(&s_ctrl_lock);
     return 0;
 }
@@ -538,8 +550,8 @@ int virtio_gpu_init(void) {
     virtq_activate(s_common, VQ_CONTROLQ, &s_ctrl_vq);
     virtq_activate(s_common, VQ_CURSORQ,  &s_cursor_vq);
 
-    // Command bounce buffer.
-    s_cmd_phys = pmm_buddy_alloc(0);
+    // Command bounce buffer (128 KiB: 64K request + 64K response window).
+    s_cmd_phys = pmm_buddy_alloc(CMD_BUF_ORDER);
     if (!PMM_ALLOC_OK(s_cmd_phys)) return 0;
     s_cmd_virt = (uint8_t*)((uintptr_t)s_cmd_phys + HHDM_OFFSET);
 
@@ -917,14 +929,15 @@ typedef struct __attribute__((packed)) {
 #define PIPE_CLEAR_COLOR0                 (1u << 2)   // gallium p_defines.h == 4
 
 // SUBMIT_3D: hand a virgl command stream (ndwords dwords) to the host context.
-// The request is the submit header immediately followed by the command bytes.
-// Max virgl command bytes per SUBMIT_3D: the control bounce buffer is 2048 B
-// (req window before the response at +2048), minus the 32-byte submit header.
-#define VGPU_SUBMIT_MAX 2016u
+// The request is the submit header immediately followed by the command bytes,
+// bounded by the request window (minus the submit header).  Built in a heap
+// buffer, not on the stack: virgl command streams reach tens of KiB.
+#define VGPU_SUBMIT_MAX (CMD_RESP_OFF - sizeof(vgpu_cmd_submit_t))
 static int vgpu_submit_3d(uint32_t ctx_id, const uint32_t* cmd, uint32_t ndwords) {
     const uint32_t clen = ndwords * 4u;
     if (clen > VGPU_SUBMIT_MAX) return 0;
-    uint8_t buf[sizeof(vgpu_cmd_submit_t) + VGPU_SUBMIT_MAX];
+    uint8_t* buf = (uint8_t*)kmalloc(sizeof(vgpu_cmd_submit_t) + clen);
+    if (!buf) return 0;
     vgpu_cmd_submit_t* s = (vgpu_cmd_submit_t*)buf;
     __builtin_memset(s, 0, sizeof(*s));
     s->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
@@ -932,8 +945,9 @@ static int vgpu_submit_3d(uint32_t ctx_id, const uint32_t* cmd, uint32_t ndwords
     s->size       = clen;
     __builtin_memcpy(buf + sizeof(vgpu_cmd_submit_t), cmd, clen);
     virtio_gpu_ctrl_hdr_t resp = {0};
-    if (!vgpu_send_ctrl(buf, sizeof(vgpu_cmd_submit_t) + clen, &resp, sizeof(resp))) return 0;
-    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+    int ok = vgpu_send_ctrl(buf, sizeof(vgpu_cmd_submit_t) + clen, &resp, sizeof(resp));
+    kfree(buf);
+    return ok && resp.type == VIRTIO_GPU_RESP_OK_NODATA;
 }
 
 // ── virgl self-test (Phase 1a: 3D command layer + guest<->host data path) ────
@@ -1089,10 +1103,12 @@ int virtio_gpu_3d_capset(uint32_t idx, uint32_t* id, uint32_t* max_ver,
     return 0;
 }
 
+// Capset blobs must fit in the response window (after its ctrl header).
+#define VGPU_CAPSET_MAX ((CMD_BUF_SIZE - CMD_RESP_OFF) - sizeof(virtio_gpu_ctrl_hdr_t))
 int virtio_gpu_3d_get_capset(uint32_t capset_id, uint32_t version,
                               void* out, uint32_t size) {
     if (!s_virgl) return -ENODEV;
-    if (size == 0 || size > VGPU_SUBMIT_MAX) return -EINVAL;   // fits the resp window
+    if (size == 0 || size > VGPU_CAPSET_MAX) return -EINVAL;   // fits the resp window
     struct __attribute__((packed)) {
         virtio_gpu_ctrl_hdr_t hdr;
         uint32_t capset_id;
@@ -1101,12 +1117,15 @@ int virtio_gpu_3d_get_capset(uint32_t capset_id, uint32_t version,
     req.hdr.type        = VIRTIO_GPU_CMD_GET_CAPSET;
     req.capset_id       = capset_id;
     req.capset_version  = version;
-    // Response is ctrl_hdr followed by `size` bytes of capset_data.
-    uint8_t resp[sizeof(virtio_gpu_ctrl_hdr_t) + VGPU_SUBMIT_MAX];
+    // Response is ctrl_hdr followed by `size` bytes of capset_data.  Heap, not
+    // stack: capset blobs are multi-KiB.
     uint32_t rlen = (uint32_t)sizeof(virtio_gpu_ctrl_hdr_t) + size;
-    if (!vgpu_send_ctrl(&req, sizeof(req), resp, rlen)) return -EIO;
-    if (((virtio_gpu_ctrl_hdr_t*)resp)->type != VIRTIO_GPU_RESP_OK_CAPSET) return -EIO;
+    uint8_t* resp = (uint8_t*)kmalloc(rlen);
+    if (!resp) return -ENOMEM;
+    if (!vgpu_send_ctrl(&req, sizeof(req), resp, rlen)) { kfree(resp); return -EIO; }
+    if (((virtio_gpu_ctrl_hdr_t*)resp)->type != VIRTIO_GPU_RESP_OK_CAPSET) { kfree(resp); return -EIO; }
     __builtin_memcpy(out, resp + sizeof(virtio_gpu_ctrl_hdr_t), size);
+    kfree(resp);
     return 0;
 }
 
