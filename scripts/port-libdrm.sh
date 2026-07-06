@@ -110,18 +110,19 @@ if marker in s and 'MAKAOS_FIXED_NODE_TYPE' not in s:
     with open(p, 'w') as f: f.write(s)
     print('patched drmGetNodeTypeFromFd')
 "
-    # Patch drmGetRenderDeviceNameFromFd — same sysfs walk; we don't
-    # have a render node, so return NULL and let callers fall back to
-    # drmGetDeviceNameFromFd2.
+    # Patch drmGetRenderDeviceNameFromFd — same sysfs walk we can't do.
+    # We DO have a render node now (Phase 2: /dev/dri/renderD128), and it is
+    # the node Mesa's virgl winsys opens for GL.  Single-GPU system, so return
+    # it unconditionally (mirrors drmGetDeviceNameFromFd2 -> card0 above).
     python3 -c "
 p='$DRM_SRC/xf86drm.c'
 with open(p) as f: s = f.read()
 marker = 'drm_public char *drmGetRenderDeviceNameFromFd(int fd)\n{'
-if marker in s and 'MAKAOS_NO_RENDER_NODE' not in s:
-    replacement = marker + '\n    /* MAKAOS_NO_RENDER_NODE: no separate render node. */\n    (void)fd;\n    return (char*)0;'
+if marker in s and 'MAKAOS_RENDER_NODE' not in s:
+    replacement = marker + '\n    /* MAKAOS_RENDER_NODE: single-GPU system; no sysfs. */\n    (void)fd;\n    return strdup(\"/dev/dri/renderD128\");'
     s = s.replace(marker, replacement, 1)
     with open(p, 'w') as f: f.write(s)
-    print('patched drmGetRenderDeviceNameFromFd')
+    print('patched drmGetRenderDeviceNameFromFd -> renderD128')
 "
 }
 

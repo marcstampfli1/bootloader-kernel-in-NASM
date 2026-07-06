@@ -1193,7 +1193,11 @@ int drm_is_drm_file(vfs_file_t* f) {
 static int drm_ioctl_version(uint64_t arg) {
     drm_version_t v;
     if (copy_from_user(&v, (void*)arg, sizeof(v)) != 0) return -EFAULT;
-    static const char name[] = "makaos-drm";
+    // Driver name is "virtio_gpu": both nodes are the virtio-gpu driver, and
+    // Mesa's virgl pipe_loader selects its gallium driver by matching this
+    // name (loader_get_driver_for_fd -> drmGetVersion) against the static
+    // descriptor virtio_gpu_driver_descriptor. Must stay exactly "virtio_gpu".
+    static const char name[] = "virtio_gpu";
     static const char date[] = "20260420";
     static const char desc[] = "MakaOS virtio-gpu DRM layer";
     v.version_major     = 1;
