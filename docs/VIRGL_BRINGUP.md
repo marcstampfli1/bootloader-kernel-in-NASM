@@ -80,6 +80,11 @@ phase N's gate passes.
 
 ### Phase 0 - host + capability probe (safe, no behaviour change)
 
+STATUS: DONE (commit 0152728).  On the gl launch the driver logs the host's
+virgl capsets (id=1 VIRGL, id=2 VIRGL2 max_size 1384); on the plain 2D launch
+it logs "offered: no" and the 2D path is byte-identical.  scripts/run-gl.sh is
+the gl launch variant.
+
 Goal: confirm the host offers virgl and read its capset, WITHOUT enabling
 VIRTIO_GPU_F_VIRGL in the live driver (2D path stays byte-identical).
 
@@ -95,6 +100,22 @@ VIRTIO_GPU_F_VIRGL in the live driver (2D path stays byte-identical).
 - Effort: small.
 
 ### Phase 1 - kernel 3D command layer + fences
+
+STATUS: DONE (1a commit 698d83d, 1b commit bd3c28f).  VIRGL is added to
+DRIVER_FEATURES but only negotiated when the host offers it (masked out on a
+plain virtio-gpu-pci device), so the 2D path is untouched.  CTX_CREATE/DESTROY,
+CTX_ATTACH_RESOURCE, RESOURCE_CREATE_3D, TRANSFER_TO/FROM_HOST_3D and SUBMIT_3D
+are implemented; two init self-tests pass on the gl launch: (1a) a 3D-resource
+upload/wipe/download round-trip, and (1b) a hand-encoded virgl CREATE_SURFACE +
+SET_FRAMEBUFFER_STATE + CLEAR that virglrenderer runs on the host GPU, read back
+byte-exact.
+
+NOTE on fences: the self-tests use the existing SYNCHRONOUS control-queue path
+(FIFO order => a later response proves all earlier commands retired), which is
+correct and needs no fence object/list/workqueue.  The async fence path below
+(VIRTIO_GPU_FLAG_FENCE + an O(1) monotonic completion counter woken from the
+control-queue IRQ, no per-fence allocation -- better than Linux) is deferred to
+Phase 2, where userland EXECBUFFER/WAIT is the actual consumer.
 
 Goal: the kernel can create a 3D context, create/transfer 3D resources, submit a
 virgl command buffer, and wait on a fence. Still no userland client; verified by
