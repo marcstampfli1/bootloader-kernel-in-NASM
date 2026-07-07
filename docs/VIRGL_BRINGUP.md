@@ -274,8 +274,17 @@ First-light debugging fixed a CHAIN of real bugs:
    negotiated the size, virtio-gpu was the one driver that forgot.  Now both GPU
    queues negotiate queue_size = VIRTQ_SIZE.
 
-NEXT: EGL config hardening, then wire wlroots (-Drenderers=gles2 -Dallocators=gbm)
-and SDL3's GL path (Phase 4).
+Phase 4 UPDATE: DONE for wlroots.  wlroots builds -Drenderers=gles2
+-Dallocators=gbm over the static Mesa, and the tinywl reference compositor
+COMPOSITES its first GLES2/virgl frame end to end (renderer -> allocator ->
+wayland socket -> DRM backend started -> first frame committed).  Getting there
+fixed two more MakaOS bugs: a libdrm format-modifier stub that strdup(NULL)'d on
+the LINEAR modifier, and -- the real blocker for every Wayland compositor -- an
+ext2 open(O_CREAT) hang (ext2 alloc/writeback held spinlocks across block I/O
+whose completion wait sched_sleep'd, a silent panic since 74c8dec made spinlocks
+disable preemption; fixed in ahci.c AHCI_WAIT, which busy-polls when preempt is
+disabled).  NEXT: propagate the Mesa-GL link fragment to port-sway.sh /
+port-dwl.sh, then SDL3's GL path.
 
 DONE earlier this pass:
 - Feasibility CONFIRMED from Mesa 24.0.9 source: a fully STATIC virgl+EGL+GBM+
