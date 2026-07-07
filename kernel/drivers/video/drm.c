@@ -452,6 +452,9 @@ typedef struct drm_res3d {
     uint32_t    bytes;          // page-rounded backing allocation
     phys_addr_t phys;           // backing pages (physically contiguous)
     uint8_t     order;          // buddy order used
+    uint8_t     borrowed;       // 1 = PRIME-imported clone: references an existing
+                                // host virgl resource, does NOT own it (the
+                                // exporting res3d does), so free must NOT unref it
 } drm_res3d_t;
 
 typedef struct drm_client {
@@ -531,11 +534,40 @@ static drm_res3d_t* find_res3d(drm_client_t* c, uint32_t handle) {
 // (this bo + every dma-buf/import) has let go.
 static void res3d_free(drm_res3d_t* r) {
     if (!r || r->handle == 0) return;
-    if (r->res_id) virtio_gpu_resource_unref(r->res_id);
+    // A borrowed (PRIME-imported) clone references a host resource owned by the
+    // exporting res3d -- only the owner unrefs it, or the host destroys a live
+    // resource out from under the exporter.
+    if (r->res_id && !r->borrowed) virtio_gpu_resource_unref(r->res_id);
     if (r->phys)
         for (uint32_t i = 0; i < r->bytes / 4096u; i++)
             pmm_ref_dec(r->phys + (phys_addr_t)i * 4096u);
     __builtin_memset(r, 0, sizeof(*r));   // handle=0 marks the slot free
+}
+
+// Reserve the next GEM handle and return its (zeroed) res3d slot, growing the
+// O(1) handle-indexed array to fit.  Shared by RESOURCE_CREATE and PRIME import
+// so both place a res3d identically.  On success *out_handle holds the handle,
+// r->handle is set, and next_handle is advanced; returns NULL on OOM WITHOUT
+// burning a handle number (the caller's own resource is untouched).
+static drm_res3d_t* res3d_alloc_slot(drm_client_t* c, uint32_t* out_handle) {
+    uint32_t h = c->next_handle;
+    if (h > c->res3d_cap) {
+        uint32_t ncap = c->res3d_cap ? c->res3d_cap * 2u : 8u;
+        if (ncap < h) ncap = h;
+        drm_res3d_t* na = (drm_res3d_t*)kmalloc(ncap * sizeof(drm_res3d_t));
+        if (!na) return NULL;
+        __builtin_memset(na, 0, ncap * sizeof(drm_res3d_t));
+        if (c->res3d) {
+            __builtin_memcpy(na, c->res3d, c->res3d_cap * sizeof(drm_res3d_t));
+            kfree(c->res3d);
+        }
+        c->res3d = na; c->res3d_cap = ncap;
+    }
+    drm_res3d_t* r = &c->res3d[h - 1];
+    r->handle = h;
+    c->next_handle = h + 1u;
+    *out_handle = h;
+    return r;
 }
 
 // ── CREATE_DUMB ──────────────────────────────────────────────────────
@@ -1517,6 +1549,9 @@ typedef struct {
     uint32_t    bytes;     // page-rounded allocation
     uint8_t     order;
     uint32_t    width, height, format;
+    uint32_t    res_id;    // non-zero if exported from a virgl 3D resource: the
+                           // host res_id, so PRIME import can rebuild a
+                           // renderable res3d (not a plain dumb) around it
 } drm_dmabuf_t;
 
 static void drm_prime_close(vfs_file_t* self) {
@@ -1559,8 +1594,10 @@ static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
 
     drm_client_t* c = client_of(drm_f);
-    // Export a dumb (2D) OR a res3d (render-node/virgl) buffer.
+    // Export a dumb (2D) OR a res3d (render-node/virgl) buffer.  For a res3d,
+    // carry the host res_id so a later import rebuilds a renderable res3d.
     phys_addr_t phys; uint32_t bytes, w, h, fmt; uint8_t order;
+    uint32_t src_res_id = 0;
     drm_dumb_t* d = find_dumb(c, a.handle);
     if (d) {
         phys = d->phys; bytes = d->bytes_alloc; order = d->order;
@@ -1570,6 +1607,7 @@ static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
         if (!r) return -ENOENT;
         phys = r->phys; bytes = r->bytes; order = r->order;
         w = r->width; h = r->height; fmt = r->format;
+        src_res_id = r->res_id;
     }
 
     vfs_file_t* pf = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
@@ -1581,6 +1619,7 @@ static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
     if (!db) { kfree(pf); return -ENOMEM; }
     db->phys = phys; db->bytes = bytes; db->order = order;
     db->width = w; db->height = h; db->format = fmt;
+    db->res_id = src_res_id;
     // Own a reference to every backing page: the dma-buf keeps the memory alive
     // even after the exporter destroys its handle.
     for (uint32_t i = 0; i < bytes / 4096u; i++)
@@ -1624,6 +1663,34 @@ static int drm_ioctl_prime_fd_to_handle(vfs_file_t* drm_f, uint64_t arg) {
     if (!drm_prime_is_ours(pf)) return -EINVAL;
     drm_dmabuf_t* db = (drm_dmabuf_t*)pf->ctx;
     drm_client_t* dst = client_of(drm_f);
+
+    // A dma-buf exported from a virgl 3D resource: rebuild a res3d that
+    // references the SAME host resource (borrowed -- shares the backing pages,
+    // does NOT own the host resource), so DRM_IOCTL_VIRTGPU_RESOURCE_INFO
+    // returns a valid res_handle and Mesa/virgl can render into the imported
+    // buffer.  This is the wlroots GLES2 output path: gbm allocates the output
+    // buffer, gbm_bo_get_fd exports it, eglCreateImageKHR imports it.  Without
+    // this the import fell through to a plain dumb (res_id 0) and virgl's
+    // resource_create_from_handle -> RESOURCE_INFO returned nothing, so
+    // eglCreateImageKHR failed EGL_BAD_ALLOC and the compositor never painted.
+    // The pages are already charged to the exporting res3d in this same task
+    // (res3d_free does not uncharge), so no second charge here -- balanced.
+    if (db->res_id != 0) {
+        uint32_t h;
+        drm_res3d_t* r = res3d_alloc_slot(dst, &h);
+        if (!r) return -ENOMEM;
+        r->res_id = db->res_id; r->width = db->width; r->height = db->height;
+        r->format = db->format; r->bytes = db->bytes; r->phys = db->phys;
+        r->order = db->order; r->borrowed = 1;
+        for (uint32_t i = 0; i < db->bytes / 4096u; i++)
+            pmm_ref_inc(db->phys + (phys_addr_t)i * 4096u);
+        a.handle = h;
+        if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) {
+            res3d_free(r);   // borrowed: ref_decs pages, does NOT unref host res
+            return -EFAULT;
+        }
+        return 0;
+    }
 
     // Charge the importer: dumb_free unconditionally uncharges, so an uncharged
     // clone would drift the quota negative over time.
@@ -2732,29 +2799,14 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
         return rc;
     }
 
-    // Record in the O(1) handle-indexed array, growing on demand.  The handle
-    // is drawn from the fd's single GEM namespace (shared with dumbs), so it can
-    // be sparse vs the array (dumb handles consume counter values without a slot)
-    // -- the grow-to-at-least-h below covers that.  Peek here, commit below only
-    // on success so a grow-OOM doesn't burn a handle number.
-    uint32_t h = c->next_handle;
-    if (h > c->res3d_cap) {
-        uint32_t ncap = c->res3d_cap ? c->res3d_cap * 2u : 8u;
-        if (ncap < h) ncap = h;
-        drm_res3d_t* na = (drm_res3d_t*)kmalloc(ncap * sizeof(drm_res3d_t));
-        if (!na) { virtio_gpu_resource_unref(res_id); pmm_buddy_free(phys, order);
-                   drm_uncharge(g_current, bytes); return -ENOMEM; }
-        __builtin_memset(na, 0, ncap * sizeof(drm_res3d_t));
-        if (c->res3d) {
-            __builtin_memcpy(na, c->res3d, c->res3d_cap * sizeof(drm_res3d_t));
-            kfree(c->res3d);
-        }
-        c->res3d = na; c->res3d_cap = ncap;
-    }
-    drm_res3d_t* r = &c->res3d[h - 1];
-    r->handle = h; r->res_id = res_id; r->width = a.width; r->height = a.height;
+    // Record in the O(1) handle-indexed array via the shared slot allocator
+    // (grows on demand; a grow-OOM does not burn a handle number).
+    uint32_t h;
+    drm_res3d_t* r = res3d_alloc_slot(c, &h);
+    if (!r) { virtio_gpu_resource_unref(res_id); pmm_buddy_free(phys, order);
+              drm_uncharge(g_current, bytes); return -ENOMEM; }
+    r->res_id = res_id; r->width = a.width; r->height = a.height;
     r->format = a.format; r->bytes = bytes; r->phys = phys; r->order = order;
-    c->next_handle = h + 1u;
 
     a.bo_handle = h; a.res_handle = res_id; a.size = (uint32_t)size64; a.stride = stride;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
