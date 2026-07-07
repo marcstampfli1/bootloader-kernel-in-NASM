@@ -376,6 +376,13 @@ ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_test_posix1.o" \
    -o "$BUILD_DIR/user_test_posix1.elf"
 
+# unixsock_test — isolates which AF_UNIX/epoll syscall wl_display_add_socket_auto hangs on
+if [ -f "$USERLAND_DIR/apps/unixsock_test/unixsock_test.c" ]; then
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/unixsock_test/unixsock_test.c" -o "$BUILD_DIR/user_unixsock_test.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_unixsock_test.o" \
+   -o "$BUILD_DIR/user_unixsock_test.elf"
+fi
+
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_io_uring/test_io_uring.c" -o "$BUILD_DIR/user_test_io_uring.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_test_io_uring.o" \
    -o "$BUILD_DIR/user_test_io_uring.elf"
@@ -859,6 +866,9 @@ if [ -f "$BUILD_DIR/user_helloraw.elf" ]; then
 fi
 if [ -f "$BUILD_DIR/user_test_posix1.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_test_posix1.elf" bin/test_posix1
+fi
+if [ -f "$BUILD_DIR/user_unixsock_test.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_unixsock_test.elf" bin/unixsock_test
 fi
 if [ -f "$BUILD_DIR/user_test_io_uring.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_test_io_uring.elf" bin/test_io_uring
