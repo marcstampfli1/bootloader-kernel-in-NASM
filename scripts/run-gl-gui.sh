@@ -36,7 +36,12 @@ cd "$REPO_ROOT"
 case "${GLPROVIDER:-intel}" in
   intel)
     export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/50_mesa.json}"
-    export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-mesa}" ;;
+    export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-mesa}"
+    # Pin mesa to the Intel iris driver so it never probes the NVIDIA card and
+    # tries to load nouveau_dri.so (which fails hard when the proprietary NVIDIA
+    # driver is loaded: "glx: failed to create dri3 screen / failed to load
+    # driver: nouveau").  renderD128 is the Intel i915 node on this laptop.
+    export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-iris}" ;;
   nvidia)
     export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}"
     export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
@@ -52,6 +57,15 @@ cp "/usr/share/OVMF/OVMF_VARS_4M.fd" "$OVMF_VARS"
 # SDL opens a window on this host (GTK hit eglMakeCurrent errors); override with
 # DISP=... (see header).
 DISPLAY_OPT="${DISP:-sdl,gl=on}"
+
+# In a Wayland session, force the toolkit onto its NATIVE Wayland backend so the
+# window's GL context is created via the session's EGL (Intel iGPU) instead of
+# falling back to Xwayland + GLX + DRI3, which probes the NVIDIA card and dies on
+# nouveau.  Override by exporting SDL_VIDEODRIVER / GDK_BACKEND yourself.
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-wayland}"
+  export GDK_BACKEND="${GDK_BACKEND:-wayland}"
+fi
 
 pkill -9 -f "qemu-system-x86_64.*disk\.img" 2>/dev/null || true
 
