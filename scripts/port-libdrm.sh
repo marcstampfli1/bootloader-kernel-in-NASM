@@ -235,20 +235,26 @@ build_lib() {
     # drmFormatModifierInfo / drmFormatModifierVendorInfo struct defs
     # that xf86drm.c declares just above the #include site.
     cat > "$DRM_SRC/generated_static_table_fourcc.h" <<'TABLESTUB'
-/* Empty format-modifier lookup tables.  xf86drm.c declares the
- * struct types itself (drmFormatModifierInfo, drmFormatModifierVendorInfo)
- * right before this file is #included.  We provide zero-length tables
- * that drmGetFormatModifierName / drmGetFormatModifierVendor will
- * walk and always miss on, returning NULL — clients fall back to
- * returning "Unknown" or similar.  Populate with real entries later
- * if a port actually needs human-readable modifier names.
+/* Minimal format-modifier name tables.  xf86drm.c declares the struct types
+ * itself (drmFormatModifierInfo, drmFormatModifierVendorInfo) right before this
+ * file is #included.  These back drmGetFormatModifierName /
+ * drmGetFormatModifierVendor, used ONLY for human-readable logging (e.g.
+ * wlroots dumps the EGL dmabuf modifier list at DEBUG).
+ *
+ * A MATCHED entry is strdup'd, so a NULL name is a landmine: the old
+ * `{ 0, 0 }` stub matched DRM_FORMAT_MOD_LINEAR (modifier 0) AND vendor NONE
+ * (0), and strdup(NULL) SIGSEGV'd inside strlen the first time wlroots logged
+ * the LINEAR modifier.  Give the two well-known NONE-vendor modifiers real
+ * names; any other modifier/vendor misses the tables and the lookup returns
+ * NULL, which callers already render as "<unknown>".
  */
 static const struct drmFormatModifierInfo drm_format_modifier_table[] = {
-    { 0, 0 }
+    { DRM_FORMAT_MOD_LINEAR,  "LINEAR"  },
+    { DRM_FORMAT_MOD_INVALID, "INVALID" },
 };
 
 static const struct drmFormatModifierVendorInfo drm_format_modifier_vendor_table[] = {
-    { 0, 0 }
+    { DRM_FORMAT_MOD_VENDOR_NONE, "NONE" },
 };
 TABLESTUB
 
