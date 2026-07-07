@@ -103,8 +103,10 @@ fi
 
 # ── meson configure (only re-runs if $WLR_BUILD is fresh) ─────────
 # Backends: drm (native KMS) + libinput (input via libinput port).
-# Renderer: pixman only — GL/Vulkan require libgbm + mesa we haven't
-# ported.  Session support uses our native libseat equivalent.
+# Renderer: gles2 over the static Mesa (EGL+GLESv2) stack; allocator: gbm.
+# The virgl GL stack reached first light (docs/VIRGL_BRINGUP.md phase 3c), so
+# wlroots now composites on the GPU (GLES2 over GBM/dmabuf) instead of pixman
+# software.  Session support uses our native libseat equivalent.
 if [ ! -d "$WLR_BUILD" ]; then
     log "meson setup ${WLR_BUILD}"
     meson setup "$WLR_BUILD" "$WLR_SRC" \
@@ -113,8 +115,8 @@ if [ ! -d "$WLR_BUILD" ]; then
         --libdir=lib \
         -Ddefault_library=static \
         -Dbackends=drm,libinput \
-        -Drenderers= \
-        -Dallocators= \
+        -Drenderers=gles2 \
+        -Dallocators=gbm \
         -Dsession=enabled \
         -Dxwayland=disabled \
         -Dxcb-errors=disabled \
