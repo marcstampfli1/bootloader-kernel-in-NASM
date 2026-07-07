@@ -3,6 +3,25 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "common.h"
+
+// Wait for `cond`, running `hook` between checks.  SLEEPS when preemptible
+// (the normal case), but BUSY-POLLS when called in atomic context
+// (preempt_depth > 0 -- e.g. a filesystem metadata write issued under an
+// ext2 allocation spinlock).  sched_sleep panics if preemption is disabled
+// (see sched.c), so a plain WAIT_EVENT would silently halt the CPU there.
+// The busy-poll is self-sufficient: the AHCI ISR still fires (spinlocks
+// disable preemption, NOT interrupts), and `hook` (ahci_rescan_completions)
+// re-polls SACT/CI directly, so the completion is observed with no sleep.
+#define AHCI_WAIT(wq, cond, hook)                                   \
+    do {                                                            \
+        if (this_cpu()->preempt_depth > 0) {                        \
+            while (!(cond)) { hook; cpu_relax(); }                  \
+        } else {                                                    \
+            WAIT_EVENT_HOOK((wq), (cond), hook);                    \
+        }                                                           \
+    } while (0)
+
+static void ahci_rescan_completions(void);   // AHCI_WAIT hook (defined below)
 #include "idt.h"
 #include "lapic.h"
 #include "sched.h"
@@ -397,8 +416,11 @@ static uint32_t slot_alloc(void) {
     for (;;) {
         uint32_t free = __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE);
         if (!free) {
-            WAIT_EVENT(&s_slot_avail_wq,
-                       __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE) != 0);
+            // Poll (freeing completed slots via the rescan) when atomic --
+            // an ext2 alloc under a spinlock must not sched_sleep here.
+            AHCI_WAIT(&s_slot_avail_wq,
+                      __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE) != 0,
+                      ahci_rescan_completions());
             continue;
         }
         uint32_t slot = (uint32_t)__builtin_ctz(free);
@@ -605,10 +627,13 @@ static void ahci_rescan_completions(void) {
 static void slot_wait(uint32_t slot) {
     // Post-wake hook: rescan for completions the ISR may have missed due
     // to IRQ coalescing (W1C of port_is can clear a completion's IS bit
-    // before the ISR reads SACT/CI).
-    WAIT_EVENT_HOOK(&s_slot_wq[slot],
-                    __atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE),
-                    ahci_rescan_completions());
+    // before the ISR reads SACT/CI).  AHCI_WAIT busy-polls (running the
+    // rescan every spin) when called in atomic context -- ext2 issues
+    // metadata reads/writes under per-group/per-inode spinlocks, where
+    // sched_sleep would panic.
+    AHCI_WAIT(&s_slot_wq[slot],
+              __atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE),
+              ahci_rescan_completions());
 }
 
 // PRIMITIVE (DMA transfer sizing): byte length of `sectors` sectors, overflow-safe
@@ -754,8 +779,11 @@ static void submit_busy_acquire(void) {
         if (__atomic_compare_exchange_n(&s_submit_busy, &expected, 1u, 0,
                                            __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
             return;
-        WAIT_EVENT(&s_submit_busy_wq,
-                   __atomic_load_n(&s_submit_busy, __ATOMIC_ACQUIRE) == 0);
+        // Poll when atomic (ext2 metadata I/O under a spinlock): another
+        // submitter releases the gate; the rescan keeps completions flowing.
+        AHCI_WAIT(&s_submit_busy_wq,
+                  __atomic_load_n(&s_submit_busy, __ATOMIC_ACQUIRE) == 0,
+                  ahci_rescan_completions());
     }
 }
 static void submit_busy_release(void) {

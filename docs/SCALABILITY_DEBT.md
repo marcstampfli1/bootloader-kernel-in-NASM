@@ -464,3 +464,33 @@ generation tag to keep a stale userspace handle from aliasing a new object.
 Deferred: handles are per-fd and bounded by that fd's lifetime allocation count;
 no real client hits this, and the O(1) res3d lookup + unified-namespace
 correctness are both preserved today.
+
+## ext2/AHCI: filesystem metadata I/O runs under fs spinlocks via busy-polling
+
+ext2's allocation and writeback paths hold spinlocks across block I/O:
+alloc_inode / alloc_block hold the per-group s_group_locks[g] across the bitmap
+read + bitmap/bgd write; the inode writeback holds the per-inode seqlock
+write_lock across the 128-byte inode write.  This predates the scheduler change
+that made spin_lock disable preemption (74c8dec): the code's comments call the
+write_lock "preemptible" and were written when a writer could sleep inside
+write_block.  After 74c8dec, sched_sleep panics with preempt_depth > 0, so the
+AHCI IRQ-driven path (which sleeps on slot/submit/completion wait queues) can no
+longer be called under those spinlocks -- open(O_CREAT) silently halted the CPU.
+
+Fix in place (ahci.c AHCI_WAIT): the AHCI slot-alloc, submit-busy and completion
+waits busy-poll (re-running ahci_rescan_completions each spin) when
+preempt_depth > 0 instead of sched_sleep-ing.  This is correct -- the ISR still
+fires with IRQs enabled and the rescan services completions directly -- but it
+holds the fs spinlock AND disables preemption on that CPU for the whole I/O.  On
+fast media (QEMU: microseconds) this is fine; on slow media a metadata write
+under a group lock stalls the holding CPU and any CPU spinning on that group
+lock for the I/O duration (~ms).
+
+The scalable fix is to keep block I/O OUT of the fs allocation/inode spinlocks:
+do the in-memory allocation decision under the lock (pin the bitmap/bgd/inode
+blocks in bcache, set the bit / stage the inode in memory), release the lock,
+then persist to disk with the normal sleeping path outside the lock.  Concurrent
+allocators stay consistent via the pinned bcache block.  Deferred: the poll path
+is correct and unblocks the whole Wayland-compositor bring-up (every compositor
+creates a socket lockfile); no MakaOS workload issues enough concurrent
+metadata writes for the lock-hold latency to matter yet.
