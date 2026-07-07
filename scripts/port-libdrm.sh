@@ -136,6 +136,91 @@ if marker in s and 'MAKAOS_RENDER_NODE' not in s:
     with open(p, 'w') as f: f.write(s)
     print('patched drmGetRenderDeviceNameFromFd -> renderD128')
 "
+    # Synthesise the DRM device list.  drmGetDevice2/drmGetDevices2/
+    # drmGetDeviceFromDevId walk /sys/dev/char to enumerate DRM devices; MakaOS
+    # has no sysfs, so they would return nothing and Mesa's _eglFindDevice /
+    # render-node discovery (and therefore eglInitialize on the GBM platform)
+    # would fail.  Emit a single synthetic virtio-gpu device (card0 primary +
+    # renderD128 render node, virtio PCI identity 1af4:1050) allocated via
+    # drmDeviceAlloc so drmFreeDevice frees it correctly.  Early-return from
+    # each entry point; the original sysfs body stays as dead code.
+    DRM_SRC="$DRM_SRC" python3 - <<'PYEOF'
+import os
+p = os.path.join(os.environ['DRM_SRC'], 'xf86drm.c')
+with open(p) as f: s = f.read()
+if 'MAKAOS_SYNTH_DEVICE' in s:
+    raise SystemExit(0)
+
+synth = r'''/* MAKAOS_SYNTH_DEVICE: MakaOS has no sysfs, so drmGetDevice2/drmGetDevices2
+ * cannot enumerate via /sys/dev/char.  Synthesise the single virtio-gpu device
+ * (card0 primary + renderD128 render node, virtio PCI identity) so Mesa's
+ * EGLDevice / render-node discovery works.  Allocated through drmDeviceAlloc so
+ * drmFreeDevice frees it correctly. */
+static drmDevicePtr makaos_synth_virtio_device(void)
+{
+    char *addr;
+    drmDevicePtr dev = drmDeviceAlloc(DRM_NODE_RENDER, "/dev/dri/renderD128",
+                                      sizeof(drmPciBusInfo),
+                                      sizeof(drmPciDeviceInfo), &addr);
+    if (!dev)
+        return NULL;
+    dev->available_nodes = (1 << DRM_NODE_PRIMARY) | (1 << DRM_NODE_RENDER);
+    strcpy(dev->nodes[DRM_NODE_PRIMARY], "/dev/dri/card0");
+    strcpy(dev->nodes[DRM_NODE_RENDER], "/dev/dri/renderD128");
+    dev->bustype = DRM_BUS_PCI;
+    dev->businfo.pci = (drmPciBusInfoPtr)addr;
+    dev->businfo.pci->domain = 0;
+    dev->businfo.pci->bus    = 0;
+    dev->businfo.pci->dev    = 4;
+    dev->businfo.pci->func   = 0;
+    addr += sizeof(drmPciBusInfo);
+    dev->deviceinfo.pci = (drmPciDeviceInfoPtr)addr;
+    dev->deviceinfo.pci->vendor_id    = 0x1af4;   /* Red Hat / virtio */
+    dev->deviceinfo.pci->device_id    = 0x1050;   /* virtio-gpu */
+    dev->deviceinfo.pci->subvendor_id = 0x1af4;
+    dev->deviceinfo.pci->subdevice_id = 0x1100;
+    dev->deviceinfo.pci->revision_id  = 0;
+    return dev;
+}
+
+'''
+
+m_fromdevid = 'drm_public int drmGetDeviceFromDevId(dev_t find_rdev, uint32_t flags, drmDevicePtr *device)\n{'
+b_fromdevid = ('\n    /* MAKAOS: no sysfs; single synthesised device. */\n'
+               '    (void)find_rdev; (void)flags;\n'
+               '    *device = makaos_synth_virtio_device();\n'
+               '    return *device ? 0 : -ENOMEM;\n')
+
+m_dev2 = 'drm_public int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)\n{'
+b_dev2 = ('\n    /* MAKAOS: no sysfs; single synthesised device. */\n'
+          '    (void)fd; (void)flags;\n'
+          '    *device = makaos_synth_virtio_device();\n'
+          '    return *device ? 0 : -ENOMEM;\n')
+
+m_devs2 = ('drm_public int drmGetDevices2(uint32_t flags, drmDevicePtr devices[],\n'
+           '                              int max_devices)\n{')
+b_devs2 = ('\n    /* MAKAOS: no sysfs; report the single synthesised device. */\n'
+           '    (void)flags;\n'
+           '    if (devices == NULL)\n'
+           '        return 1;\n'
+           '    if (max_devices < 1)\n'
+           '        return 0;\n'
+           '    devices[0] = makaos_synth_virtio_device();\n'
+           '    return devices[0] ? 1 : -ENOMEM;\n')
+
+for m in (m_fromdevid, m_dev2, m_devs2):
+    if m not in s:
+        raise SystemExit('port-libdrm: device-synth marker not found: ' + m.split('(')[0])
+
+# Insert the helper just before the first user (drmGetDeviceFromDevId) and the
+# early-return into each of the three entry points.
+s = s.replace(m_fromdevid, synth + m_fromdevid + b_fromdevid, 1)
+s = s.replace(m_dev2,  m_dev2  + b_dev2,  1)
+s = s.replace(m_devs2, m_devs2 + b_devs2, 1)
+
+with open(p, 'w') as f: f.write(s)
+print('patched drmGetDevice2/drmGetDevices2/drmGetDeviceFromDevId (synth device)')
+PYEOF
 }
 
 build_lib() {
