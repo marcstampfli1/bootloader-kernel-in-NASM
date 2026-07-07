@@ -1032,6 +1032,7 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* -- disabled on MakaOS (no glob in wordexp yet)|' \
         -e 's|^output \* bg .*|output * bg /usr/share/backgrounds/sway/wallpaper.png fill|' \
         -e '/bindsym .mod+Return exec .term/a\    bindsym Mod1+Return exec $term' \
+        -e '/bindsym .mod+Return exec .term/a\    bindsym Mod1+s exec /bin/sdl3_hello' \
         -e 's|^set \$menu .*|set $menu swaymsg exec -- $(ls /bin \| tofi --font /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf)|' \
         -e 's|^[[:space:]]*status_command .*|    status_command /bin/makaclock|' \
         -e 's|^[[:space:]]*font .*|    font pango:DejaVu Sans Mono 11|' \
