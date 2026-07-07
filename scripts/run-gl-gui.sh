@@ -39,9 +39,22 @@ case "${GLPROVIDER:-intel}" in
     export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-mesa}"
     # Pin mesa to the Intel iris driver so it never probes the NVIDIA card and
     # tries to load nouveau_dri.so (which fails hard when the proprietary NVIDIA
-    # driver is loaded: "glx: failed to create dri3 screen / failed to load
-    # driver: nouveau").  renderD128 is the Intel i915 node on this laptop.
-    export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-iris}" ;;
+    # driver is loaded: "glx: failed to create dri3 screen").
+    export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-iris}"
+    # On a hybrid laptop whose desktop renders on the NVIDIA GPU (e.g. this
+    # RTX 5060 Blackwell, which open-source mesa CANNOT drive), the QEMU window's
+    # GL context would land on that GPU and mesa dies.  Force QEMU to RENDER on
+    # the Intel i915 render node (safe, well supported) via DRI_PRIME; the
+    # Wayland compositor imports the resulting dma-buf (reverse-PRIME).  This
+    # keeps every GL call off the NVIDIA driver -- no Blackwell GL, no freeze.
+    if [ -z "${DRI_PRIME:-}" ]; then
+      for _rn in /sys/class/drm/renderD*; do
+        [ "$(basename "$(readlink -f "$_rn/device/driver")" 2>/dev/null)" = i915 ] || continue
+        _pci="$(basename "$(readlink -f "$_rn/device")")"   # e.g. 0000:00:02.0
+        export DRI_PRIME="pci-${_pci//[:.]/_}"              # -> pci-0000_00_02_0
+        break
+      done
+    fi ;;
   nvidia)
     export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}"
     export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
