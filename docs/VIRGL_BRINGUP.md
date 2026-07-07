@@ -12,7 +12,13 @@ regressing the working 2D desktop.
 
 ## Where we are (verified 2026-07)
 
-2D KMS is genuinely complete and real:
+UPDATE: the 3D/virgl GL stack is now at FIRST LIGHT -- a static Mesa
+(EGL+GLES2+GBM+virgl) build renders an offscreen magenta FBO through the
+render node and reads it back (Phase 3c below).  The 2D snapshot in this
+section is the pre-Mesa baseline; where it says "no Mesa/GBM/EGL/GL/virgl
+anywhere" and "2D only", read Phase 3 for the current state.
+
+2D KMS baseline (still the default desktop path):
 
 - `kernel/drivers/video/virtio_gpu.c` drives virtio-gpu **2D only**.
   `DRIVER_FEATURES` (virtio_gpu.c:40) = `VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID`.
@@ -231,31 +237,45 @@ libstdc++ (Phase 3-0, done), the static_library conversions (libc.a is non-PIC),
 the loader static-DRI shim, virgl disk-cache stub, and a long tail of libc gaps
 (C++ runtime + extern "C" headers, float/fused math, gettid/sched_getcpu/
 setpriority/syscall shim, elf.h, alloca-via-stdlib, PRIi* macros, libsync.h).
-3c IN PROGRESS -- userland/apps/gltest links the whole static stack (libEGL +
-libGLESv2 + libgbm + libgallium_dri) and drives GBM+EGL+GLES2 on the render node.
-First-light debugging fixed a CHAIN of real bugs and got EGL init most of the way
-through; gbm_create_device now SUCCEEDS, which means Mesa's virgl gallium driver
-fully initialises against our kernel render node (GET_CAPS/CONTEXT_INIT/winsys).
-Fixes landed on the way:
- - kernel DRM_IOCTL_VERSION: the length protocol was wrong (only copied the name
-   when caller_len >= actual+1, but libdrm's drmGetVersion passes caller_len ==
-   actual on the fill call) -> Mesa saw an empty driver name and fell to swrast.
-   Now copies min(caller_len, actual), Linux-style.
- - kernel DRM version is 0.1.0 (was 1.0.0): Mesa's virgl_drm_get_version REJECTS
-   version_major != 0.
- - libdrm drmGetNodeTypeFromFd derives the node type from the fd's minor
-   (renderD128 => DRM_NODE_RENDER) instead of always PRIMARY.
- - loader.c (port-mesa.sh): loader_open_driver_lib returns NULL (no dlopen, and
-   no NULL-search-path crash); loader_is_device_render_capable uses the node type
-   instead of drmGetDevice2 (which needs sysfs).
+3c DONE -- FIRST LIGHT.  userland/apps/gltest links the whole static stack
+(libEGL + libGLESv2 + libgbm + libgallium_dri) and renders a real frame on the
+render node: gbm_create_device -> eglGetPlatformDisplay(GBM) -> eglInitialize ->
+GLES2 context -> surfaceless make-current -> offscreen RGBA8 FBO ->
+glClearColor(magenta) -> glClear -> glFinish -> glReadPixels, then verifies every
+pixel is magenta.  A headless boot passes it repeatedly (0x600D600D), so the
+whole path works: EGL -> gallium virgl winsys -> our virtio-gpu render node ->
+the host GPU rendered it -> we read it back.
 
-REMAINING (3c): eglInitialize still fails at dri2_setup_device -> _eglFindDevice,
-which needs drmGetDevice2 / drmGetDevices2 to enumerate the device. Those are
-deeply sysfs-based (dozens of /sys/dev/char reads) and MakaOS has no sysfs, so
-the next step is a minimal libdrm drmGetDevice2/drmGetDevices2 that SYNTHESISES
-the single virtio-gpu device (nodes card0+renderD128, available_nodes, a virtio
-PCI bus/deviceinfo) so _eglFindDevice matches it. After that: EGL config
-creation, then the first magenta readback; then wire wlroots/SDL (Phase 4).
+First-light debugging fixed a CHAIN of real bugs:
+ - kernel DRM_IOCTL_VERSION length protocol (only copied the name when caller_len
+   >= actual+1, but libdrm passes caller_len == actual) -> empty driver name ->
+   swrast fallback.  Now copies min(caller_len, actual), Linux-style.
+ - kernel DRM version 0.0.0: virgl_drm_get_version rejects version_major != 0, and
+   Mesa keys supports_fences off minor >= 1.  We do not implement sync_file fence
+   FDs (EXECBUFFER returns fence_fd = -1), so 0.1 made glFinish block forever in
+   sync_wait(poll(fd=-1, -1)); 0.0 routes it through the DRM_IOCTL_VIRTGPU_WAIT
+   resource-wait path our synchronous submit supports.
+ - libdrm drmGetNodeTypeFromFd derives node type from the fd's minor
+   (renderD128 => DRM_NODE_RENDER); drmGetDevice2/drmGetDevices2/
+   drmGetDeviceFromDevId synthesise the single virtio-gpu device (no sysfs) so
+   _eglFindDevice / render-node discovery works (durable in port-libdrm.sh).
+ - loader.c (port-mesa.sh): loader_open_driver_lib returns NULL (no dlopen);
+   loader_is_device_render_capable uses the node type, not drmGetDevice2.
+ - kernel DRM resource-create exempts PIPE_BUFFER (target 0, width == byte size)
+   from the 16384 texture-dimension limit; EXECBUFFER cap raised 4 KiB -> 64 KiB;
+   control bounce buffer grown to 128 KiB with heap-built submit/capset for the
+   multi-KiB virgl command streams.
+ - THE headline bug: virtq_activate never wrote cfg->queue_size, so the device
+   used its own controlq default (256) while we allocate 64-entry rings.  The
+   avail-ring indices agree only for the first 64 commands, then the device reads
+   a slot we never wrote and sets DEVICE_NEEDS_RESET -- wedging the control queue
+   after ~64 GPU commands (QEMU: "Guest says index <garbage> is available").  It
+   is a general virtio-gpu corruption bug (not virgl-specific); virtio_net always
+   negotiated the size, virtio-gpu was the one driver that forgot.  Now both GPU
+   queues negotiate queue_size = VIRTQ_SIZE.
+
+NEXT: EGL config hardening, then wire wlroots (-Drenderers=gles2 -Dallocators=gbm)
+and SDL3's GL path (Phase 4).
 
 DONE earlier this pass:
 - Feasibility CONFIRMED from Mesa 24.0.9 source: a fully STATIC virgl+EGL+GBM+
