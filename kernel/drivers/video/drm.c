@@ -457,6 +457,8 @@ typedef struct drm_res3d {
     uint8_t     borrowed;       // 1 = PRIME-imported clone: references an existing
                                 // host virgl resource, does NOT own it (the
                                 // exporting res3d does), so free must NOT unref it
+    uint8_t     ctx_attached;   // 1 = already CTX_ATTACH_RESOURCE'd to the fd's
+                                // virgl context (attach once, not per-execbuffer)
 } drm_res3d_t;
 
 typedef struct drm_client {
@@ -2913,6 +2915,32 @@ static int drm_ioctl_virtgpu_execbuffer(vfs_file_t* f, uint64_t arg) {
     // 64 KiB matches the virtio-gpu control request window; virtio_gpu_3d_submit
     // enforces the exact device limit.  virgl command streams are multi-KiB.
     if (a.size == 0 || (a.size & 3u) || a.size > 65536u) return -EINVAL;
+
+    // Attach every bo the command stream references to this fd's virgl context
+    // BEFORE submitting.  vrend rejects any command that touches a resource not
+    // attached to the context ("Illegal resource N" / CREATE_OBJECT -> EINVAL),
+    // so without this the GPU never renders into the compositor's buffers and
+    // the screen stays black even though frames are being flipped.  Attach once
+    // per resource (ctx_attached), not per-execbuffer.
+    if (a.num_bo_handles) {
+        extern int virtio_gpu_3d_ctx_attach_resource(uint32_t ctx_id, uint32_t res_id);
+        if (a.num_bo_handles > 4096u) return -EINVAL;
+        uint32_t* handles = (uint32_t*)kmalloc(a.num_bo_handles * sizeof(uint32_t));
+        if (!handles) return -ENOMEM;
+        if (copy_from_user(handles, (void*)a.bo_handles,
+                           (uint64_t)a.num_bo_handles * sizeof(uint32_t)) != 0) {
+            kfree(handles); return -EFAULT;
+        }
+        for (uint32_t i = 0; i < a.num_bo_handles; i++) {
+            drm_res3d_t* r = find_res3d(c, handles[i]);
+            if (r && r->res_id && !r->ctx_attached) {
+                virtio_gpu_3d_ctx_attach_resource(c->virgl_ctx_id, r->res_id);
+                r->ctx_attached = 1;
+            }
+        }
+        kfree(handles);
+    }
+
     void* cmds = kmalloc(a.size);
     if (!cmds) return -ENOMEM;
     if (copy_from_user(cmds, (void*)a.command, a.size) != 0) { kfree(cmds); return -EFAULT; }
