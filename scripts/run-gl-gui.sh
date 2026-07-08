@@ -28,12 +28,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Which host GPU provides QEMU's OpenGL context.  DEFAULT = intel: use the Intel
-# iGPU via Mesa (mature, stable, and the exact GL path proven to work headless).
-# This deliberately avoids the brand-new NVIDIA Blackwell driver, whose repeated
-# GL-context creation can hang and freeze the whole machine.  GLPROVIDER=nvidia
-# forces the RTX via PRIME offload if you specifically want that.
-case "${GLPROVIDER:-intel}" in
+# Which host GPU provides QEMU's OpenGL context.  DEFAULT = nvidia: this desktop
+# renders on the RTX 5060 (Blackwell), and open-source mesa (nouveau/iris) cannot
+# drive Blackwell at all -- only the proprietary NVIDIA stack (GL 4.6 / EGL /
+# Vulkan) can, so it is the only provider that yields a working window here.
+# GLPROVIDER=intel keeps GL entirely on the Intel iGPU via mesa (safe, but the
+# window's GL must reach the iGPU -- works when the Intel iGPU drives the display,
+# e.g. BIOS Hybrid mode, or via DRI_PRIME reverse-PRIME if the compositor imports).
+case "${GLPROVIDER:-nvidia}" in
   intel)
     export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/50_mesa.json}"
     export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-mesa}"
@@ -72,9 +74,10 @@ cp "/usr/share/OVMF/OVMF_VARS_4M.fd" "$OVMF_VARS"
 DISPLAY_OPT="${DISP:-sdl,gl=on}"
 
 # In a Wayland session, force the toolkit onto its NATIVE Wayland backend so the
-# window's GL context is created via the session's EGL (Intel iGPU) instead of
-# falling back to Xwayland + GLX + DRI3, which probes the NVIDIA card and dies on
-# nouveau.  Override by exporting SDL_VIDEODRIVER / GDK_BACKEND yourself.
+# window's GL context comes from the session's own EGL (the NVIDIA EGL vendor
+# selected above) instead of falling back to Xwayland + GLX + DRI3, which probes
+# GPUs via mesa and dies on nouveau/iris.  Override by exporting SDL_VIDEODRIVER /
+# GDK_BACKEND yourself (e.g. SDL_VIDEODRIVER=x11 for the classic GLX path).
 if [ -n "${WAYLAND_DISPLAY:-}" ]; then
   export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-wayland}"
   export GDK_BACKEND="${GDK_BACKEND:-wayland}"
@@ -82,7 +85,7 @@ fi
 
 pkill -9 -f "qemu-system-x86_64.*disk\.img" 2>/dev/null || true
 
-echo "[run-gl-gui] virtio-gpu-gl + $DISPLAY_OPT  (GLPROVIDER=${GLPROVIDER:-intel}, host GL EGL=${__EGL_VENDOR_LIBRARY_FILENAMES:-default})"
+echo "[run-gl-gui] virtio-gpu-gl + $DISPLAY_OPT  (GLPROVIDER=${GLPROVIDER:-nvidia}, host GL EGL=${__EGL_VENDOR_LIBRARY_FILENAMES:-default})"
 echo "[run-gl-gui] serial -> $SERIAL"
 exec qemu-system-x86_64 \
   -accel kvm -cpu host -smp 4 -m 1024M -nodefaults -no-user-config \
