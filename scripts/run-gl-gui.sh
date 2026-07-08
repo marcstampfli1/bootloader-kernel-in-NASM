@@ -97,6 +97,7 @@ exec qemu-system-x86_64 \
   -display "$DISPLAY_OPT" \
   -device virtio-keyboard-pci -device virtio-tablet-pci \
   -audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
+  -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
   -serial file:"$SERIAL" \
   -no-reboot -no-shutdown \
   "$@"
