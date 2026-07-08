@@ -403,6 +403,8 @@ typedef struct drm_fb {
     phys_addr_t        phys;           // backing pages
     uint32_t           bytes_alloc;
     uint8_t            order;
+    uint8_t            is_3d;          // 1 = borrows a virgl 3D resource (res3d
+                                       // owns res_id+pages); do not create/free them
     struct drm_fb*     next;
 } drm_fb_t;
 
@@ -798,56 +800,81 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
         return -EINVAL;
     }
     drm_client_t* c = client_of(f);
-    drm_dumb_t* d = find_dumb(c, a.handles[0]);
-    if (!d) {
+    // The handle names EITHER a dumb (2D/CPU) buffer OR a res3d (virgl/GPU)
+    // buffer -- one GEM namespace, so exactly one matches.  wlroots' GLES2
+    // output path scans out a GBM buffer, which on virgl is a res3d.
+    drm_dumb_t*  d = find_dumb(c, a.handles[0]);
+    drm_res3d_t* r = d ? NULL : find_res3d(c, a.handles[0]);
+    if (!d && !r) {
         pr_warn("drm", "ADDFB2: handle %u not found", a.handles[0]);
         return -ENOENT;
     }
-    if (a.width > d->width || a.height > d->height) {
-        pr_warn("drm", "ADDFB2: size %ux%u > dumb %ux%u",
-                a.width, a.height, d->width, d->height);
+    uint32_t    src_w     = d ? d->width       : r->width;
+    uint32_t    src_h     = d ? d->height      : r->height;
+    phys_addr_t src_phys  = d ? d->phys        : r->phys;
+    uint32_t    src_bytes = d ? d->bytes_alloc : r->bytes;
+    uint8_t     src_order = d ? d->order       : r->order;
+    uint32_t    src_pitch = d ? d->pitch       : (r->width * 4u);
+    if (a.width > src_w || a.height > src_h) {
+        pr_warn("drm", "ADDFB2: size %ux%u > bo %ux%u",
+                a.width, a.height, src_w, src_h);
         return -EINVAL;
     }
     TRACE(TRACE_DRM_ADDFB, a.width, a.height, a.pixel_format, a.handles[0]);
 
-        // Allocate an INDEPENDENT virtio-gpu resource for this fb, backed
-    // by the same phys pages.  This lets dumb and fb be destroyed on
-    // their own schedules (wlroots closes the GEM handle immediately
-    // after ADDFB2; the fb must survive).
     const drm_backend_ops_t* b2 = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
-    uint32_t fb_res_id = alloc_res_id();
-    if (!b2 ||
-        b2->resource_create(fb_res_id,
-                            VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
-                            a.width, a.height) != 0 ||
-        b2->resource_attach_backing(fb_res_id, d->phys, d->bytes_alloc) != 0) {
-        if (b2) b2->resource_destroy(fb_res_id);
-        return -EIO;
+    uint32_t fb_res_id;
+    uint8_t  is_3d;
+    if (r) {
+        // GPU-rendered (virgl 3D) buffer: scan out its EXISTING host resource
+        // directly.  The rendered pixels live host-side, so a fresh 2D resource
+        // over the guest pages would show stale guest memory.  The res3d owns
+        // res_id + pages; the fb borrows them.  wlroots keeps the gbm_bo alive
+        // while it is in the swapchain, so the res3d outlives the fb (the
+        // res3d-freed-while-scanned-out edge is the same caveat as PRIME borrow).
+        fb_res_id = r->res_id;
+        is_3d     = 1;
+    } else {
+        // Dumb (CPU/linear): an INDEPENDENT resource over the same pages so the
+        // fb survives close_all_bo_handles() closing the source GEM handle.
+        fb_res_id = alloc_res_id();
+        if (!b2 ||
+            b2->resource_create(fb_res_id,
+                                VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
+                                a.width, a.height) != 0 ||
+            b2->resource_attach_backing(fb_res_id, src_phys, src_bytes) != 0) {
+            if (b2) b2->resource_destroy(fb_res_id);
+            return -EIO;
+        }
+        is_3d = 0;
     }
 
     drm_fb_t* fb = (drm_fb_t*)kmalloc(sizeof(*fb));
     if (!fb) {
-        b2->resource_destroy(fb_res_id);
+        if (!is_3d && b2) b2->resource_destroy(fb_res_id);
         return -ENOMEM;
     }
     fb->fb_id       = c->next_fb_id++;
     fb->handle      = a.handles[0];
     fb->width       = a.width;
     fb->height      = a.height;
-    fb->pitch       = a.pitches[0] ? a.pitches[0] : d->pitch;
+    fb->pitch       = a.pitches[0] ? a.pitches[0] : src_pitch;
     fb->format      = a.pixel_format;
     fb->vgpu_res_id = fb_res_id;
-    fb->phys        = d->phys;
-    fb->bytes_alloc = d->bytes_alloc;
-    fb->order       = d->order;
-    // Take independent refs on every backing page so the fb survives
-    // close_all_bo_handles() even if the dumb (and its refs) is freed.
-    for (uint32_t i = 0; i < d->bytes_alloc / 4096u; i++)
-        pmm_ref_inc(d->phys + (phys_addr_t)i * 4096u);
+    fb->phys        = src_phys;
+    fb->bytes_alloc = src_bytes;
+    fb->order       = src_order;
+    fb->is_3d       = is_3d;
+    // Dumb: take independent page refs so the fb survives close_all_bo_handles().
+    // 3D: the res3d owns the pages + resource (borrowed) -- no extra refs here.
+    if (!is_3d)
+        for (uint32_t i = 0; i < src_bytes / 4096u; i++)
+            pmm_ref_inc(src_phys + (phys_addr_t)i * 4096u);
     fb->next   = c->fbs;
     c->fbs     = fb;
-    pr_info("drm", "ADDFB2 fb=%u res=%u phys=%p %ux%u",
-            fb->fb_id, fb->vgpu_res_id, (void*)fb->phys, a.width, a.height);
+    pr_info("drm", "ADDFB2 fb=%u res=%u %s phys=%p %ux%u",
+            fb->fb_id, fb->vgpu_res_id, is_3d ? "(3D)" : "(dumb)",
+            (void*)fb->phys, a.width, a.height);
 
     a.fb_id = fb->fb_id;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
@@ -866,6 +893,9 @@ typedef struct { uint32_t fb_id; } drm_mode_rmfb_t;
 // here is safe because the resource is still tracked by s_scanouts.
 static void drm_fb_free(drm_fb_t* fb) {
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    // A 3D-backed fb borrows the res3d's resource + pages; the res3d (via its
+    // GEM handle / res3d_free) owns their lifetime, so release nothing here.
+    if (fb->is_3d) { kfree(fb); return; }
     int active = 0;
     for (uint32_t i = 0; i < DRM_MAX_SCANOUTS; i++)
         if (s_scanouts[i].resource_id == fb->vgpu_res_id) { active = 1; break; }
@@ -915,6 +945,8 @@ typedef struct drm_commit_entry {
     uint32_t resource_id;      // backend id; 0 disables
     uint32_t fb_id;            // tracked for observability
     uint32_t w, h;
+    uint8_t  is_3d;            // scan out an existing virgl 3D resource: skip the
+                               // 2D guest->host transfer (content is host-side)
 } drm_commit_entry_t;
 
 typedef struct drm_commit {
@@ -961,7 +993,11 @@ static int drm_commit_apply(const drm_commit_t* commit) {
         // exposed that buffer's stale host content on the next QEMU refresh (a
         // brief flicker).  transfer -> set-scanout -> flush means the resource
         // is already fresh the instant the display starts scanning it out.
-        if (e->resource_id) {
+        // A virgl 3D resource is rendered host-side, so a 2D guest->host
+        // transfer is both wrong (would copy stale guest pages over the GPU
+        // output) and rejected by the host -- skip it; SET_SCANOUT + FLUSH of
+        // the existing resource presents the rendered frame.
+        if (e->resource_id && !e->is_3d) {
             if (b->resource_transfer(e->resource_id, e->w, e->h) != 0) {
                 pr_err("drm", "commit: resource_transfer(res=%u) failed", e->resource_id);
                 goto rollback;
@@ -1023,13 +1059,17 @@ typedef struct {
 // Uses the fb's own snapshot — does NOT chase fb->handle (the source
 // GEM handle may have been closed via close_all_bo_handles).
 static int resolve_fb(drm_client_t* c, uint32_t fb_id,
-                       uint32_t* out_res, uint32_t* out_w, uint32_t* out_h) {
-    if (fb_id == 0) { *out_res = 0; *out_w = 0; *out_h = 0; return 0; }
+                       uint32_t* out_res, uint32_t* out_w, uint32_t* out_h,
+                       uint8_t* out_is_3d) {
+    if (fb_id == 0) {
+        *out_res = 0; *out_w = 0; *out_h = 0; *out_is_3d = 0; return 0;
+    }
     drm_fb_t* fb = find_fb(c, fb_id);
     if (!fb) return -ENOENT;
-    *out_res = fb->vgpu_res_id;
-    *out_w   = fb->width;
-    *out_h   = fb->height;
+    *out_res   = fb->vgpu_res_id;
+    *out_w     = fb->width;
+    *out_h     = fb->height;
+    *out_is_3d = fb->is_3d;
     return 0;
 }
 
@@ -1047,7 +1087,8 @@ static int drm_ioctl_setcrtc(vfs_file_t* f, uint64_t arg) {
     int rc = resolve_fb(client_of(f), a.fb_id,
                          &commit.entries[0].resource_id,
                          &commit.entries[0].w,
-                         &commit.entries[0].h);
+                         &commit.entries[0].h,
+                         &commit.entries[0].is_3d);
     if (rc != 0) return rc;
     return drm_commit_apply(&commit);
 }
@@ -1071,7 +1112,8 @@ static int drm_ioctl_page_flip(vfs_file_t* f, uint64_t arg) {
     int rc = resolve_fb(client_of(f), a.fb_id,
                          &commit.entries[0].resource_id,
                          &commit.entries[0].w,
-                         &commit.entries[0].h);
+                         &commit.entries[0].h,
+                         &commit.entries[0].is_3d);
     if (rc != 0) return rc;
     int r = drm_commit_apply(&commit);
     // Userland asked for a flip-complete event (DRM_MODE_PAGE_FLIP_EVENT).
@@ -1166,7 +1208,7 @@ static int drm_ioctl_atomic(vfs_file_t* f, uint64_t arg) {
         drm_commit_entry_t* e = &commit.entries[commit.n++];
         e->scanout = obj_id - CRTC_BASE;
         e->fb_id   = fb_id;
-        int rc = resolve_fb(c, fb_id, &e->resource_id, &e->w, &e->h);
+        int rc = resolve_fb(c, fb_id, &e->resource_id, &e->w, &e->h, &e->is_3d);
         if (rc != 0) return rc;
     }
     int r = drm_commit_apply(&commit);
