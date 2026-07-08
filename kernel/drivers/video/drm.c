@@ -1728,6 +1728,21 @@ static int drm_ioctl_prime_fd_to_handle(vfs_file_t* drm_f, uint64_t arg) {
     // The pages are already charged to the exporting res3d in this same task
     // (res3d_free does not uncharge), so no second charge here -- balanced.
     if (db->res_id != 0) {
+        // DEDUP -- Linux PRIME semantics: importing a dma-buf for a host resource
+        // this client already holds returns the EXISTING GEM handle, it does NOT
+        // mint a second one.  wlroots exports its own gbm_bo and reimports it to
+        // build the EGLImage on the SAME fd; minting a second handle made Mesa's
+        // virgl winsys create TWO virgl_hw_res for one res_handle (keyed by GEM
+        // handle), corrupting its bo bookkeeping -> __DRIimage->texture became a
+        // garbage pointer -> #GP in dri_get_egl_image on the first render.
+        for (uint32_t i = 0; i < dst->res3d_cap; i++) {
+            drm_res3d_t* ex = &dst->res3d[i];
+            if (ex->handle != 0 && ex->res_id == db->res_id) {
+                a.handle = ex->handle;
+                if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+                return 0;
+            }
+        }
         uint32_t h;
         drm_res3d_t* r = res3d_alloc_slot(dst, &h);
         if (!r) return -ENOMEM;

@@ -315,5 +315,25 @@ ninja -C "$MESA_BUILD" 2>&1 | tee "$BUILD_DIR/mesa_ninja.log"
 log "installing into $SYSROOT"
 DESTDIR="$SYSROOT" ninja -C "$MESA_BUILD" install 2>&1 | tee "$BUILD_DIR/mesa_install.log"
 
+# ── Static-link symbol-collision fix ──────────────────────────────────────
+# When the whole GL stack is statically linked into one binary (tinywl/sway/
+# gltest with -Wl,--allow-multiple-definition), the EGL frontend and the DRI
+# megadriver each define a GLOBAL dri2_lookup_egl_image_validated / *_egl_image
+# etc. with DIFFERENT signatures (the EGL copy reads its 1st arg as the image,
+# the gallium copy the 2nd).  --allow-multiple-definition collapses them to one
+# and the EGL copy wins, so the DRI frontend calls it with swapped args and gets
+# a garbage __DRIimage->texture -> #GP in dri_get_egl_image on the first frame.
+# Normally these are hidden inside separate .so's; the monolithic static link
+# exposes them.  Localize the EGL frontend's copies so each frontend uses its
+# own (the megadriver's stay global for the gallium code).
+if command -v objcopy >/dev/null 2>&1 && [ -f "$SYSROOT/usr/lib/libEGL.a" ]; then
+    for s in dri2_lookup_egl_image_validated dri2_lookup_egl_image \
+             dri2_validate_egl_image loader_dri_create_image \
+             loader_image_format_to_fourcc; do
+        objcopy --localize-symbol="$s" "$SYSROOT/usr/lib/libEGL.a" 2>/dev/null || true
+    done
+    log "localized EGL-frontend image symbols in libEGL.a (static-link collision fix)"
+fi
+
 log "done — check $SYSROOT/usr/lib/{libEGL,libgbm,libGLESv2}.a"
 ls -la "$SYSROOT"/usr/lib/lib{EGL,gbm,GLESv2,glapi,gallium}* 2>/dev/null || true
