@@ -776,6 +776,16 @@ static int drm_ioctl_destroy_dumb(vfs_file_t* f, uint64_t arg) {
         }
         pp = &(*pp)->next;
     }
+    // Not a dumb -- a res3d (virgl render-node handle, incl. PRIME-imported
+    // borrowed clones) shares the SAME GEM namespace.  wlroots imports a GBM
+    // buffer via PRIME, ADDFB2's it, then closes the handle; that handle is a
+    // res3d, so closing it must free the res3d slot here (not return -ENOENT,
+    // which left wlroots' buffer bookkeeping inconsistent -> a use-after-free).
+    // res3d_free honours ->borrowed: a PRIME clone drops only its own page refs
+    // and never destroys the shared host resource, so any fb that scans it out
+    // survives -- the same "closing the GEM handle does not remove fbs" rule.
+    drm_res3d_t* r = find_res3d(client_of(f), a.handle);
+    if (r) { res3d_free(r); return 0; }
     return -ENOENT;
 }
 

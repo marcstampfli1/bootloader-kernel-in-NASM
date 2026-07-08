@@ -416,11 +416,13 @@ static uint32_t slot_alloc(void) {
     for (;;) {
         uint32_t free = __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE);
         if (!free) {
-            // Poll (freeing completed slots via the rescan) when atomic --
-            // an ext2 alloc under a spinlock must not sched_sleep here.
-            AHCI_WAIT(&s_slot_avail_wq,
-                      __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE) != 0,
-                      ahci_rescan_completions());
+            // Busy-poll, NEVER sleep: the caller holds s_submit_busy (the
+            // exclusive submit gate), so it must stay on its CPU and make its own
+            // progress.  Sleeping here let the gate holder be descheduled and
+            // never rescheduled behind a preempt-disabled gate waiter, leaking
+            // s_submit_busy forever (see slot_wait).  rescan frees completed slots.
+            ahci_rescan_completions();
+            cpu_relax();
             continue;
         }
         uint32_t slot = (uint32_t)__builtin_ctz(free);
@@ -625,15 +627,24 @@ static void ahci_rescan_completions(void) {
 }
 
 static void slot_wait(uint32_t slot) {
-    // Post-wake hook: rescan for completions the ISR may have missed due
-    // to IRQ coalescing (W1C of port_is can clear a completion's IS bit
-    // before the ISR reads SACT/CI).  AHCI_WAIT busy-polls (running the
-    // rescan every spin) when called in atomic context -- ext2 issues
-    // metadata reads/writes under per-group/per-inode spinlocks, where
-    // sched_sleep would panic.
-    AHCI_WAIT(&s_slot_wq[slot],
-              __atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE),
-              ahci_rescan_completions());
+    // Busy-poll the caller's OWN completion -- NEVER sleep.  The caller holds
+    // s_submit_busy (the exclusive submit gate).  Sleeping here deadlocked the
+    // whole storage stack: the holder context-switched away mid-I/O, was woken
+    // by the completion but never rescheduled -- a concurrent preempt-DISABLED
+    // busy-poll submitter (ext2 metadata I/O under a spinlock, e.g. /bin/net
+    // creating /etc/resolv.conf) occupied a CPU and could not yield back to it,
+    // so it never ran to call submit_busy_release().  s_submit_busy stayed 1 and
+    // every later submitter -- including the compositor demand-paging its binary
+    // -- spun on the gate forever (observed: gate held, slot done+free, no
+    // waiter queued, all other CPUs idle).  Busy-polling keeps the holder on its
+    // CPU straight through completion, so the gate is always released promptly;
+    // rescan self-services via SACT/CI register polling with IRQs on or off.
+    // (Root cause is ext2 holding spinlocks across block I/O -- see
+    //  docs/SCALABILITY_DEBT.md; this makes the current design deadlock-free.)
+    while (!__atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE)) {
+        ahci_rescan_completions();
+        cpu_relax();
+    }
 }
 
 // PRIMITIVE (DMA transfer sizing): byte length of `sectors` sectors, overflow-safe
