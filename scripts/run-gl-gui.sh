@@ -95,7 +95,7 @@ exec qemu-system-x86_64 \
   -device ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0 \
   -device virtio-gpu-gl-pci,id=vgpu \
   -display "$DISPLAY_OPT" \
-  -device virtio-keyboard-pci -device virtio-tablet-pci \
+  -device virtio-tablet-pci \
   -audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
   -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
   -serial file:"$SERIAL" \
