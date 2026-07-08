@@ -2227,6 +2227,8 @@ typedef struct {
     uint32_t hot_x, hot_y;
     int32_t  cur_x, cur_y;   // last position (UPDATE_CURSOR needs it)
     uint8_t  cursor_latched; // 1 = device shows cursor_res (UPDATE sent OK)
+    uint8_t  cursor_borrowed;// 1 = cursor_res is a res3d's own resource (GL cursor):
+                             // do NOT destroy it on drop, the res3d owns it
 } drm_crtc_state_t;
 static drm_crtc_state_t g_crtc_state[VIRTIO_GPU_MAX_SCANOUTS_CAP];
 
@@ -2509,13 +2511,16 @@ static int drm_ioctl_mode_closefb(vfs_file_t* self, uint64_t arg) {
 // release the page pin taken when it was minted.  Idempotent.
 static void cursor_drop_alias(const drm_backend_ops_t* b, drm_crtc_state_t* cs) {
     if (!cs->cursor_res) return;
-    if (b) b->resource_destroy(cs->cursor_res);
+    // A borrowed res3d cursor's resource is owned by the res3d -- never destroy
+    // it here (that would pull it out from under the res3d); just unbind.
+    if (!cs->cursor_borrowed && b) b->resource_destroy(cs->cursor_res);
     for (uint32_t i = 0; i < cs->cursor_pin_pages; i++)
         pmm_ref_dec(cs->cursor_phys + (phys_addr_t)i * 4096u);
     cs->cursor_res       = 0;
     cs->cursor_phys      = 0;
     cs->cursor_pin_pages = 0;
     cs->cursor_latched   = 0;
+    cs->cursor_borrowed  = 0;
 }
 
 static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
@@ -2554,8 +2559,43 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
     }
 
     drm_client_t* c = client_of(f);
-    drm_dumb_t* d = find_dumb(c, a.handle);
-    if (!d) return -ENOENT;
+    // The cursor buffer is a dumb (CPU) OR a res3d (GL/gbm) handle -- one GEM
+    // namespace.  wlroots renders its legacy cursor into a gbm bo (res3d).
+    drm_dumb_t*  d = find_dumb(c, a.handle);
+    drm_res3d_t* r = d ? NULL : find_res3d(c, a.handle);
+    if (!d && !r) return -ENOENT;
+
+    if (r) {
+        // A GL-rendered cursor's pixels live host-side in r->res_id, so bind that
+        // resource directly to the virtio-gpu cursor queue (borrow it -- the res3d
+        // owns it).  NOTE/TODO: QEMU only scans out a 2D resource as a cursor
+        // sprite; a virgl texture gives it nothing to draw, so the pointer is
+        // currently invisible.  The correct path is TRANSFER_FROM_HOST_3D(res_id)
+        // -> a 2D cursor resource -> UPDATE_CURSOR.  Kept here as the foundation;
+        // for now this is no worse than the software-cursor fallback (also
+        // invisible at the compositor's slow redraw rate on this present path).
+        uint8_t hot_changed = 0;
+        if (has_hotspot && ((uint32_t)a.hot_x != cs->hot_x ||
+                            (uint32_t)a.hot_y != cs->hot_y)) {
+            cs->hot_x = (uint32_t)a.hot_x; cs->hot_y = (uint32_t)a.hot_y;
+            hot_changed = 1;
+        }
+        if (cs->cursor_res != r->res_id) {
+            if (cs->cursor_res) cursor_drop_alias(b, cs);
+            cs->cursor_res       = r->res_id;
+            cs->cursor_borrowed  = 1;
+            cs->cursor_phys      = 0;
+            cs->cursor_pin_pages = 0;
+            cs->cursor_w = a.width; cs->cursor_h = a.height;
+            cs->cursor_latched   = 0;
+        } else if (cs->cursor_latched && !hot_changed) {
+            return 0;
+        }
+        int rc = b->cursor_update(idx, r->res_id, cs->hot_x, cs->hot_y,
+                                  cs->cur_x, cs->cur_y);
+        if (rc == 0) cs->cursor_latched = 1;
+        return rc;
+    }
     // Overflow-safe: width*height*4 must fit the backing.  The old bare
     // (uint64_t)w*h*4 > d->size guard wrapped u64 (w=h=2^31 -> *4 == 2^64 -> 0)
     // and accepted absurd dimensions.  cur_bytes is reused for the pin count.
