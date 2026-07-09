@@ -154,6 +154,8 @@ static void drm_uncharge(task_t* t, uint64_t bytes) {
 #define DRM_IOCTL_MODE_GETPROPERTY          0xC04064AA  // 64B
 #define DRM_IOCTL_MODE_SETPROPERTY          0xC01064AB  // 16B (connector-legacy)
 #define DRM_IOCTL_MODE_GETPROPBLOB          0xC01064AC  // 16B
+#define DRM_IOCTL_MODE_CREATEPROPBLOB       0xC01064BD  // 16B (atomic mode blob)
+#define DRM_IOCTL_MODE_DESTROYPROPBLOB      0xC00464BE  // 4B
 #define DRM_IOCTL_MODE_GETFB                0xC01C64AD  // 28B (legacy)
 #define DRM_IOCTL_MODE_CLOSEFB              0xC00864D0  // 8B  (Linux 6.0+)
 #define DRM_IOCTL_MODE_GETPLANERESOURCES    0xC01064B5  // 16B
@@ -1169,6 +1171,14 @@ static inline int drm_atomic_count_ok(uint32_t count) {
     return count <= DRM_MAX_PROPS_PER_OBJ;
 }
 
+// Atomic flags.
+#define DRM_MODE_ATOMIC_TEST_ONLY  0x0100u
+
+// Apply the atomic cursor plane (fb -> sprite via the virtio-gpu cursor queue,
+// CRTC_X/Y -> position).  Defined below, after the cursor infrastructure.
+static int drm_atomic_apply_cursor(vfs_file_t* f, uint32_t idx, uint32_t fb_id,
+                                    int32_t x, int32_t y);
+
 static int drm_ioctl_atomic(vfs_file_t* f, uint64_t arg) {
     drm_mode_atomic_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
@@ -1197,33 +1207,70 @@ static int drm_ioctl_atomic(vfs_file_t* f, uint64_t arg) {
     drm_client_t* c = client_of(f);
     uint64_t props_off   = 0;
     uint64_t values_off  = 0;
+
+    // Atomic modeset: wlroots drives scan-out and cursor through PLANE objects
+    // (PROP_PLANE_FB_ID / CRTC_X / CRTC_Y), not CRTC_FB.  Accumulate the primary
+    // plane's fb (-> scan-out) and the cursor plane's fb + position (-> cursor)
+    // per CRTC, then apply.  (The legacy SETCRTC/PAGE_FLIP/MODE_CURSOR path stays
+    // for non-atomic clients; wlroots just won't use it once ATOMIC is granted.)
+    uint32_t prim_fb[DRM_MAX_SCANOUTS];  uint8_t  prim_set[DRM_MAX_SCANOUTS];
+    uint32_t cur_fb [DRM_MAX_SCANOUTS];  int32_t  cur_x[DRM_MAX_SCANOUTS];
+    int32_t  cur_y  [DRM_MAX_SCANOUTS];  uint8_t  cur_set[DRM_MAX_SCANOUTS];
+    for (uint32_t i = 0; i < n_sc; i++) { prim_set[i] = 0; cur_set[i] = 0; }
+
     for (uint32_t i = 0; i < a.count_objs; i++) {
-        uint32_t obj_id = objs[i];
-        if (obj_id < CRTC_BASE || obj_id >= CRTC_BASE + n_sc) {
-            // Not a CRTC — skip its props (we don't yet model planes).
-            props_off  += counts[i] * sizeof(uint32_t);
-            values_off += counts[i] * sizeof(uint64_t);
-            continue;
-        }
-        uint32_t fb_id = 0;
+        uint32_t obj_id  = objs[i];
+        int is_plane = (obj_id >= PLANE_BASE &&
+                        obj_id <  PLANE_BASE + n_sc * PLANES_PER_CRTC);
+        int is_crtc  = (obj_id >= CRTC_BASE && obj_id < CRTC_BASE + n_sc);
+        uint32_t p_fb = 0; int32_t p_x = 0, p_y = 0; uint8_t p_fb_set = 0;
         for (uint32_t j = 0; j < counts[i]; j++) {
-            uint32_t prop_id;
-            uint64_t prop_val;
+            uint32_t prop_id; uint64_t prop_val;
             if (copy_from_user(&prop_id, (void*)(a.props_ptr + props_off),
                                 sizeof(prop_id)) != 0) return -EFAULT;
             if (copy_from_user(&prop_val, (void*)(a.prop_values_ptr + values_off),
                                 sizeof(prop_val)) != 0) return -EFAULT;
             props_off  += sizeof(uint32_t);
             values_off += sizeof(uint64_t);
-            if (prop_id == DRM_MODE_PROP_CRTC_FB) fb_id = (uint32_t)prop_val;
+            if (is_plane) {
+                if      (prop_id == PROP_PLANE_FB_ID) { p_fb = (uint32_t)prop_val; p_fb_set = 1; }
+                else if (prop_id == PROP_PLANE_CRTC_X) p_x = (int32_t)(int64_t)prop_val;
+                else if (prop_id == PROP_PLANE_CRTC_Y) p_y = (int32_t)(int64_t)prop_val;
+            } else if (is_crtc && prop_id == DRM_MODE_PROP_CRTC_FB) {
+                p_fb = (uint32_t)prop_val; p_fb_set = 1;   // legacy-shaped fallback
+            }
         }
+        if (is_plane) {
+            uint32_t raw = obj_id - PLANE_BASE;
+            uint32_t ci  = raw / PLANES_PER_CRTC;
+            int is_cursor = (raw % PLANES_PER_CRTC) == 1;
+            if (ci < n_sc && p_fb_set) {
+                if (is_cursor) { cur_fb[ci]=p_fb; cur_x[ci]=p_x; cur_y[ci]=p_y; cur_set[ci]=1; }
+                else           { prim_fb[ci]=p_fb; prim_set[ci]=1; }
+            }
+        } else if (is_crtc && p_fb_set) {
+            uint32_t ci = obj_id - CRTC_BASE;
+            prim_fb[ci] = p_fb; prim_set[ci] = 1;
+        }
+    }
+
+    for (uint32_t ci = 0; ci < n_sc; ci++) {
+        if (!prim_set[ci]) continue;
         drm_commit_entry_t* e = &commit.entries[commit.n++];
-        e->scanout = obj_id - CRTC_BASE;
-        e->fb_id   = fb_id;
-        int rc = resolve_fb(c, fb_id, &e->resource_id, &e->w, &e->h, &e->is_3d);
+        e->scanout = ci;
+        e->fb_id   = prim_fb[ci];
+        int rc = resolve_fb(c, prim_fb[ci], &e->resource_id, &e->w, &e->h, &e->is_3d);
         if (rc != 0) return rc;
     }
-    int r = drm_commit_apply(&commit);
+    // TEST_ONLY: wlroots validates a configuration without committing it.  We've
+    // parsed + resolved every fb above (so a bad config is rejected); return
+    // success without touching the scanout or cursor.
+    if (a.flags & DRM_MODE_ATOMIC_TEST_ONLY) return 0;
+    int r = commit.n ? drm_commit_apply(&commit) : 0;
+    // Atomic hardware cursor: apply the cursor plane (fb -> sprite, CRTC_X/Y ->
+    // position) via the shared cursor path.
+    for (uint32_t ci = 0; ci < n_sc; ci++)
+        if (cur_set[ci]) drm_atomic_apply_cursor(f, ci, cur_fb[ci], cur_x[ci], cur_y[ci]);
     // DRM_MODE_ATOMIC_EVENT_FLIP flag (0x02) requests a flip-complete
     // event per CRTC, user_data=a.user_data.  Same constant as PAGE_FLIP
     // flags DRM_MODE_PAGE_FLIP_EVENT=0x1 wait — the atomic flag set is:
@@ -1570,9 +1617,8 @@ static int drm_ioctl_set_client_cap(uint64_t arg) {
     case DRM_CLIENT_CAP_UNIVERSAL_PLANES:
     case DRM_CLIENT_CAP_ASPECT_RATIO:
     case DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT:
+    case DRM_CLIENT_CAP_ATOMIC:      // atomic modeset now implemented (plane graph)
         return 0;
-    case DRM_CLIENT_CAP_ATOMIC:
-        return -EOPNOTSUPP;
     default:
         return -EINVAL;
     }
@@ -1918,6 +1964,19 @@ static void drm_ensure_edid(void) {
 }
 
 // ── Blob registry ─────────────────────────────────────────────────────
+// Dynamic property blobs created by userland (DRM_IOCTL_MODE_CREATEPROPBLOB).
+// wlroots' atomic backend creates a mode blob per output and references it via
+// the CRTC MODE_ID property; without CREATEPROPBLOB, modeset fails ("Unable to
+// create mode property blob") and there is no scan-out.  Our scan-out mode is
+// fixed, so we only need to hand back a valid id (+ store the bytes so a later
+// GETPROPBLOB round-trips) -- the commit ignores MODE_ID/ACTIVE.
+typedef struct drm_dyn_blob {
+    uint32_t id; uint32_t len; void* data; struct drm_dyn_blob* next;
+} drm_dyn_blob_t;
+static drm_dyn_blob_t* s_dyn_blobs     = NULL;
+static spinlock_t      s_dyn_blob_lock = SPINLOCK_INIT;
+static uint32_t        s_next_dyn_blob = BLOB_ID_BASE + 0x1000u;
+
 static int drm_resolve_blob(uint32_t blob_id, const void** out, uint32_t* len) {
     switch (blob_id) {
     case BLOB_EDID:
@@ -1931,9 +1990,54 @@ static int drm_resolve_blob(uint32_t blob_id, const void** out, uint32_t* len) {
         drm_ensure_mode_blob();
         *out = &g_mode_blob; *len = sizeof(g_mode_blob);
         return 0;
-    default:
-        return -ENOENT;
+    default: {
+        drm_dyn_blob_t* bl;
+        spin_lock(&s_dyn_blob_lock);
+        for (bl = s_dyn_blobs; bl; bl = bl->next)
+            if (bl->id == blob_id) { *out = bl->data; *len = bl->len; break; }
+        spin_unlock(&s_dyn_blob_lock);
+        return bl ? 0 : -ENOENT;
     }
+    }
+}
+
+static int drm_ioctl_create_blob(uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint64_t data; uint32_t length; uint32_t blob_id;
+    } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (a.length == 0 || a.length > 65536u) return -EINVAL;
+    void* buf = kmalloc(a.length);
+    if (!buf) return -ENOMEM;
+    if (copy_from_user(buf, (void*)a.data, a.length) != 0) { kfree(buf); return -EFAULT; }
+    drm_dyn_blob_t* bl = (drm_dyn_blob_t*)kmalloc(sizeof(*bl));
+    if (!bl) { kfree(buf); return -ENOMEM; }
+    bl->len = a.length; bl->data = buf;
+    spin_lock(&s_dyn_blob_lock);
+    bl->id = s_next_dyn_blob++;
+    bl->next = s_dyn_blobs; s_dyn_blobs = bl;
+    spin_unlock(&s_dyn_blob_lock);
+    a.blob_id = bl->id;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+static int drm_ioctl_destroy_blob(uint64_t arg) {
+    struct { uint32_t blob_id; } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    spin_lock(&s_dyn_blob_lock);
+    drm_dyn_blob_t** pp = &s_dyn_blobs;
+    while (*pp) {
+        if ((*pp)->id == a.blob_id) {
+            drm_dyn_blob_t* dead = *pp; *pp = dead->next;
+            spin_unlock(&s_dyn_blob_lock);
+            kfree(dead->data); kfree(dead);
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+    spin_unlock(&s_dyn_blob_lock);
+    return 0;   // destroying an unknown blob is a no-op, not an error
 }
 
 static int drm_ioctl_mode_getpropblob(uint64_t arg) {
@@ -2566,32 +2670,48 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
     if (!d && !r) return -ENOENT;
 
     if (r) {
-        // A GL-rendered cursor's pixels live host-side in r->res_id, so bind that
-        // resource directly to the virtio-gpu cursor queue (borrow it -- the res3d
-        // owns it).  NOTE/TODO: QEMU only scans out a 2D resource as a cursor
-        // sprite; a virgl texture gives it nothing to draw, so the pointer is
-        // currently invisible.  The correct path is TRANSFER_FROM_HOST_3D(res_id)
-        // -> a 2D cursor resource -> UPDATE_CURSOR.  Kept here as the foundation;
-        // for now this is no worse than the software-cursor fallback (also
-        // invisible at the compositor's slow redraw rate on this present path).
-        uint8_t hot_changed = 0;
-        if (has_hotspot && ((uint32_t)a.hot_x != cs->hot_x ||
-                            (uint32_t)a.hot_y != cs->hot_y)) {
-            cs->hot_x = (uint32_t)a.hot_x; cs->hot_y = (uint32_t)a.hot_y;
-            hot_changed = 1;
-        }
-        if (cs->cursor_res != r->res_id) {
-            if (cs->cursor_res) cursor_drop_alias(b, cs);
-            cs->cursor_res       = r->res_id;
-            cs->cursor_borrowed  = 1;
-            cs->cursor_phys      = 0;
-            cs->cursor_pin_pages = 0;
+        // GL-rendered cursor: wlroots draws it into a res3d whose pixels live
+        // host-side (the old 2D path got a DUMB buffer, so this never arose).
+        // QEMU only scans out a 2D resource as a cursor sprite, so pull the host
+        // pixels into the res3d's guest backing (TRANSFER_FROM_HOST_3D) and then
+        // take the exact same alias + TRANSFER_TO_HOST_2D + UPDATE_CURSOR path the
+        // dumb cursor uses.  64x64 ARGB, so the download/upload is ~16 KiB.
+        if (c->virgl_ctx_id && r->res_id)
+            virtio_gpu_3d_transfer(0 /*from host*/, c->virgl_ctx_id, r->res_id,
+                                   0, 0, a.width, a.height, 0, 0);
+        uint64_t cur_bytes;
+        if (!drm_cursor_bytes(a.width, a.height, (uint64_t)r->bytes, &cur_bytes))
+            return -EINVAL;
+        // (Re)mint the 2D ARGB alias over the now-populated backing when the phys
+        // or dimensions change; keep it across re-binds of the same buffer.
+        if (cs->cursor_res &&
+            (cs->cursor_phys != r->phys ||
+             cs->cursor_w != a.width || cs->cursor_h != a.height))
+            cursor_drop_alias(b, cs);
+        if (!cs->cursor_res) {
+            uint32_t id = alloc_res_id();
+            if (b->resource_create(id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
+                                   a.width, a.height) != 0)
+                return -EIO;
+            if (b->resource_attach_backing(id, r->phys, r->bytes) != 0) {
+                b->resource_destroy(id);
+                return -EIO;
+            }
+            uint32_t pages = (uint32_t)((cur_bytes + 4095u) / 4096u);
+            for (uint32_t i = 0; i < pages; i++)
+                pmm_ref_inc(r->phys + (phys_addr_t)i * 4096u);
+            cs->cursor_res       = id;
+            cs->cursor_phys      = r->phys;
+            cs->cursor_pin_pages = pages;
             cs->cursor_w = a.width; cs->cursor_h = a.height;
-            cs->cursor_latched   = 0;
-        } else if (cs->cursor_latched && !hot_changed) {
-            return 0;
+            cs->cursor_borrowed  = 0;
         }
-        int rc = b->cursor_update(idx, r->res_id, cs->hot_x, cs->hot_y,
+        if (has_hotspot) { cs->hot_x = (uint32_t)a.hot_x; cs->hot_y = (uint32_t)a.hot_y; }
+        // Push the freshly-downloaded pixels to the device cursor resource + bind.
+        // Always transfer (no dedupe): the GL cursor image can change in place.
+        if (b->resource_transfer(cs->cursor_res, a.width, a.height) != 0)
+            return -EIO;
+        int rc = b->cursor_update(idx, cs->cursor_res, cs->hot_x, cs->hot_y,
                                   cs->cur_x, cs->cur_y);
         if (rc == 0) cs->cursor_latched = 1;
         return rc;
@@ -2661,6 +2781,64 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
         return -EIO;
     int rc = b->cursor_update(idx, cs->cursor_res, cs->hot_x, cs->hot_y,
                               cs->cur_x, cs->cur_y);
+    if (rc == 0) cs->cursor_latched = 1;
+    return rc;
+}
+
+// Atomic hardware cursor: the cursor plane references a FB (from ADDFB2 over the
+// GL-rendered cursor gbm bo, i.e. a res3d) plus a CRTC_X/Y position.  Reuse the
+// same virtio-gpu cursor pipeline as the legacy path: pull the host GL pixels
+// into the fb's guest backing (TRANSFER_FROM_HOST_3D for a 3D fb), alias a 2D
+// ARGB cursor resource over them, TRANSFER_TO_HOST_2D, then UPDATE_CURSOR.  A
+// re-bind of the same buffer only moves (no host sprite redefine -> no flicker).
+static int drm_atomic_apply_cursor(vfs_file_t* f, uint32_t idx, uint32_t fb_id,
+                                    int32_t x, int32_t y) {
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    if (!b || !b->cursor_update || !b->cursor_move) return -EOPNOTSUPP;
+    if (idx >= DRM_MAX_SCANOUTS) return -EINVAL;
+    drm_crtc_state_t* cs = &g_crtc_state[idx];
+    drm_client_t* c = client_of(f);
+    cs->cur_x = x; cs->cur_y = y;
+
+    if (fb_id == 0) {                       // hide the cursor
+        if (cs->cursor_res) { b->cursor_update(idx, 0, 0, 0, x, y); cursor_drop_alias(b, cs); }
+        return 0;
+    }
+    drm_fb_t* fb = find_fb(c, fb_id);
+    if (!fb) return -ENOENT;
+    uint32_t w = fb->width, h = fb->height;
+
+    // Same sprite already latched -> just move it (host keeps the sprite).
+    if (cs->cursor_latched && cs->cursor_phys == fb->phys &&
+        cs->cursor_w == w && cs->cursor_h == h)
+        return b->cursor_move(idx, x, y);
+
+    // GL cursor pixels are host-side; download them into the fb's guest backing.
+    if (fb->is_3d && c->virgl_ctx_id && fb->vgpu_res_id)
+        virtio_gpu_3d_transfer(0 /*from host*/, c->virgl_ctx_id, fb->vgpu_res_id,
+                               0, 0, w, h, 0, 0);
+
+    uint64_t cur_bytes;
+    if (!drm_cursor_bytes(w, h, (uint64_t)fb->bytes_alloc, &cur_bytes)) return -EINVAL;
+    if (cs->cursor_res &&
+        (cs->cursor_phys != fb->phys || cs->cursor_w != w || cs->cursor_h != h))
+        cursor_drop_alias(b, cs);
+    if (!cs->cursor_res) {
+        uint32_t id = alloc_res_id();
+        if (b->resource_create(id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, w, h) != 0)
+            return -EIO;
+        if (b->resource_attach_backing(id, fb->phys, fb->bytes_alloc) != 0) {
+            b->resource_destroy(id);
+            return -EIO;
+        }
+        uint32_t pages = (uint32_t)((cur_bytes + 4095u) / 4096u);
+        for (uint32_t i = 0; i < pages; i++)
+            pmm_ref_inc(fb->phys + (phys_addr_t)i * 4096u);
+        cs->cursor_res = id; cs->cursor_phys = fb->phys; cs->cursor_pin_pages = pages;
+        cs->cursor_w = w; cs->cursor_h = h; cs->cursor_borrowed = 0;
+    }
+    if (b->resource_transfer(cs->cursor_res, w, h) != 0) return -EIO;
+    int rc = b->cursor_update(idx, cs->cursor_res, cs->hot_x, cs->hot_y, x, y);
     if (rc == 0) cs->cursor_latched = 1;
     return rc;
 }
@@ -3090,6 +3268,8 @@ static int64_t drm_ioctl_impl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     case DRM_IOCTL_MODE_SETPROPERTY:       return drm_ioctl_mode_setproperty(arg);
     case DRM_IOCTL_MODE_OBJ_SETPROPERTY:   return drm_ioctl_mode_obj_setproperty(arg);
     case DRM_IOCTL_MODE_GETPROPBLOB:       return drm_ioctl_mode_getpropblob(arg);
+    case DRM_IOCTL_MODE_CREATEPROPBLOB:    return drm_ioctl_create_blob(arg);
+    case DRM_IOCTL_MODE_DESTROYPROPBLOB:   return drm_ioctl_destroy_blob(arg);
     case DRM_IOCTL_MODE_GETFB:             return drm_ioctl_mode_getfb(self, arg);
     case DRM_IOCTL_MODE_CLOSEFB:           return drm_ioctl_mode_closefb(self, arg);
     case DRM_IOCTL_MODE_CURSOR:            return drm_ioctl_mode_cursor(self, arg, 0);

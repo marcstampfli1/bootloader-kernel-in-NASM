@@ -234,6 +234,11 @@ static int start_session(passwd_entry_t* pw, const char* username,
         "TERM=xterm-256color",
         "LANG=C.UTF-8",
         "XDG_RUNTIME_DIR=/tmp",
+        // Force wlroots' SOFTWARE cursor: our virtio-gpu can't make a legacy HW
+        // cursor DUMB buffer a GLES2 render target, so wlroots renders the cursor
+        // sprite into an empty buffer -> invisible pointer.  The software cursor
+        // composites into the main frame (which renders correctly), so it shows.
+        "WLR_NO_HARDWARE_CURSORS=1",
         (char*)0,
     };
     const char* prog = cmd_override ? cmd_override : pw->shell;
