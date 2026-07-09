@@ -124,7 +124,7 @@ configure() {
         -DSDL_X11=OFF \
         -DSDL_KMSDRM=OFF \
         -DSDL_KMSDRM_SHARED=OFF \
-        -DSDL_OPENGL=OFF \
+        -DSDL_OPENGL=ON \
         -DSDL_OPENGLES=ON \
         -DSDL_RENDER_D3D=OFF \
         -DSDL_VULKAN=OFF \

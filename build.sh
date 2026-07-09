@@ -447,6 +447,17 @@ if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_
     echo "[build] sdl3_gl linked against SDL3 + the static Mesa GL stack"
 fi
 
+# sdl3_gl3 -- DESKTOP GL 3.3 core smoke test (proves virgl exposes desktop GL,
+# not just GLES2 -- i.e. no GL4ES translation layer needed for legacy/core GL).
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
+    "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+        -I "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/sdl3_gl3/sdl3_gl3.c" \
+        -o "$BUILD_DIR/user_sdl3_gl3.o"
+    link_sdl_app sdl3_gl3
+    echo "[build] sdl3_gl3 (desktop GL 3.3 core) linked"
+fi
+
 # ── sdl3_audio -- end-to-end SDL3 audio smoke test (native /dev/dsp backend) ──
 if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
     "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
@@ -908,6 +919,8 @@ if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello
     [ -f "$BUILD_DIR/user_sdl3_gl.elf" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_gl.elf" bin/sdl3_gl
+    [ -f "$BUILD_DIR/user_sdl3_gl3.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_gl3.elf" bin/sdl3_gl3
     echo "[+] sdl3_hello ELF installed at bin/sdl3_hello (root:root 0755)"
 fi
 if [ -f "$BUILD_DIR/user_sdl3_audio.elf" ]; then
