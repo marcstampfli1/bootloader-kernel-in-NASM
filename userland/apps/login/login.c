@@ -234,12 +234,16 @@ static int start_session(passwd_entry_t* pw, const char* username,
         "TERM=xterm-256color",
         "LANG=C.UTF-8",
         "XDG_RUNTIME_DIR=/tmp",
-        // Keyboard layout for the whole session.  libxkbcommon fills a NULL
-        // rule_names field from these XKB_DEFAULT_* vars (context-priv.c),
-        // and both sway and tinywl pass an all-zero rule_names, so this is
-        // the single knob for the layout.  "ch" is Swiss German (QWERTZ);
-        // add "XKB_DEFAULT_VARIANT=fr" for French Swiss.
-        "XKB_DEFAULT_LAYOUT=ch",
+        // NOTE: the Swiss layout is NOT set via XKB_DEFAULT_LAYOUT here.
+        // That drives from_names(ch), whose keymap contains exotic level3/4
+        // keysyms (long-s, capital-sharp-s, bullet) that the guest
+        // libxkbcommon re-serializes as UXXXX tokens its own parser then
+        // rejects -- so every wayland CLIENT (foot) ends up with a NULL
+        // keymap and dead keys, even though the compositor's bindings work.
+        // Instead sway loads a precompiled, UXXXX-free keymap via
+        // `input type:keyboard xkb_file /etc/keymap.xkb` (see build.sh). If
+        // xkb_file ever fails, the fallback is a parseable US layout, not a
+        // dead keyboard.
         // Force wlroots' SOFTWARE cursor: our virtio-gpu can't make a legacy HW
         // cursor DUMB buffer a GLES2 render target, so wlroots renders the cursor
         // sprite into an empty buffer -> invisible pointer.  The software cursor

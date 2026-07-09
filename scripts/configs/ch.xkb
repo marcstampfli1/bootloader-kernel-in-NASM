@@ -1440,7 +1440,7 @@ xkb_symbols "(unnamed)" {
 	key <BKSP>               {	[       BackSpace,       BackSpace ] };
 	key <TAB>                {	[             Tab,    ISO_Left_Tab ] };
 	key <AD01>               {	[               q,               Q,              at,     Greek_OMEGA ] };
-	key <AD02>               {	[               w,               W,           U017F,         section ] };
+	key <AD02>               {	[               w,               W,           NoSymbol,         section ] };
 	key <AD03>               {	[               e,               E,        EuroSign,               E ] };
 	key <AD04>               {	[               r,               R,       paragraph,      registered ] };
 	key <AD05>               {	[               t,               T,          tslash,          Tslash ] };
@@ -1454,7 +1454,7 @@ xkb_symbols "(unnamed)" {
 	key <RTRN>               {	[          Return ] };
 	key <LCTL>               {	[       Control_L ] };
 	key <AC01>               {	[               a,               A,              ae,              AE ] };
-	key <AC02>               {	[               s,               S,          ssharp,           U1E9E ] };
+	key <AC02>               {	[               s,               S,          ssharp,           NoSymbol ] };
 	key <AC03>               {	[               d,               D,             eth,             ETH ] };
 	key <AC04>               {	[               f,               F,         dstroke,     ordfeminine ] };
 	key <AC05>               {	[               g,               G,             eng,             ENG ] };
@@ -1474,7 +1474,7 @@ xkb_symbols "(unnamed)" {
 	key <AB05>               {	[               b,               B, leftdoublequotemark, leftsinglequotemark ] };
 	key <AB06>               {	[               n,               N, rightdoublequotemark, rightsinglequotemark ] };
 	key <AB07>               {	[               m,               M,              mu,       masculine ] };
-	key <AB08>               {	[           comma,       semicolon,           U2022,        multiply ] };
+	key <AB08>               {	[           comma,       semicolon,           NoSymbol,        multiply ] };
 	key <AB09>               {	[          period,           colon,  periodcentered,        division ] };
 	key <AB10>               {	[           minus,      underscore,   dead_belowdot,   dead_abovedot ] };
 	key <RTSH>               {	[         Shift_R ] };
