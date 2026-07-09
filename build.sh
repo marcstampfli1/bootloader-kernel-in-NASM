@@ -403,41 +403,57 @@ fi
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_tone.o" \
    -o "$BUILD_DIR/user_tone.elf"
 
-# ── sdl3_hello — end-to-end SDL3 smoke test ──────────────────────────
-# Links against the sysroot-installed libSDL3.a + its Wayland/xkbcommon
-# deps + libc/libm/libpthread.  Uses -nostartfiles + crt0.o like every
-# other sysroot-linked app so argv/argc are populated correctly.
-if [ -f "$SYSROOT/usr/lib/libSDL3.a" ]; then
+# ── SDL3 apps ────────────────────────────────────────────────────────
+# libSDL3.a now uses the static-EGL path (no dlopen; SDL_egl.o references the
+# EGL entry points directly), so EVERY SDL video app pulls SDL_egl.o and must
+# link the full static Mesa stack via g++ (libstdc++ for Mesa's C++) + crt0.o
+# (argv + .init_array for Mesa's C++ ctors).  One shared link recipe:
+link_sdl_app() {   # $1 = basename: build/user_$1.o -> build/user_$1.elf
+    "$USER_CXX" --sysroot="$SYSROOT" -m64 -mno-red-zone -no-pie -s \
+        -nostartfiles -Wl,--build-id=none \
+        "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_$1.o" \
+        -Wl,--gc-sections -Wl,--allow-multiple-definition -Wl,--start-group \
+        "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" \
+        -lSDL3 \
+        -lEGL -lGLESv2 -lGLESv1_CM -lgbm -lglapi \
+        -lwayland-egl -lwayland-client -lwayland-cursor -lwayland-server \
+        -lxkbcommon -lffi -lexpat -ldrm \
+        -lc -lm -lrt -lpthread -ldl -lz \
+        -Wl,--end-group \
+        -o "$BUILD_DIR/user_$1.elf"
+}
+
+# sdl3_hello -- end-to-end SDL3 smoke test (software renderer via wl_shm).
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
     "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
         -I "$SYSROOT/usr/include" \
         -c "$USERLAND_DIR/apps/sdl3_hello/sdl3_hello.c" \
         -o "$BUILD_DIR/user_sdl3_hello.o"
-    "$USER_CC" "${USER_CFLAGS[@]}" --sysroot="$SYSROOT" \
-        -nostartfiles -Wl,--build-id=none \
-        "$SYSROOT/usr/lib/crt0.o" \
-        "$BUILD_DIR/user_sdl3_hello.o" \
-        -Wl,--start-group \
-        -lSDL3 -lwayland-client -lwayland-cursor -lxkbcommon -lffi \
-        -lc -lm -lrt -lpthread -ldl \
-        -Wl,--end-group \
-        -o "$BUILD_DIR/user_sdl3_hello.elf"
+    link_sdl_app sdl3_hello
+fi
+
+# ── sdl3_gl -- SDL3 GLES2/EGL (Wayland-EGL -> Mesa -> virgl) smoke test ───────
+# Proves client-side hardware GL: a GLES2 context whose buffer sway composites
+# via linux-dmabuf.  Needs the full static Mesa stack (megadriver + EGL/GLES2/
+# gbm/glapi) in addition to SDL3, so it links via g++ (libstdc++ for Mesa's C++)
+# with --allow-multiple-definition (Mesa ships math symbols libc also provides)
+# and crt0.o (argv + .init_array for Mesa's C++ global ctors), like gltest.
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
+    "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+        -I "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/sdl3_gl/sdl3_gl.c" \
+        -o "$BUILD_DIR/user_sdl3_gl.o"
+    link_sdl_app sdl3_gl
+    echo "[build] sdl3_gl linked against SDL3 + the static Mesa GL stack"
 fi
 
 # ── sdl3_audio -- end-to-end SDL3 audio smoke test (native /dev/dsp backend) ──
-if [ -f "$SYSROOT/usr/lib/libSDL3.a" ]; then
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
     "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
         -I "$SYSROOT/usr/include" \
         -c "$USERLAND_DIR/apps/sdl3_audio/sdl3_audio.c" \
         -o "$BUILD_DIR/user_sdl3_audio.o"
-    "$USER_CC" "${USER_CFLAGS[@]}" --sysroot="$SYSROOT" \
-        -nostartfiles -Wl,--build-id=none \
-        "$SYSROOT/usr/lib/crt0.o" \
-        "$BUILD_DIR/user_sdl3_audio.o" \
-        -Wl,--start-group \
-        -lSDL3 -lwayland-client -lwayland-cursor -lxkbcommon -lffi \
-        -lc -lm -lrt -lpthread -ldl \
-        -Wl,--end-group \
-        -o "$BUILD_DIR/user_sdl3_audio.elf"
+    link_sdl_app sdl3_audio
 fi
 
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/shell" -c "$USERLAND_DIR/apps/shell/shell.c" -o "$BUILD_DIR/user_shell.o"
@@ -890,6 +906,8 @@ if [ -f "$BUILD_DIR/user_tone.elf" ]; then
 fi
 if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello
+    [ -f "$BUILD_DIR/user_sdl3_gl.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_gl.elf" bin/sdl3_gl
     echo "[+] sdl3_hello ELF installed at bin/sdl3_hello (root:root 0755)"
 fi
 if [ -f "$BUILD_DIR/user_sdl3_audio.elf" ]; then
