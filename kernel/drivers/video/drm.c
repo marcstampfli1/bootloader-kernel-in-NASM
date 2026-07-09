@@ -1087,7 +1087,44 @@ static int resolve_fb(drm_client_t* c, uint32_t fb_id,
     return 0;
 }
 
+// ── KMS master arbitration (card0 scanout ownership) ─────────────────
+// The scanout is a single global resource.  Letting two compositors
+// drive it at once -- e.g. a second `sway` launched from a nested
+// `login` inside the running session -- has both minting scanout fbs in
+// the shared virtio-gpu resource space and flipping the same CRTC, which
+// corrupts host resource state and wedges/crashes the display.  Linux
+// serializes this with DRM-master: exactly one client owns modeset at a
+// time.  We claim ownership at the first modeset commit (the real
+// arbitration point; SET_MASTER is advisory and a direct-session client
+// may skip it) and release it on DROP_MASTER or fd close.  A second
+// client's modeset then fails cleanly with -EBUSY instead of racing.
+// NULL owner == free for the taking; the single-compositor path claims
+// once and is otherwise unchanged.
+static vfs_file_t* s_kms_master;   // owning card0 fd, or NULL
+
+// 0 if `f` owns (or just claimed) the scanout, -EBUSY if another client
+// holds it.  Lock-free: one CAS from NULL claims ownership.
+static int drm_claim_master(vfs_file_t* f) {
+    vfs_file_t* cur = __atomic_load_n(&s_kms_master, __ATOMIC_ACQUIRE);
+    if (cur == f) return 0;
+    if (cur == NULL &&
+        __atomic_compare_exchange_n(&s_kms_master, &cur, f, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return 0;
+    // cur now holds the race winner; ok only if that is us.
+    return (cur == f) ? 0 : -EBUSY;
+}
+
+// Relinquish ownership iff `f` holds it (DROP_MASTER / close).  Idempotent.
+static void drm_release_master(vfs_file_t* f) {
+    vfs_file_t* cur = f;
+    __atomic_compare_exchange_n(&s_kms_master, &cur, NULL, false,
+                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
 static int drm_ioctl_setcrtc(vfs_file_t* f, uint64_t arg) {
+    int m = drm_claim_master(f);
+    if (m) return m;
     drm_mode_crtc_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
@@ -1113,6 +1150,8 @@ typedef struct {
 } drm_mode_page_flip_t;
 
 static int drm_ioctl_page_flip(vfs_file_t* f, uint64_t arg) {
+    int m = drm_claim_master(f);
+    if (m) return m;
     drm_mode_page_flip_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
@@ -1184,6 +1223,11 @@ static int drm_ioctl_atomic(vfs_file_t* f, uint64_t arg) {
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
     if (a.count_objs == 0) return 0;
     if (a.count_objs > DRM_MAX_SCANOUTS) return -EINVAL;
+
+    // Only the scanout owner may modeset -- reject a second compositor's
+    // commit (and its probe TEST_ONLY) rather than let it race the first.
+    int m = drm_claim_master(f);
+    if (m) return m;
 
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
     if (!b) return -ENODEV;
@@ -3280,8 +3324,8 @@ static int64_t drm_ioctl_impl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     case DRM_IOCTL_MODE_LIST_LESSEES:      return -EOPNOTSUPP;
     case DRM_IOCTL_MODE_GET_LEASE:         return -EOPNOTSUPP;
     case DRM_IOCTL_MODE_REVOKE_LEASE:      return -EOPNOTSUPP;
-    case DRM_IOCTL_SET_MASTER:        return 0;  // single-client for now
-    case DRM_IOCTL_DROP_MASTER:       return 0;
+    case DRM_IOCTL_SET_MASTER:        return drm_claim_master(self);
+    case DRM_IOCTL_DROP_MASTER:       drm_release_master(self); return 0;
     // virtio-gpu 3D (virgl) render-node uAPI (Phase 2).
     case DRM_IOCTL_VIRTGPU_GETPARAM:      return drm_ioctl_virtgpu_getparam(self, arg);
     case DRM_IOCTL_VIRTGPU_GET_CAPS:      return drm_ioctl_virtgpu_get_caps(self, arg);
@@ -3329,6 +3373,9 @@ static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
 static uint32_t s_drm_open_count;
 
 static void drm_close(vfs_file_t* self) {
+    // Give up the scanout if this client owned modeset, so the next
+    // compositor (e.g. after this session exits) can claim it.
+    drm_release_master(self);
     // Tear down every dumb buffer + fb this client still holds.
     drm_client_t* c = client_of(self);
     if (c) {
