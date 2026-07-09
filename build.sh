@@ -1038,12 +1038,25 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
         -e 's|^[[:space:]]*font .*|    font pango:DejaVu Sans Mono 11|' \
         -e '/^bar {/a\    font pango:DejaVu Sans Mono 11' \
         "$SYSROOT/etc/sway/config" > "$BUILD_DIR/etc_stage/sway_config"
+    # Swiss keyboard: load a PRECOMPILED keymap directly (xkb_file) instead of
+    # letting the guest's cross-built libxkbcommon walk /usr/share/X11/xkb at
+    # runtime.  The RMLVO tree-walk (rules -> includes -> many files) is the
+    # fragile in-guest path: the simple "us" layout compiles from names, but
+    # "ch" (more includes + level3) does not, leaving sway with a NULL keymap
+    # and a dead keyboard.  scripts/configs/ch.xkb is a self-contained keymap
+    # compiled on the host, so in-guest sway only fopen()s and parses one file
+    # (the parser already works -- it compiled "us").  Installed at
+    # /etc/keymap.xkb below; applies to every keyboard.
+    printf 'input type:keyboard xkb_file /etc/keymap.xkb\n' >> "$BUILD_DIR/etc_stage/sway_config"
     debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir etc/sway" > /dev/null 2>&1 || true
     debugfs -w "$BUILD_DIR/ext2.img" \
         -R "write $BUILD_DIR/etc_stage/sway_config etc/sway/config" > /dev/null 2>&1 || true
     ext2_setperm "$BUILD_DIR/ext2.img" /etc/sway        0040755 0 0
     ext2_setperm "$BUILD_DIR/ext2.img" /etc/sway/config 0100644 0 0
-    echo "[+] sway + swaymsg installed (+ /etc/sway/config)"
+    # Precompiled Swiss (ch) keymap that /etc/sway/config's xkb_file points at.
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $SCRIPT_DIR/scripts/configs/ch.xkb etc/keymap.xkb" > /dev/null 2>&1 || true
+    ext2_setperm "$BUILD_DIR/ext2.img" /etc/keymap.xkb 0100644 0 0
+    echo "[+] sway + swaymsg installed (+ /etc/sway/config + /etc/keymap.xkb)"
 
     # ── Desktop environment components ────────────────────────────────
     # swaybar (taskbar) + swaynag, swaybg (wallpaper daemon), tofi
