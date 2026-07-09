@@ -234,6 +234,12 @@ static int start_session(passwd_entry_t* pw, const char* username,
         "TERM=xterm-256color",
         "LANG=C.UTF-8",
         "XDG_RUNTIME_DIR=/tmp",
+        // Keyboard layout for the whole session.  libxkbcommon fills a NULL
+        // rule_names field from these XKB_DEFAULT_* vars (context-priv.c),
+        // and both sway and tinywl pass an all-zero rule_names, so this is
+        // the single knob for the layout.  "ch" is Swiss German (QWERTZ);
+        // add "XKB_DEFAULT_VARIANT=fr" for French Swiss.
+        "XKB_DEFAULT_LAYOUT=ch",
         // Force wlroots' SOFTWARE cursor: our virtio-gpu can't make a legacy HW
         // cursor DUMB buffer a GLES2 render target, so wlroots renders the cursor
         // sprite into an empty buffer -> invisible pointer.  The software cursor
