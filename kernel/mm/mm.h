@@ -47,6 +47,20 @@ typedef struct vma_t {
     rcu_head_t      rcu_head;
 } vma_t;
 
+// Bytes of file backing to copy into the page at `pg_off` (the offset of that
+// page within a file-backed VMA whose backing spans `file_len` bytes); 0 if the
+// page lies entirely past the backing (pure BSS/zero tail).  The caller zero-
+// fills the whole page first, then reads this many bytes from the file at
+// (vma->file_off + pg_off).  Underflow-safe by construction: it never evaluates
+// file_len - pg_off when pg_off >= file_len.  Single source of truth for every
+// file-backed page fill: the demand-fault handler, its read-ahead, and the PIE
+// self-relocation page populate.
+static inline uint64_t vma_file_page_span(uint64_t pg_off, uint64_t file_len) {
+    if (pg_off >= file_len) return 0;
+    uint64_t n = file_len - pg_off;
+    return n < PAGE_SIZE ? n : PAGE_SIZE;
+}
+
 // ── Memory descriptor ─────────────────────────────────────────────────────
 // One per address space (PML4).  Shared by all threads in a task group.
 // Kernel threads have mm == NULL.

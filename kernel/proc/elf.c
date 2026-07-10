@@ -353,12 +353,9 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                     __builtin_memset(dst, 0, PAGE_SIZE);
                     if (vma->flags & VMA_FILE) {
                         uint64_t pg_off = page - vma->start;
-                        if (pg_off < vma->file_len) {
-                            uint64_t src = vma->file_off + pg_off;
-                            uint64_t n   = PAGE_SIZE;
-                            if (pg_off + n > vma->file_len) n = vma->file_len - pg_off;
-                            if (src + n <= size) __builtin_memcpy(dst, data + src, n);
-                        }
+                        uint64_t n      = vma_file_page_span(pg_off, vma->file_len);
+                        uint64_t src    = vma->file_off + pg_off;
+                        if (n && src + n <= size) __builtin_memcpy(dst, data + src, n);
                     }
                     if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma->flags))) {
                         pmm_buddy_free(frame, 0);

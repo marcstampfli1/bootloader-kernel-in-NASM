@@ -930,11 +930,9 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                 }
                 uint8_t* dst = (uint8_t*)(clean_frame + HHDM_OFFSET);
                 __builtin_memset(dst, 0, PAGE_SIZE);
-                if (pg_off < vma_file_len) {
+                uint64_t bytes = vma_file_page_span(pg_off, vma_file_len);
+                if (bytes) {
                     uint64_t src_off = vma_file_off + pg_off;
-                    uint64_t bytes   = PAGE_SIZE;
-                    if (pg_off + bytes > vma_file_len)
-                        bytes = vma_file_len - pg_off;
                     // pread: positional read — no seek position shared with other
                     // CPUs using the same vfs_file_t (lazy-loaded ELF VMAs).
                     int64_t pread_rc;
@@ -994,9 +992,7 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                         uint8_t* ra_dst = (uint8_t*)(ra_frame + HHDM_OFFSET);
                         __builtin_memset(ra_dst, 0, PAGE_SIZE);
                         uint64_t ra_src_off = vma_file_off + ra_pg_off;
-                        uint64_t ra_bytes   = PAGE_SIZE;
-                        if (ra_pg_off + ra_bytes > vma_file_len)
-                            ra_bytes = vma_file_len - ra_pg_off;
+                        uint64_t ra_bytes   = vma_file_page_span(ra_pg_off, vma_file_len);
                         int64_t ra_rc;
                         if (vma_file->pread)
                             ra_rc = vma_file->pread(vma_file, ra_dst, ra_bytes, ra_src_off);
