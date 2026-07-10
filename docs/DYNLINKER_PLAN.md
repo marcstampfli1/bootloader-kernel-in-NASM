@@ -55,9 +55,11 @@ ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
    - GOTCHA: a FAILED background build leaves a stale disk.img -> QEMU runs the
      old kernel and every result lies.  Build in the FOREGROUND (or verify the
      kernel binary changed) before trusting a headless run.
-   TODO milestone 2: bind a `.so`'s libc imports against the PIE exe's exported
-   `.dynsym` (needs the exe load-base + its _DYNAMIC); RELRO mprotect (no mprotect
-   syscall yet).
+   MILESTONE 2 **DONE**: a `.so`'s libc imports (GLOB_DAT/JUMP_SLOT vs UND syms)
+   bind against the PIE exe's exported `.dynsym` -- dsotest's dso_strlen() calls
+   the exe's strlen.  The exe scope is derived from the auxv PHDRs libc saves
+   (__libc_phdr...): exe base = AT_PHDR - PT_PHDR vaddr; dynsym via PT_DYNAMIC.
+   TODO: RELRO mprotect (no mprotect syscall yet).
 3. init/fini + `DT_NEEDED` deps + `dlopen(NULL)` (self scope) + `dlerror` (TLS) +
    `dlclose` (refcount). DONE: C++ ctor `.so`; dlopen(NULL) finds host syms.
 4. Dynamic TLS: `__tls_get_addr` + per-thread DTV + `DTPMOD64`/`DTPOFF64`/
