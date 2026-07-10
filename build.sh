@@ -176,7 +176,7 @@ SYSROOT_CFLAGS=(
 # in-tree apps that include it directly.
 for src in unistd fcntl sys_stat sys_socket sys_eventfd sys_timerfd \
            sys_signalfd sys_ioctl sys_time sys_file sys_epoll \
-           time arpa_inet string ctype makaos_input poll signal resolv \
+           time arpa_inet string ctype makaos_input poll select signal resolv \
            getopt wordexp tls; do
   "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
     -c "$USERLAND_DIR/libc/${src}.c" -o "$BUILD_DIR/user_${src}.o"
@@ -250,7 +250,7 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_sys_epoll.o" \
    "$BUILD_DIR/user_time.o" "$BUILD_DIR/user_arpa_inet.o" \
    "$BUILD_DIR/user_ctype.o" "$BUILD_DIR/user_makaos_input.o" \
-   "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_signal.o" \
+   "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_select.o" "$BUILD_DIR/user_signal.o" \
    "$BUILD_DIR/user_resolv.o" "$BUILD_DIR/user_getopt.o" \
    "$BUILD_DIR/user_wordexp.o" "$BUILD_DIR/user_tls.o" \
    "$BUILD_DIR/user_wayland_egl_stub.o" \
@@ -317,6 +317,7 @@ USER_RT=(
     "$BUILD_DIR/user_ctype.o"
     "$BUILD_DIR/user_makaos_input.o"
     "$BUILD_DIR/user_poll.o"
+    "$BUILD_DIR/user_select.o"
     "$BUILD_DIR/user_signal.o"
     "$BUILD_DIR/user_arpa_inet.o"
     "$BUILD_DIR/user_string.o"
@@ -578,6 +579,13 @@ if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_
             --whole-archive "$SYSROOT/usr/lib/libc.a" --no-whole-archive \
             -o "$BUILD_DIR/user_sdl2test.elf"
         echo "[build] sdl2test PIE linked (SDL2 -> sdl2-compat -> dlopen libSDL3)"
+    fi
+
+    # DarkPlaces engine (Xonotic): a PIE that links sdl2-compat (libSDL2.a) +
+    # the codec libs and dlopens libSDL3.so.0 at runtime for video/GL/input.
+    if [ -f "$SYSROOT/usr/lib/libSDL2.a" ] && [ -d "$(pwd)/build/third_party/darkplaces" ]; then
+        SYSROOT="$SYSROOT" bash "$(pwd)/scripts/port-darkplaces.sh" || \
+            echo "[build] WARNING: DarkPlaces build failed"
     fi
 fi
 
@@ -1053,6 +1061,8 @@ if [ -f "$BUILD_DIR/user_tone.elf" ]; then
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdltest.elf" bin/sdltest
     [ -f "$BUILD_DIR/user_sdl2test.elf" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl2test.elf" bin/sdl2test
+    [ -f "$BUILD_DIR/darkplaces_build/darkplaces.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/darkplaces_build/darkplaces.elf" bin/darkplaces
 fi
 if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello
