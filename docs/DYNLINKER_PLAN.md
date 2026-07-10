@@ -60,8 +60,12 @@ ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
    the exe's strlen.  The exe scope is derived from the auxv PHDRs libc saves
    (__libc_phdr...): exe base = AT_PHDR - PT_PHDR vaddr; dynsym via PT_DYNAMIC.
    TODO: RELRO mprotect (no mprotect syscall yet).
-3. init/fini + `DT_NEEDED` deps + `dlopen(NULL)` (self scope) + `dlerror` (TLS) +
-   `dlclose` (refcount). DONE: C++ ctor `.so`; dlopen(NULL) finds host syms.
+3. init/fini + `DT_NEEDED` deps + `dlopen(NULL)` + `dlclose` refcount.
+   **DONE**: `DT_NEEDED` loads deps recursively (/lib/<name>), published-before-
+   deps so circular chains dedup; `dlopen(NULL)` global scope; path dedup +
+   refcount; `DT_FINI_ARRAY` on dlclose.  Tested: libdso2.so as a DT_NEEDED dep,
+   dlopen(NULL)+dlsym.  TODO: per-object dep list so dlclose unloads deps;
+   `dlerror` is not yet per-thread (TLS) -- fine until threads dlopen.
 4. Dynamic TLS: `__tls_get_addr` + per-thread DTV + `DTPMOD64`/`DTPOFF64`/
    `TPOFF64`, integrated with `__makaos_tls_init` + pthreads. THE hard part;
    SDL3/Mesa need it. DONE: a `__thread` `.so` works across threads.
