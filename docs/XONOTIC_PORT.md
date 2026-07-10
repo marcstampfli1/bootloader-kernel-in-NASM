@@ -27,8 +27,16 @@ from automation (it froze the host GPU before).
 - (already had: zlib, libpng16, freetype, SDL3, GLESv2/EGL, Mesa/virgl)
 
 ## REMAINING (ordered)
-1. **sdl2-compat**: build the SDL2 API shim over SDL3 (fetched at
-   build/third_party/sdl2-compat). Reuses all the SDL3 static-EGL work.
+1. **sdl2-compat** (fetched, assessed -- NOT trivial): it is architecturally
+   built to `dlopen` libSDL3 at runtime and fill a ~hundreds-entry jump table
+   (`SDL3_##fn`) via `dlsym`; even `SDL2COMPAT_STATIC` still loads SDL3
+   dynamically.  MakaOS has no dlopen, so this needs a static-symbol-bind patch
+   (make `LoadSDL3Library` a no-op and bind each `SDL3_##fn` to the linked SDL3
+   `SDL_##fn` symbol) -- same class as the SDL_egl static-ANGLE fix but across
+   the whole SDL3 API.  Watch for the SDL2/SDL3 `SDL_*` symbol-name clash (SDL2
+   dynapi renames its exports; keep SDL3's real names for the linked binds).
+   Alternative if this proves too hairy: patch DarkPlaces' SDL2 calls to SDL3
+   directly (more edits, no shim).
 2. **libGL desktop front-end** OR confirm DarkPlaces resolves GL via
    SDL_GL_GetProcAddress (it does -- no libGL link needed).
 3. **Disk image bump**: EXT2_SECTORS in build.sh (currently 384 MiB) -> ~2 GiB
