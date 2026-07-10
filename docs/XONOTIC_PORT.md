@@ -53,10 +53,21 @@ from automation (it froze the host GPU before).
    small libc additions were needed: memccpy, select (SYS_SELECT wrapper), the
    glibc __jmp_buf_tag tag; plus a real latent fix (the exe now self-applies its
    initial-exec TLS relocs so libc's errno works -- see DYNLINKER_PLAN.md).
-5. **Assets**: fetch Xonotic data (or a minimal `data/` + one map .pk3),
-   install into the image like doom1.wad.
-6. **Headless launch** via run-gl.sh; iterate on serial until it inits GL,
-   loads a map, and renders frames. Then hand to user for the visual check.
+5. **Assets** -- NEXT: no game data yet, so DarkPlaces exits at "Couldn't load
+   gfx/mainmenu".  Minimal-data-first (user's call): a small data set to render
+   real content + a visible frame.  For DarkPlaces-Quake (id1) that's the Quake
+   shareware pak0.pak; for Xonotic proper, `-game xonotic` + a minimal Xonotic
+   data subset.
+6. **Headless launch** -- **GL CONTEXT ACHIEVED (2026-07-10)**.  dplaunch (sets
+   SDL_VIDEODRIVER=offscreen + basedir) booted under scripts/run-gl.sh
+   (virtio-gpu-gl, rendernode renderD129) brings up the FULL stack: DarkPlaces ->
+   sdl2-compat -> dlopen(libSDL3.so.0) -> SDL3 -> Mesa/virgl -> the NVIDIA
+   RTX 5060.  Serial: GL_RENDERER "virgl (NVIDIA GeForce RTX 5060)", GL_VERSION
+   4.2 Core, GLSL 420, "OpenGL backend started", GL draw commands submitted (host
+   vrend log shows them).  No crash; exits only on the missing gfx/mainmenu.
+   OPEN: host vrend rejects a cube-map with array size 1 ("Illegal command
+   buffer") -- a virgl compat quirk to chase once content renders.
+   Then hand the windowed run (run-gl-gui.sh) to the user for the visual check.
 
 ## Risks / unknowns
 - sdl2-compat may exercise SDL3 entry points our build stubbed.
