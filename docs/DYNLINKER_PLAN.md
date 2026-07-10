@@ -44,10 +44,20 @@ ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
    - GOTCHA (fixed): the exec path hands elf_load_into only the first-PAGE header
      buffer; the reloc pass must read .dynamic/.rela.dyn/target pages from the
      BACKING FILE (elf_read_at), not `data`, or any PIE > 4 KiB relocates nothing.
-2. libc `dlopen`/`dlsym`: map `.so`, base-relocate (`RELATIVE`/`GLOB_DAT`/
-   `JUMP_SLOT`/`64`, BIND_NOW), resolve host imports vs the PIE exe `.dynsym` +
-   loaded `.so`s, RELRO mprotect, gnu-hash lookup. DONE: no-import `.so`, then
-   libc-import `.so`.
+2. libc `dlopen`/`dlsym`: map `.so`, base-relocate, resolve imports, run init.
+   MILESTONE 1 **DONE**: no-import `.so` (dsotest) -> dltest dlopen/dlsym/call/
+   dlclose end to end (SysV hash; `ld -shared` emits SysV HASH not GNU_HASH).
+   Segments map file-backed MAP_PRIVATE per-PT_LOAD (text R+X, data R+W, BSS
+   zeroed) -- no mprotect, W^X holds.  Handles RELATIVE + GLOB_DAT/JUMP_SLOT/64.
+   - KERNEL GAPS this needed (fixed, deny-by-default): open() now grants
+     RIGHT_MMAP_X only for files the caller may EXECUTE (acl_check); PROT_WRITE
+     MAP_PRIVATE needs only RIGHT_MMAP_R (COW never writes the file).
+   - GOTCHA: a FAILED background build leaves a stale disk.img -> QEMU runs the
+     old kernel and every result lies.  Build in the FOREGROUND (or verify the
+     kernel binary changed) before trusting a headless run.
+   TODO milestone 2: bind a `.so`'s libc imports against the PIE exe's exported
+   `.dynsym` (needs the exe load-base + its _DYNAMIC); RELRO mprotect (no mprotect
+   syscall yet).
 3. init/fini + `DT_NEEDED` deps + `dlopen(NULL)` (self scope) + `dlerror` (TLS) +
    `dlclose` (refcount). DONE: C++ ctor `.so`; dlopen(NULL) finds host syms.
 4. Dynamic TLS: `__tls_get_addr` + per-thread DTV + `DTPMOD64`/`DTPOFF64`/
