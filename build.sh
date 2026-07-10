@@ -562,6 +562,23 @@ if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_
         --whole-archive "$SYSROOT/usr/lib/libc.a" --no-whole-archive \
         -o "$BUILD_DIR/user_sdltest.elf"
     echo "[build] sdltest PIE linked (dlopen libSDL3.so)"
+
+    # sdl2-compat (libSDL2.a) + sdl2test: the SDL2 API over SDL3.  sdl2-compat
+    # loads libSDL3.so.0 at runtime via dlopen+dlsym (unmodified upstream path,
+    # now that the loader exists), so an SDL2 program reaches SDL3 with no hack.
+    SYSROOT="$SYSROOT" bash "$(pwd)/scripts/port-sdl2-compat.sh"
+    if [ -f "$SYSROOT/usr/lib/libSDL2.a" ]; then
+        "$USER_CC" "${USER_CFLAGS[@]}" -D_REENTRANT -isystem "$SYSROOT/usr/include" \
+            "${USER_INCLUDES[@]}" \
+            -c "$USERLAND_DIR/apps/sdl2test/sdl2test.c" -o "$BUILD_DIR/user_sdl2test.o"
+        "$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
+            --export-dynamic -e _entry --build-id=none -T "$USERLAND_DIR/link-pie.ld" \
+            "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_sdl2test.o" \
+            "$SYSROOT/usr/lib/libSDL2.a" \
+            --whole-archive "$SYSROOT/usr/lib/libc.a" --no-whole-archive \
+            -o "$BUILD_DIR/user_sdl2test.elf"
+        echo "[build] sdl2test PIE linked (SDL2 -> sdl2-compat -> dlopen libSDL3)"
+    fi
 fi
 
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/shell" -c "$USERLAND_DIR/apps/shell/shell.c" -o "$BUILD_DIR/user_shell.o"
@@ -1027,12 +1044,15 @@ if [ -f "$BUILD_DIR/user_tone.elf" ]; then
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libtlsdso.so" lib/libtlsdso.so
     [ -f "$BUILD_DIR/user_dltest.elf" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_dltest.elf" bin/dltest
-    # libSDL3.so at /lib (0755 so the loader may map its text PROT_EXEC) + the
-    # sdltest PIE that dlopen()s it (Phase 5 milestone).
+    # libSDL3 at its standard runtime soname /lib/libSDL3.so.0 (0755 so the loader
+    # may map its text PROT_EXEC) -- the name sdl2-compat + sdltest dlopen.  (No
+    # symlinks in the ext2, and two 83 MB copies won't fit, so one file, .0 name.)
     [ -f "$BUILD_DIR/libSDL3.so" ] && \
-        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libSDL3.so" lib/libSDL3.so
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libSDL3.so" lib/libSDL3.so.0
     [ -f "$BUILD_DIR/user_sdltest.elf" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdltest.elf" bin/sdltest
+    [ -f "$BUILD_DIR/user_sdl2test.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl2test.elf" bin/sdl2test
 fi
 if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello

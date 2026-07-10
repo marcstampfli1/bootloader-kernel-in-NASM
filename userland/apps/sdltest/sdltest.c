@@ -26,7 +26,7 @@ extern int   dlclose(void*);
 int main(void) {
     unsigned long r = 0x5D100000UL;
 
-    void* h = dlopen("/lib/libSDL3.so", 2 /*RTLD_NOW*/);
+    void* h = dlopen("libSDL3.so.0", 2 /*RTLD_NOW*/);   /* bare soname -> /lib (standard SDL3 runtime name) */
     if (h) {
         r |= 0x01UL;
 

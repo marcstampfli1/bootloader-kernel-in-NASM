@@ -82,8 +82,21 @@ ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
    libc.  So a `.so` and the exe share libc's `errno` per thread.
    TODO: TLS unload on dlclose (module slots + per-thread blocks currently leak).
 5. Build `libSDL3.so`; sdl2-compat builds unmodified (its dlopen(libSDL3) works);
-   revert SDL/Mesa static-bind hacks; then DarkPlaces dynamic loading + Xonotic;
-   foundation for LWJGL/JVM. DONE: sdl2-compat runs a trivial SDL2 app.
+   then DarkPlaces dynamic loading + Xonotic; foundation for LWJGL/JVM.
+   **DONE (real):** the loader loads the actual 83 MB `libSDL3.so.0` end to end
+   (sdltest, CR2=0x5D10001F) and **sdl2-compat runs UNMODIFIED over it**
+   (sdl2test, CR2=0x5D20001F): a plain SDL2 program links `libSDL2.a`
+   (sdl2-compat `release-2.30.50`, the tag that targets our SDL3 3.2.0), whose
+   `SDL_Init` `dlopen("libSDL3.so.0")` + dlsym-fills the SDL3 jump table and
+   forwards to SDL3 -- SDL_Init/GetVersion/WasInit/GetError/Quit all round-trip.
+   No static-bind hack: `dlopen` of a BARE soname now resolves via /lib (same
+   rule as DT_NEEDED), and the exe provides libc (+ errno) to the .so.
+   - KNOWN LIMITATION (deferred): the loader ignores RTLD_LOCAL -- every dlopen'd
+     object joins the global resolve scope.  Harmless for the current paths
+     (nothing depends on local-scope isolation; sdl2-compat dlsyms SDL3 per-
+     handle, and libSDL3 imports no SDL_* from the exe), but real RTLD_LOCAL
+     wants per-handle symbol visibility.  Revisit if a plugin needs isolation.
+   NEXT: DarkPlaces (PRELOAD static, link -lSDL2) + Xonotic assets.
 
 ## Risks
 - Phase 0 toolchain surgery (PIE script may be missing from ld; PIC libc/crt).

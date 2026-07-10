@@ -27,16 +27,19 @@ from automation (it froze the host GPU before).
 - (already had: zlib, libpng16, freetype, SDL3, GLESv2/EGL, Mesa/virgl)
 
 ## REMAINING (ordered)
-1. **sdl2-compat** (fetched, assessed -- NOT trivial): it is architecturally
-   built to `dlopen` libSDL3 at runtime and fill a ~hundreds-entry jump table
-   (`SDL3_##fn`) via `dlsym`; even `SDL2COMPAT_STATIC` still loads SDL3
-   dynamically.  MakaOS has no dlopen, so this needs a static-symbol-bind patch
-   (make `LoadSDL3Library` a no-op and bind each `SDL3_##fn` to the linked SDL3
-   `SDL_##fn` symbol) -- same class as the SDL_egl static-ANGLE fix but across
-   the whole SDL3 API.  Watch for the SDL2/SDL3 `SDL_*` symbol-name clash (SDL2
-   dynapi renames its exports; keep SDL3's real names for the linked binds).
-   Alternative if this proves too hairy: patch DarkPlaces' SDL2 calls to SDL3
-   directly (more edits, no shim).
+1. **sdl2-compat** -- **DONE, UNMODIFIED** (the static-bind-patch idea below is
+   obsolete: MakaOS now HAS a real dlopen loader, see docs/DYNLINKER_PLAN.md).
+   sdl2-compat's native path -- `dlopen("libSDL3.so.0")` + a dlsym'd
+   `SDL3_##fn` jump table -- just works.  Built via scripts/port-sdl2-compat.sh
+   as `libSDL2.a`, pinned to `release-2.30.50` (the tag targeting our SDL3 3.2.0;
+   newer sdl2-compat needs 3.2.4's integer_x/y wheel API).  Proven by sdl2test
+   (CR2=0x5D20001F): SDL_Init loads SDL3 and the API round-trips, headless.
+   The SDL2/SDL3 `SDL_*` clash is a non-issue here: the shim dlsyms SDL3 per
+   libSDL3 handle (not global), libSDL3 imports no `SDL_*` from the exe, and the
+   shim's `dlopen(NULL)` quirk-probe is `#ifdef __linux__` (skipped on MakaOS).
+   DarkPlaces links `-lSDL2` (this libSDL2.a) and reaches SDL3 at runtime, no hack.
+   [OBSOLETE ORIGINAL NOTE kept for context: "MakaOS has no dlopen, so this needs
+   a static-symbol-bind patch..." -- superseded by the loader.]
 2. **libGL desktop front-end** OR confirm DarkPlaces resolves GL via
    SDL_GL_GetProcAddress (it does -- no libGL link needed).
 3. **Disk image bump**: EXT2_SECTORS in build.sh (currently 384 MiB) -> ~2 GiB

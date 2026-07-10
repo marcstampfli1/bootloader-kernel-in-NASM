@@ -10,7 +10,7 @@ SYSROOT="build/sysroot"
 L="$SYSROOT/usr/lib"
 OUT="${1:-build/libSDL3.so}"
 
-"$LD" -shared -m elf_x86_64_makaos --build-id=none -soname libSDL3.so \
+"$LD" -shared -m elf_x86_64_makaos --build-id=none -soname libSDL3.so.0 \
     --gc-sections --allow-multiple-definition \
     -L "$L" \
     build/dso_handle.o \
