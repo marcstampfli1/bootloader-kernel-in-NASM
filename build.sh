@@ -403,6 +403,15 @@ fi
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_tone.o" \
    -o "$BUILD_DIR/user_tone.elf"
 
+# ── pietest -- PIE self-relocation smoke test (dynamic-loader Phase 0/1) ──
+# Linked via ld DIRECTLY: gcc's driver forces -static (overriding -pie -> ET_EXEC),
+# but ld -pie yields a proper ET_DYN + PT_DYNAMIC + R_X86_64_RELATIVE that the
+# kernel ELF loader relocates at load time.  Freestanding, no libc.
+"$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
+   -c "$USERLAND_DIR/apps/pietest/pietest.c" -o "$BUILD_DIR/user_pietest.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -pie --export-dynamic -e _start \
+   --build-id=none "$BUILD_DIR/user_pietest.o" -o "$BUILD_DIR/user_pietest.elf"
+
 # ── SDL3 apps ────────────────────────────────────────────────────────
 # libSDL3.a now uses the static-EGL path (no dlopen; SDL_egl.o references the
 # EGL entry points directly), so EVERY SDL video app pulls SDL_egl.o and must
@@ -914,6 +923,8 @@ if [ -f "$BUILD_DIR/user_makaclock.elf" ]; then
 fi
 if [ -f "$BUILD_DIR/user_tone.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_tone.elf" bin/tone
+    [ -f "$BUILD_DIR/user_pietest.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_pietest.elf" bin/pietest
 fi
 if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello

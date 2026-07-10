@@ -278,6 +278,60 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
         if (seg_start < seg_start_min) seg_start_min = seg_start;
     }
 
+    // ── PIE self-relocation (R_X86_64_RELATIVE) ──────────────────────────
+    // A statically-linked PIE (ET_DYN) is linked at base 0 and carries only
+    // RELATIVE relocs.  Apply them now that the segments are mapped, writing
+    // through the physical frame (vmm_page_phys + HHDM) so a read-only / RELRO
+    // page is not a problem.  Without this every absolute pointer in the image
+    // (vtables, .data.rel.ro, string/reloc tables, __init_array) stays base-0
+    // -> wild pointers the instant the program runs.  Imported symbols are the
+    // dynamic loader's job, not this static-PIE path.
+    if (load_bias != 0) {
+        uint64_t dyn_vaddr = 0, dyn_filesz = 0;
+        for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+            const Elf64_Phdr* ph = (const Elf64_Phdr*)(data + ehdr->e_phoff
+                                     + (uint64_t)i * ehdr->e_phentsize);
+            if (ph->p_type == PT_DYNAMIC) { dyn_vaddr = ph->p_vaddr; dyn_filesz = ph->p_filesz; break; }
+        }
+        // Resolve a base-0 vaddr to a file offset via the PT_LOAD table.
+        // (returns (uint64_t)-1 if not found in any loadable segment)
+        #define ELF_VA2OFF(V) ({ uint64_t _o = (uint64_t)-1; \
+            for (uint16_t _i = 0; _i < ehdr->e_phnum; _i++) { \
+                const Elf64_Phdr* _p = (const Elf64_Phdr*)(data + ehdr->e_phoff \
+                                        + (uint64_t)_i * ehdr->e_phentsize); \
+                if (_p->p_type == PT_LOAD && (V) >= _p->p_vaddr \
+                    && (V) < _p->p_vaddr + _p->p_filesz) { \
+                    _o = _p->p_offset + ((V) - _p->p_vaddr); break; } } _o; })
+        uint64_t dyn_off = dyn_vaddr ? ELF_VA2OFF(dyn_vaddr) : (uint64_t)-1;
+        uint64_t rela_va = 0, rela_sz = 0, rela_ent = sizeof(Elf64_Rela);
+        if (dyn_off != (uint64_t)-1 && dyn_off + dyn_filesz <= size) {
+            const Elf64_Dyn* dyn = (const Elf64_Dyn*)(data + dyn_off);
+            for (uint64_t i = 0; (i + 1) * sizeof(Elf64_Dyn) <= dyn_filesz
+                                  && dyn[i].d_tag != DT_NULL; i++) {
+                if      (dyn[i].d_tag == DT_RELA)    rela_va  = dyn[i].d_un;
+                else if (dyn[i].d_tag == DT_RELASZ)  rela_sz  = dyn[i].d_un;
+                else if (dyn[i].d_tag == DT_RELAENT) rela_ent = dyn[i].d_un;
+            }
+        }
+        uint64_t rela_off = rela_va ? ELF_VA2OFF(rela_va) : (uint64_t)-1;
+        if (rela_sz && rela_ent && rela_off != (uint64_t)-1 && rela_off + rela_sz <= size) {
+            for (uint64_t o = 0; o + rela_ent <= rela_sz; o += rela_ent) {
+                const Elf64_Rela* r = (const Elf64_Rela*)(data + rela_off + o);
+                if (ELF64_R_TYPE(r->r_info) != R_X86_64_RELATIVE) continue;
+                virt_addr_t va = load_bias + r->r_offset;
+                // Segments are demand-paged, so the target page may not be
+                // resident yet -- vmm_get_user_pages faults it in (copying the
+                // file backing) and returns its HHDM pointer.
+                void* pg = 0;
+                if (vmm_get_user_pages(pml4, va & ~(virt_addr_t)0xFFF, 1, &pg) != 1
+                    || !pg) continue;
+                *(uint64_t*)((uintptr_t)pg + (va & 0xFFF)) =
+                    load_bias + (uint64_t)r->r_addend;
+            }
+        }
+        #undef ELF_VA2OFF
+    }
+
     // ── AT_PHDR safety net ────────────────────────────────────────────────
     // If the phdr table isn't inside any PT_LOAD (binaries whose first
     // LOAD skips file offset 0 — e.g. foot/sway from meson), the loop
