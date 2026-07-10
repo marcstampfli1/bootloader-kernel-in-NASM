@@ -538,7 +538,20 @@ got_file:
     // process can neither read nor CREATE outside its unveiled subtree.
 
     // ── Stamp fd rights from open flags ───────────────────────────────────
-    f->rights = rights_from_oflags((int)(flags & 3), 0 /* exec_ok: not checked here */);
+    // exec_ok grants RIGHT_EXEC | RIGHT_MMAP_X (needed to mmap PROT_EXEC, e.g.
+    // dlopen mapping a .so's text).  Deny by default (ASVS V4): grant it ONLY
+    // when the caller is authorized to EXECUTE this object -- its own ACL,
+    // checked against the caller's cred, exactly like fs_lookup's read/write
+    // check.  A non-executable data file (no x bit) therefore can never be
+    // mapped executable, and W^X still blocks W+X.  Only for real ext2 files
+    // resolved above; devices / newly O_CREAT'd files get no exec right.
+    int exec_ok = 0;
+    if (fsr == 0 && !fsn.is_virtual) {
+        acl_entry_t _acl[3];
+        acl_from_mode(_acl, fsn.uid, fsn.gid, fsn.mode);
+        exec_ok = acl_check(_acl, 3, &g_current->cred, ACL_PERM_EXEC);
+    }
+    f->rights = rights_from_oflags((int)(flags & 3), exec_ok);
 
     // Enforce access mode: strip write for O_RDONLY (belt-and-suspenders).
     if ((flags & 3) == O_RDONLY) f->write = NULL;
@@ -2631,9 +2644,14 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         // restricted from mapping -- especially PROT_EXEC, i.e. executing code
         // from a fd it may only read -- must be denied even when RIGHT_READ is
         // present.  Without this, RIGHT_MMAP_R/W/X were defined but never checked.
+        // PROT_WRITE: a MAP_SHARED writable mapping modifies the file, so it
+        // needs RIGHT_MMAP_W; a MAP_PRIVATE (COW) writable mapping never touches
+        // the file (writes go to private frames), so read-map access is enough
+        // -- exactly as POSIX allows PROT_WRITE|MAP_PRIVATE on a read-only fd,
+        // which is how a loader maps a .so's data segment (dlopen).
         if (f->rights != 0 &&
             (((prot & PROT_READ)  && !rights_check(f->rights, RIGHT_MMAP_R)) ||
-             ((prot & PROT_WRITE) && !rights_check(f->rights, RIGHT_MMAP_W)) ||
+             ((prot & PROT_WRITE) && !rights_check(f->rights, is_shared ? RIGHT_MMAP_W : RIGHT_MMAP_R)) ||
              ((prot & PROT_EXEC)  && !rights_check(f->rights, RIGHT_MMAP_X)))) {
             fdput(f); return (uint64_t)-EACCES;
         }
