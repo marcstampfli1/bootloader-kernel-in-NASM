@@ -533,6 +533,37 @@ if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_
     link_sdl_app sdl3_audio
 fi
 
+# Ensure the toolchain's libstdc++/libsupc++ are PIC (a from-source toolchain may
+# have built them non-PIC).  Self-guards: a no-op if already PIC.  PIC C++ links
+# fine into the static -no-pie apps too, so this is the ONE C++ runtime.  Only
+# bother when the Mesa/SDL stack is present (i.e. GL builds are live).
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
+    SYSROOT="$SYSROOT" bash "$(pwd)/scripts/build-libstdcxx-pic.sh" || \
+        echo "[build] WARNING: PIC libstdc++ retrofit failed; libSDL3.so may not link"
+fi
+
+# ── libSDL3.so + sdltest -- the real dynamic-loader milestone (Phase 5) ──────
+# A SELF-CONTAINED shared object: SDL3 (whole-archive) + the whole Mesa GL stack
+# + wayland + the (now PIC) C++ runtime (libstdc++/supc++/gcc), importing ONLY
+# libc from the host exe.  sdltest is a PIE that dlopen()s it and calls SDL entry
+# points -- proving the loader on a real 83 MB object with ~26k relocs, deps
+# folded in, and cross-module general-dynamic TLS (libc's errno).
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
+    echo "[build] linking libSDL3.so (self-contained shared object)"
+    bash "$(pwd)/scripts/link-libsdl3-so.sh" "$BUILD_DIR/libSDL3.so"
+    # sdltest PIE provides libc (+ the errno TLS var) to the .so via
+    # --export-dynamic; whole-archive libc.a so EVERY symbol libSDL3.so imports
+    # is present in the exe's exported .dynsym (RTLD_NOW resolves them all).
+    "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
+        -c "$USERLAND_DIR/apps/sdltest/sdltest.c" -o "$BUILD_DIR/user_sdltest.o"
+    "$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
+        --export-dynamic -e _entry --build-id=none -T "$USERLAND_DIR/link-pie.ld" \
+        "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_sdltest.o" \
+        --whole-archive "$SYSROOT/usr/lib/libc.a" --no-whole-archive \
+        -o "$BUILD_DIR/user_sdltest.elf"
+    echo "[build] sdltest PIE linked (dlopen libSDL3.so)"
+fi
+
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/shell" -c "$USERLAND_DIR/apps/shell/shell.c" -o "$BUILD_DIR/user_shell.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_shell.o" \
    -o "$BUILD_DIR/user_shell.elf"
@@ -795,7 +826,7 @@ stat -c "%n %s" \
 echo "[+] Creating disk image (GPT + ESP + ext2)"
 
 EXT2_LBA=4096
-EXT2_SECTORS=786432  # 384 MiB — room for the DE stack (sway+swaybar+swaybg+tofi) + xkb tree
+EXT2_SECTORS=1048576  # 512 MiB — DE stack (sway+swaybar+swaybg+tofi) + xkb tree + the 83 MB libSDL3.so
 ESP_START=2048
 ESP_END=4095
 
@@ -996,6 +1027,12 @@ if [ -f "$BUILD_DIR/user_tone.elf" ]; then
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libtlsdso.so" lib/libtlsdso.so
     [ -f "$BUILD_DIR/user_dltest.elf" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_dltest.elf" bin/dltest
+    # libSDL3.so at /lib (0755 so the loader may map its text PROT_EXEC) + the
+    # sdltest PIE that dlopen()s it (Phase 5 milestone).
+    [ -f "$BUILD_DIR/libSDL3.so" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libSDL3.so" lib/libSDL3.so
+    [ -f "$BUILD_DIR/user_sdltest.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdltest.elf" bin/sdltest
 fi
 if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello
