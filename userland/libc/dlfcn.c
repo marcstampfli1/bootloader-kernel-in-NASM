@@ -252,6 +252,21 @@ static int apply_rela(dso_t* d, const Elf64_Rela* rela, uint64_t sz) {
     return 0;
 }
 
+// Run an init/fini function-pointer array (DT_INIT_ARRAY / DT_FINI_ARRAY),
+// bounded to the object's own mapped span so a corrupt array pointer in a bad
+// .so cannot make us fetch + call through wild memory (V12).  `reverse` runs
+// destructors last-to-first.
+static void run_array(const dso_t* d, const unsigned long* arr, uint64_t sz, int reverse) {
+    if (!arr || !sz) return;
+    unsigned long a = (unsigned long)arr;
+    if (a < d->map_start || a + sz > d->map_start + d->map_len) return;   // corrupt -> skip
+    uint64_t n = sz / sizeof(unsigned long);
+    for (uint64_t k = 0; k < n; k++) {
+        unsigned long fp = arr[reverse ? (n - 1 - k) : k];
+        if (fp && fp != ~0UL) ((void (*)(void))fp)();
+    }
+}
+
 // dlopen(NULL) returns this handle for the global scope (main exe + all loaded
 // objects); dlsym on it searches everything via resolve_sym.
 static dso_t s_global;
@@ -336,10 +351,11 @@ void* dlopen(const char* path, int flags) {
     const Elf64_Rela* rela = NULL; uint64_t rela_sz = 0;
     const Elf64_Rela* jmprel = NULL; uint64_t jmprel_sz = 0;
     const unsigned long* init_arr = NULL; uint64_t init_sz = 0;
-    uint64_t needed[MAX_NEEDED]; int n_needed = 0;
+    uint64_t needed[MAX_NEEDED]; int n_needed = 0, needed_overflow = 0;
     for (const Elf64_Dyn* e = dyn; e->d_tag != DT_NULL; e++) {
         switch (e->d_tag) {
-            case DT_NEEDED:       if (n_needed < MAX_NEEDED) needed[n_needed++] = e->d_un; break;
+            case DT_NEEDED:       if (n_needed < MAX_NEEDED) needed[n_needed++] = e->d_un;
+                                  else needed_overflow = 1; break;
             case DT_SYMTAB:       d->symtab = (const Elf64_Sym*)(base + e->d_un); break;
             case DT_STRTAB:       d->strtab = (const char*)(base + e->d_un); break;
             case DT_STRSZ:        d->strsz  = e->d_un; break;
@@ -353,6 +369,10 @@ void* dlopen(const char* path, int flags) {
             case DT_FINI_ARRAY:   d->fini_arr = (const unsigned long*)(base + e->d_un); break;
             case DT_FINI_ARRAYSZ: d->fini_sz  = e->d_un; break;
         }
+    }
+    if (needed_overflow) {   // never silently drop deps -> unresolved symbols; fail closed
+        set_err("dlopen: too many DT_NEEDED", path);
+        munmap(res, span); free(d); return NULL;
     }
 
     // Publish BEFORE loading dependencies + relocating so the object's own
@@ -375,13 +395,7 @@ void* dlopen(const char* path, int flags) {
         unpublish(d); munmap(res, span); free(d); return NULL;
     }
 
-    // Constructors (DT_INIT_ARRAY).
-    if (init_arr && init_sz) {
-        for (uint64_t i = 0; i < init_sz / sizeof(unsigned long); i++) {
-            void (*fn)(void) = (void (*)(void))init_arr[i];
-            if (fn && (unsigned long)fn != ~0UL) fn();
-        }
-    }
+    run_array(d, init_arr, init_sz, 0);   // constructors (DT_INIT_ARRAY), bounded
     return d;
 }
 
@@ -402,12 +416,7 @@ int dlclose(void* handle) {
     if (!handle || handle == &s_global) return 0;
     dso_t* d = (dso_t*)handle;
     if (--d->refcnt > 0) return 0;
-    // Destructors (DT_FINI_ARRAY), reverse order.
-    if (d->fini_arr && d->fini_sz)
-        for (long i = (long)(d->fini_sz / sizeof(unsigned long)) - 1; i >= 0; i--) {
-            void (*fn)(void) = (void (*)(void))d->fini_arr[i];
-            if (fn && (unsigned long)fn != ~0UL) fn();
-        }
+    run_array(d, d->fini_arr, d->fini_sz, 1);   // destructors (DT_FINI_ARRAY), reverse, bounded
     // Note: DT_NEEDED deps are left loaded (no per-object dep list yet); a small
     // leak, not a correctness bug.
     unpublish(d);
