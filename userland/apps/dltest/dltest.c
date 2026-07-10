@@ -18,8 +18,10 @@
  *   bit10 DT_NEEDED: libdso.so pulls in libdso2.so; dso_dep() == 100
  *   bit11 dlopen(NULL) global scope: dlsym finds the exe's strlen
  *   bit12 THREAD-SAFETY: 3 threads hammer dlopen/dlsym/call/dlclose of the same
- *         .so concurrently; the loader lock + refcount keep it correct (no
- *         crash, every call returns 42).  Full pass => CR2=0x5EC01FFF.
+ *         .so concurrently; the loader lock + refcount keep it correct.
+ *   bit13 DYNAMIC TLS: a dlopen'd .so's __thread var is per-thread -- a spawned
+ *         thread sees the template value (7), not the main thread's mutation.
+ *         Full pass => CR2=0x5EC03FFF.
  */
 #include <pthread.h>
 extern void* dlopen(const char*, int);
@@ -27,6 +29,18 @@ extern void* dlsym(void*, const char*);
 extern int   dlclose(void*);
 extern int   open(const char*, int, ...);
 extern void* mmap(void*, unsigned long, int, int, int, long);
+
+// Dynamic-TLS test: the spawned thread must see the .so's __thread var at its
+// template value (7), NOT the main thread's mutation -- proving per-thread TLS.
+static int (*g_tget)(void);
+static void (*g_tset)(int);
+static void* tls_thread(void* a) {
+    int* out = (int*)a;
+    *out = g_tget();          // this thread's own copy -> must be 7, not main's 100
+    g_tset(200);
+    if (g_tget() != 200) *out = -1;   // this thread's write must stick locally
+    return (void*)0;
+}
 
 // Concurrent load/use/unload of the same object -- races the loaded-object list
 // + refcount; without the lock this corrupts or double-frees.
@@ -87,6 +101,24 @@ int main(void) {
     if (c2 == 0) pthread_join(t2, &r2);
     if (rm == (void*)1 && c1 == 0 && r1 == (void*)1 && c2 == 0 && r2 == (void*)1) r |= 0x1000UL;
 
-    *(volatile unsigned char*)r = 0;   /* PF-KILL: CR2=0x5EC01FFF on full pass */
+    /* bit13: dynamic TLS -- a dlopen'd .so's __thread var is per-thread. */
+    void* ht = dlopen("/lib/libtlsdso.so", 2);
+    if (ht) {
+        g_tget = (int (*)(void))dlsym(ht, "dso_tls_get");
+        g_tset = (void (*)(int))dlsym(ht, "dso_tls_set");
+        if (g_tget && g_tset) {
+            int ok = (g_tget() == 7);       /* main thread: template value */
+            g_tset(100);
+            ok = ok && (g_tget() == 100);
+            int other = -2;
+            pthread_t tt;
+            if (pthread_create(&tt, (void*)0, tls_thread, &other) == 0) pthread_join(tt, (void*)0);
+            /* the other thread saw 7 (isolation), and main still sees 100 */
+            if (ok && other == 7 && g_tget() == 100) r |= 0x2000UL;
+        }
+        dlclose(ht);
+    }
+
+    *(volatile unsigned char*)r = 0;   /* PF-KILL: CR2=0x5EC03FFF on full pass */
     return 0;
 }

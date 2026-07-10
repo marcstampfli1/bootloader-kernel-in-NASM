@@ -44,6 +44,7 @@ typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
 #define PT_PHDR 6
+#define PT_TLS 7
 #define PF_X 1
 #define PF_W 2
 #define PF_R 4
@@ -67,9 +68,13 @@ typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;
 #define DT_PLTRELSZ 2
 #define MAX_NEEDED 24
 #define R_X86_64_64 1
+#define R_X86_64_DTPMOD64 16
+#define R_X86_64_DTPOFF64 17
+#define R_X86_64_TPOFF64  18
 #define R_X86_64_GLOB_DAT 6
 #define R_X86_64_JUMP_SLOT 7
 #define R_X86_64_RELATIVE 8
+#define MAX_TLS_MODULES 32
 #define ELF64_R_SYM(i)  ((uint32_t)((i) >> 32))
 #define ELF64_R_TYPE(i) ((uint32_t)((i) & 0xffffffffu))
 
@@ -89,7 +94,43 @@ typedef struct dso {
     int              dev;        //   aliasing (symlinks, relative vs absolute, /lib/x vs x)
     int              refcnt;
     int              closing;    // guard: a dtor that dlclose()s its own handle
+    int              tls_modid;  // dynamic-TLS module id (0 = no PT_TLS)
 } dso_t;
+
+// ── Dynamic TLS (general-dynamic model) ────────────────────────────────────
+// A dlopen'd .so's __thread vars are accessed through __tls_get_addr(module,
+// offset).  Each PT_TLS-bearing module gets an id; every thread lazily
+// allocates + zero/template-inits that module's block on first touch, held in a
+// per-thread DTV (a __thread array, so it lives in the static TLS block and is
+// automatically per-thread).  The static executable stays local-exec (TPOFF) --
+// this path is only for dynamically loaded modules.
+typedef struct { unsigned long module, offset; } tls_index;
+typedef struct { const char* tdata; unsigned long filesz, memsz; } tls_module_t;
+static tls_module_t s_tls_mod[MAX_TLS_MODULES];   // [0] unused; ids start at 1
+static int          s_tls_nmod = 1;
+static __thread void* g_dtv[MAX_TLS_MODULES];     // per-thread block per module (NULL = unallocated)
+
+void* __tls_get_addr(tls_index* ti) {
+    unsigned long m = ti->module;
+    // Fail closed on a corrupt module id / offset (V12): bound m to the
+    // registered count and the offset to the module's block size.  s_tls_mod[m]
+    // and s_tls_nmod are written once under s_lock at registration, which
+    // happens-before the module's code runs (via the dlopen/dlsym mutex), so
+    // this reads them locklessly -- and keeps the hot TLS path lock-free.
+    if (m == 0 || m >= (unsigned long)s_tls_nmod) return (void*)0;
+    if (ti->offset >= s_tls_mod[m].memsz) return (void*)0;
+    void* blk = g_dtv[m];                          // __thread -> this thread only
+    if (!blk) {
+        tls_module_t mod = s_tls_mod[m];
+        unsigned long sz = mod.memsz ? mod.memsz : 8;
+        blk = malloc(sz);
+        if (!blk) return (void*)0;
+        if (mod.tdata) memcpy(blk, mod.tdata, mod.filesz);
+        memset((char*)blk + mod.filesz, 0, sz - mod.filesz);
+        g_dtv[m] = blk;
+    }
+    return (char*)blk + ti->offset;
+}
 
 static dso_t* s_loaded = NULL;      // head of loaded-object list (under s_lock)
 static __thread char s_err[160];    // last error -- per-thread (POSIX dlerror is per-thread)
@@ -241,6 +282,20 @@ static int apply_rela(dso_t* d, const Elf64_Rela* rela, uint64_t sz) {
         uint64_t* where = (uint64_t*)w;
         if (type == R_X86_64_RELATIVE) { *where = d->base + (uint64_t)r->r_addend; continue; }
 
+        // Dynamic-TLS relocations (general-dynamic): DTPMOD64 = the module id of
+        // the object whose TLS the __thread var lives in; DTPOFF64 = its offset
+        // within that module's block.  Together they are the tls_index that
+        // __tls_get_addr resolves per-thread.  Handled before symbol resolution
+        // because DTPMOD64 usually has sym 0 (this module's own TLS).
+        if (type == R_X86_64_DTPMOD64 || type == R_X86_64_DTPOFF64 || type == R_X86_64_TPOFF64) {
+            uint32_t tsym = ELF64_R_SYM(r->r_info);
+            const Elf64_Sym* ts = (tsym && d->hash && tsym < d->hash[1]) ? &d->symtab[tsym] : (const Elf64_Sym*)0;
+            if (type == R_X86_64_DTPMOD64)      *where = (uint64_t)d->tls_modid;      // own module
+            else if (type == R_X86_64_DTPOFF64) *where = (ts ? ts->st_value : 0) + (uint64_t)r->r_addend;
+            else { set_err("dlopen: initial-exec TLS (TPOFF64) in a .so unsupported", 0); return -1; }
+            continue;
+        }
+
         // Bound the symbol index + name against the .so's tables (OOB guard).
         uint32_t symi = ELF64_R_SYM(r->r_info);
         if (!d->hash || symi >= d->hash[1]) { set_err("dlopen: bad reloc symbol index", 0); return -1; }
@@ -329,10 +384,12 @@ static void* dlopen_impl(const char* path, int flags) {
         set_err("dlopen: short phdr read", path); free(ph); close(fd); return NULL;
     }
 
-    // Span of all PT_LOADs (link-time vaddrs) + the PT_DYNAMIC vaddr.
+    // Span of all PT_LOADs (link-time vaddrs) + PT_DYNAMIC + PT_TLS template.
     unsigned long lo = ~0UL, hi = 0, dyn_vaddr = 0;
+    unsigned long tls_vaddr = 0, tls_filesz = 0, tls_memsz = 0;
     for (int i = 0; i < phnum; i++) {
         if (ph[i].p_type == PT_DYNAMIC) dyn_vaddr = ph[i].p_vaddr;
+        if (ph[i].p_type == PT_TLS) { tls_vaddr = ph[i].p_vaddr; tls_filesz = ph[i].p_filesz; tls_memsz = ph[i].p_memsz; }
         if (ph[i].p_type != PT_LOAD || ph[i].p_memsz == 0) continue;
         if (page_down(ph[i].p_vaddr) < lo) lo = page_down(ph[i].p_vaddr);
         if (page_up(ph[i].p_vaddr + ph[i].p_memsz) > hi) hi = page_up(ph[i].p_vaddr + ph[i].p_memsz);
@@ -359,6 +416,20 @@ static void* dlopen_impl(const char* path, int flags) {
     memset(d, 0, sizeof *d);
     d->base = base; d->map_start = (unsigned long)res; d->map_len = span; d->refcnt = 1;
     d->ino = st.st_ino; d->dev = st.st_dev;   // dedup key
+
+    // Register the .so's TLS block as a dynamic-TLS module (id in DTPMOD64
+    // relocs).  s_tls_mod is written under s_lock, which dlopen_impl holds.
+    if (tls_memsz > 0) {
+        if (s_tls_nmod >= MAX_TLS_MODULES) {
+            set_err("dlopen: too many TLS modules", path);
+            munmap(res, span); free(d); return NULL;
+        }
+        int mid = s_tls_nmod++;
+        s_tls_mod[mid].tdata  = (const char*)(base + tls_vaddr);
+        s_tls_mod[mid].filesz = tls_filesz;
+        s_tls_mod[mid].memsz  = tls_memsz;
+        d->tls_modid = mid;
+    }
 
     // Parse the dynamic section (resident at base + dyn_vaddr).
     const Elf64_Dyn* dyn = (const Elf64_Dyn*)(base + dyn_vaddr);
