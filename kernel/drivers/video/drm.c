@@ -3195,19 +3195,22 @@ static int drm_ioctl_virtgpu_execbuffer(vfs_file_t* f, uint64_t arg) {
         }
         for (uint32_t i = 0; i < a.num_bo_handles; i++) {
             drm_res3d_t* r = find_res3d(c, handles[i]);
-            // Owned resources are attached once (they are also attached at
-            // create time, when the host resource definitely exists).  BORROWED
-            // (PRIME-imported) resources -- e.g. the compositor sampling a
-            // client's shared GL swapchain buffer -- are RE-ATTACHED every
-            // submit: the host resource is owned by the exporter's context, and
-            // a single lazy attach to the importer's context can be dropped or
-            // race the exporter's create, leaving it permanently "Illegal
-            // resource N" in this context (the every-other-buffer compositor
-            // flicker).  vrend's ctx-attach is idempotent, so re-attaching each
-            // submit self-heals a lost attach with negligible cost.
-            if (r && r->res_id && (!r->ctx_attached || r->borrowed)) {
-                virtio_gpu_3d_ctx_attach_resource(c->virgl_ctx_id, r->res_id);
-                r->ctx_attached = 1;
+            // Mark ctx_attached ONLY when the host acks the attach.  A
+            // PRIME-imported (borrowed) buffer can be referenced by the
+            // compositor before the exporting client has actually created the
+            // host resource: Mesa defers the virgl RESOURCE_CREATE to first
+            // render, but the dma-buf carries the res_id to the compositor
+            // earlier, so CTX_ATTACH_RESOURCE legitimately fails with "invalid
+            // resource" that first time.  The old code threw the return value
+            // away and set ctx_attached=1 regardless, so it never retried and
+            // the buffer was wedged as "Illegal resource N" in this context
+            // forever (every other swapchain buffer never composited -> the GL
+            // window flicker).  Leaving the flag 0 on failure retries on the
+            // next submit; once the resource exists the attach lands and sticks.
+            if (r && r->res_id && !r->ctx_attached) {
+                if (virtio_gpu_3d_ctx_attach_resource(c->virgl_ctx_id,
+                                                      r->res_id) == 0)
+                    r->ctx_attached = 1;
             }
         }
         kfree(handles);
