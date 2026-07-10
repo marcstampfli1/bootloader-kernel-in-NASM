@@ -586,6 +586,17 @@ if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_
     if [ -f "$SYSROOT/usr/lib/libSDL2.a" ] && [ -d "$(pwd)/build/third_party/darkplaces" ]; then
         SYSROOT="$SYSROOT" bash "$(pwd)/scripts/port-darkplaces.sh" || \
             echo "[build] WARNING: DarkPlaces build failed"
+        # dplaunch: forces SDL's offscreen video driver + basedir, execs
+        # darkplaces (autologin can't pass args/env) -- headless GL bring-up.
+        if [ -f "$BUILD_DIR/darkplaces_build/darkplaces.elf" ]; then
+            "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
+                -c "$USERLAND_DIR/apps/dplaunch/dplaunch.c" -o "$BUILD_DIR/user_dplaunch.o"
+            "$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
+                --export-dynamic -e _entry --build-id=none -T "$USERLAND_DIR/link-pie.ld" \
+                "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_dplaunch.o" \
+                --start-group "$SYSROOT/usr/lib/libc.a" --end-group \
+                -o "$BUILD_DIR/user_dplaunch.elf"
+        fi
     fi
 fi
 
@@ -1063,6 +1074,8 @@ if [ -f "$BUILD_DIR/user_tone.elf" ]; then
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl2test.elf" bin/sdl2test
     [ -f "$BUILD_DIR/darkplaces_build/darkplaces.elf" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/darkplaces_build/darkplaces.elf" bin/darkplaces
+    [ -f "$BUILD_DIR/user_dplaunch.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_dplaunch.elf" bin/dplaunch
 fi
 if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello
