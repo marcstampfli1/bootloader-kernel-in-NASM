@@ -103,20 +103,39 @@ void elf_phtab_bounds_selftest(void) {
 }
 #endif
 
+// Read `n` bytes at file offset `off` into `buf`.  The in-memory image `data`
+// (size bytes) is used when it covers the range -- the eager path, and small
+// files whose whole image the exec path happened to read.  Otherwise it preads
+// from the backing file, because on the exec path `data` is only the first-page
+// header buffer (PAGE_SIZE), NOT the whole file: a PIE larger than a page has
+// its .dynamic / .rela.dyn / segment pages past the buffer.  Returns 1 iff all
+// n bytes were obtained.
+static int elf_read_at(const uint8_t* data, uint64_t size, vfs_file_t* bf,
+                       uint64_t off, uint64_t n, void* buf) {
+    if (n == 0) return 1;
+    if (off <= size && off + n <= size) { __builtin_memcpy(buf, data + off, n); return 1; }
+    if (!bf) return 0;
+    int64_t rc;
+    if (bf->pread) rc = bf->pread(bf, buf, n, (int64_t)off);
+    else { bf->seek(bf, (int64_t)off, 0 /*SEEK_SET*/); rc = bf->read(bf, buf, n); }
+    return rc == (int64_t)n;
+}
+
 // ── Shared segment-page fill (eager map + PIE reloc fault-in) ──────────────
 // Fill one 4KiB frame (`dst`, HHDM-mapped) with a file-backed segment's bytes
 // for the page at `pg_off` (offset of the page within the page-aligned VMA /
-// segment start), read from the in-memory ELF image `data`.  Zero-fills the
-// page and the BSS tail.  `file_off` is the file byte offset of the VMA start,
-// `file_len` its file-backed length -- the SAME coordinates and span primitive
-// (vma_file_page_span) the lazy demand-fault (isr14) uses, so an eagerly loaded
-// segment and a demand-paged one are byte-identical.  One fill model, no drift.
-static void elf_fill_page(const uint8_t* data, uint64_t size, uint64_t file_off,
-                          uint64_t file_len, uint64_t pg_off, uint8_t* dst) {
+// segment start).  Zero-fills the page and the BSS tail; the file bytes come
+// from `data` when in range else the backing file `bf` (see elf_read_at).
+// `file_off` is the file byte offset of the VMA start, `file_len` its file-
+// backed length -- the SAME coordinates and span primitive (vma_file_page_span)
+// the lazy demand-fault (isr14) uses, so an eagerly loaded segment and a
+// demand-paged one are byte-identical.  One fill model, no drift.
+static void elf_fill_page(const uint8_t* data, uint64_t size, vfs_file_t* bf,
+                          uint64_t file_off, uint64_t file_len, uint64_t pg_off,
+                          uint8_t* dst) {
     __builtin_memset(dst, 0, PAGE_SIZE);
-    uint64_t n   = vma_file_page_span(pg_off, file_len);
-    uint64_t src = file_off + pg_off;
-    if (n && src + n <= size) __builtin_memcpy(dst, data + src, n);
+    uint64_t n = vma_file_page_span(pg_off, file_len);
+    if (n) elf_read_at(data, size, bf, file_off + pg_off, n, dst);
 }
 
 // ── Internal: load ELF into a fresh address space ─────────────────────────
@@ -262,7 +281,8 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                     return 0;
                 }
                 uint8_t* fptr = (uint8_t*)(frame + HHDM_OFFSET);
-                elf_fill_page(data, size, file_off, file_len, page - seg_start, fptr);
+                elf_fill_page(data, size, backing_file, file_off, file_len,
+                              page - seg_start, fptr);
                 if (!vmm_page_map(pml4, page, frame, pte_flags)) {
                     // OOM on an intermediate PT page: this frame is NOT mapped,
                     // so vmm_free_user won't reclaim it (free it here) and the
@@ -292,13 +312,15 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
     // program runs.  Imported symbols are the dynamic loader's job, not this
     // static-PIE path.
     //
-    // Under the lazy (file-backed) path the reloc-target page is usually NOT
-    // resident yet.  We must NOT fault it in as a ZERO page (vmm_get_user_pages
-    // does that) -- that would drop every non-relocated byte on the page.
-    // Instead we populate the page from the file image (`data`, the same bytes
-    // isr14 would pull from disk) and map JUST that page; the rest of the image
-    // stays demand-paged.  Reloc entries on pointer-sized data are 8-aligned,
-    // so a single 8-byte write never straddles a page boundary.
+    // The .dynamic and .rela.dyn tables (and the reloc-target pages) usually
+    // live PAST the header buffer `data` for any non-trivial PIE, so read them
+    // through elf_read_at (backing file).  Each not-yet-resident reloc-target
+    // page is populated from the file the same way isr14 would demand-fault it
+    // (elf_fill_page, straddle-safe via the VMA's file_off) and mapped, so only
+    // reloc pages become resident; the rest stays demand-paged.  Reloc entries
+    // on pointer-sized data are 8-aligned, so an 8-byte write never straddles a
+    // page.  If the image can't be fully relocated, we FAIL the load rather than
+    // run a binary with wild pointers.
     if (load_bias != 0) {
         uint64_t dyn_vaddr = 0, dyn_filesz = 0;
         for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
@@ -306,8 +328,8 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                                      + (uint64_t)i * ehdr->e_phentsize);
             if (ph->p_type == PT_DYNAMIC) { dyn_vaddr = ph->p_vaddr; dyn_filesz = ph->p_filesz; break; }
         }
-        // Resolve a base-0 vaddr to a file offset via the PT_LOAD table.
-        // (returns (uint64_t)-1 if not found in any loadable segment)
+        // Resolve a base-0 vaddr to a file offset via the PT_LOAD table (the
+        // phdrs are always in the header buffer `data`).  -1 if not loadable.
         #define ELF_VA2OFF(V) ({ uint64_t _o = (uint64_t)-1; \
             for (uint16_t _i = 0; _i < ehdr->e_phnum; _i++) { \
                 const Elf64_Phdr* _p = (const Elf64_Phdr*)(data + ehdr->e_phoff \
@@ -317,50 +339,64 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                     _o = _p->p_offset + ((V) - _p->p_vaddr); break; } } _o; })
         uint64_t dyn_off = dyn_vaddr ? ELF_VA2OFF(dyn_vaddr) : (uint64_t)-1;
         uint64_t rela_va = 0, rela_sz = 0, rela_ent = sizeof(Elf64_Rela);
-        if (dyn_off != (uint64_t)-1 && dyn_off + dyn_filesz <= size) {
-            const Elf64_Dyn* dyn = (const Elf64_Dyn*)(data + dyn_off);
+        Elf64_Dyn* dyn  = NULL;
+        uint8_t*   rela = NULL;
+        #define RELOC_FAIL() do { if (dyn) kfree(dyn); if (rela) kfree(rela); \
+            mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); \
+            return 0; } while (0)
+
+        // ── .dynamic -> DT_RELA / DT_RELASZ / DT_RELAENT ──────────────────
+        if (dyn_off != (uint64_t)-1 && dyn_filesz && dyn_filesz <= (1u << 20)) {
+            dyn = (Elf64_Dyn*)kmalloc(dyn_filesz);
+            if (!dyn) RELOC_FAIL();
+            if (!elf_read_at(data, size, backing_file, dyn_off, dyn_filesz, dyn))
+                RELOC_FAIL();
             for (uint64_t i = 0; (i + 1) * sizeof(Elf64_Dyn) <= dyn_filesz
                                   && dyn[i].d_tag != DT_NULL; i++) {
                 if      (dyn[i].d_tag == DT_RELA)    rela_va  = dyn[i].d_un;
                 else if (dyn[i].d_tag == DT_RELASZ)  rela_sz  = dyn[i].d_un;
                 else if (dyn[i].d_tag == DT_RELAENT) rela_ent = dyn[i].d_un;
             }
+            kfree(dyn); dyn = NULL;
         }
+
+        // ── .rela.dyn -> apply every R_X86_64_RELATIVE ────────────────────
         uint64_t rela_off = rela_va ? ELF_VA2OFF(rela_va) : (uint64_t)-1;
-        if (rela_sz && rela_ent && rela_off != (uint64_t)-1 && rela_off + rela_sz <= size) {
+        if (rela_sz && rela_ent >= sizeof(Elf64_Rela) && rela_off != (uint64_t)-1
+            && rela_sz <= (16u << 20)) {
+            rela = (uint8_t*)kmalloc(rela_sz);
+            if (!rela) RELOC_FAIL();
+            if (!elf_read_at(data, size, backing_file, rela_off, rela_sz, rela))
+                RELOC_FAIL();
             for (uint64_t o = 0; o + rela_ent <= rela_sz; o += rela_ent) {
-                const Elf64_Rela* r = (const Elf64_Rela*)(data + rela_off + o);
+                const Elf64_Rela* r = (const Elf64_Rela*)(rela + o);
                 if (ELF64_R_TYPE(r->r_info) != R_X86_64_RELATIVE) continue;
                 uint64_t    off0 = r->r_offset;          // base-0 target vaddr
                 virt_addr_t va   = load_bias + off0;      // runtime target vaddr
                 virt_addr_t page = va & ~(virt_addr_t)0xFFF;
                 phys_addr_t phys = vmm_page_phys(pml4, page);
                 if (phys == PMM_INVALID_ADDR) {
-                    // Not resident (lazy path): populate this ONE page the SAME
-                    // way isr14 would demand-fault it -- via the VMA's file_off,
-                    // which correctly handles a page that straddles a segment
-                    // boundary (`data` is the same bytes isr14 would pread).  The
-                    // rest of the image stays demand-paged.
                     vma_t* vma = mm_vma_find(mm, page);
-                    if (!vma) continue;
-                    phys_addr_t frame = pmm_buddy_alloc(0);
-                    if (frame == PMM_INVALID_ADDR) continue;
+                    phys_addr_t frame = vma ? pmm_buddy_alloc(0) : PMM_INVALID_ADDR;
+                    if (!vma || frame == PMM_INVALID_ADDR) RELOC_FAIL();
                     uint8_t* dst = (uint8_t*)(frame + HHDM_OFFSET);
                     if (vma->flags & VMA_FILE)
-                        elf_fill_page(data, size, vma->file_off, vma->file_len,
-                                      page - vma->start, dst);
+                        elf_fill_page(data, size, backing_file, vma->file_off,
+                                      vma->file_len, page - vma->start, dst);
                     else
                         __builtin_memset(dst, 0, PAGE_SIZE);   // anonymous -> zero page
                     if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma->flags))) {
                         pmm_buddy_free(frame, 0);
-                        continue;
+                        RELOC_FAIL();
                     }
                     phys = frame;
                 }
                 *(uint64_t*)((uintptr_t)(phys + HHDM_OFFSET) + (va & 0xFFF)) =
                     load_bias + (uint64_t)r->r_addend;
             }
+            kfree(rela); rela = NULL;
         }
+        #undef RELOC_FAIL
         #undef ELF_VA2OFF
     }
 
