@@ -22,21 +22,28 @@ that forces a fixed base (so `-pie` still emitted `ET_EXEC`, `PT_DYNAMIC=0`).
 ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
 
 ## Phases (each with a provable milestone)
-0. Toolchain emits PIE + `.so` -- DE-RISKED, NO binutils rebuild:
-   - PROVEN: `ld -pie` (binutils 2.42) already produces a correct ET_DYN +
-     PT_DYNAMIC; the `.xd` script is base-0 ET_DYN. The ONLY blocker is gcc's
-     DRIVER suppressing `-pie` (even `-Wl,-pie` came out ET_EXEC -- gcc adds a
-     conflicting `-no-pie`/default script). Fix by either (a) a `-specs=` file
-     overriding the pie/link spec, or (b) linking the final exe via `ld`
-     directly (gather crt + libgcc + libs). No gcc/binutils rebuild needed.
-   - Recompile libc + crt0 (`entry.asm` -> RIP-relative) + userland `-fPIC/-fPIE`
-     (libc.a has non-PIC R_X86_64_32S; port libs are mostly already -fPIC).
-   - `-shared` for `.so`s uses the `.xs`/`.xd` script the same way (via ld).
-   - DONE: an `ld -pie --export-dynamic` link -> ET_DYN + host sym in `.dynsym` +
-     `R_X86_64_RELATIVE`; `ld -shared` -> a real `.so`.
-1. Kernel ET_DYN exec: load base, map PT_LOADs, apply exe `RELATIVE`/`IRELATIVE`
-   relocs, jump `base+entry`; aux vector (AT_PHDR/PHENT/PHNUM/BASE/ENTRY/EXECFN).
-   DONE: a PIE hello runs.
+0. Toolchain emits PIE -- **DONE** (commits: PIC libc + PIE link path; kernel
+   backing-file reloc fix). No binutils/gcc rebuild.
+   - Link the final exe via `ld -pie` DIRECTLY (gcc's driver forces
+     `-static -T makaos-link.ld` -> ET_EXEC; even `-Wl,-pie` came out ET_EXEC).
+   - `USER_CFLAGS` is now `-fPIE` (NOT `-fPIC`: `-fPIE` keeps the executable's
+     own `__thread` in LOCAL-EXEC / TPOFF, link-resolved; `-fPIC` would default
+     `__thread` to general-dynamic and pull in `__tls_get_addr` -- a Phase 4
+     thing). libc.a then carries only RELATIVE + TPOFF relocs, no 32/32S, so it
+     links into a PIE; ET_EXEC apps are unaffected (PIE codegen at fixed base).
+   - crt0 (`entry.asm`) was ALREADY PIC (all `[rel ...]`), no change needed.
+   - `userland/link-pie.ld` = ld's stock `-pie` script + the `__tdata_end` /
+     `__tbss_end` symbols `libc/tls.c` needs (the stock `.xd` omits them).
+   - MILESTONE (verified headless): `piehello` -- a real libc program (crt0 +
+     libc.a) built as a static PIE -- loads, relocates, runs crt0's TLS +
+     `.init_array`, and libc/TLS/malloc all work. PF-KILL sentinel `0x5EC0DE1F`.
+   - For `.so`s (Phase 5): `ld -shared` + a `-shared` variant of link-pie.ld.
+1. Kernel ET_DYN exec: load base, map PT_LOADs, apply exe `RELATIVE` relocs,
+   jump `base+entry`; aux vector (AT_PHDR/PHENT/PHNUM/BASE/ENTRY/EXECFN).
+   **DONE** for RELATIVE (IRELATIVE/ifunc still TODO).
+   - GOTCHA (fixed): the exec path hands elf_load_into only the first-PAGE header
+     buffer; the reloc pass must read .dynamic/.rela.dyn/target pages from the
+     BACKING FILE (elf_read_at), not `data`, or any PIE > 4 KiB relocates nothing.
 2. libc `dlopen`/`dlsym`: map `.so`, base-relocate (`RELATIVE`/`GLOB_DAT`/
    `JUMP_SLOT`/`64`, BIND_NOW), resolve host imports vs the PIE exe `.dynsym` +
    loaded `.so`s, RELRO mprotect, gnu-hash lookup. DONE: no-import `.so`, then
