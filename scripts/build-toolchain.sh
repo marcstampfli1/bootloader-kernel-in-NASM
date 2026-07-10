@@ -130,6 +130,7 @@ build_gcc() {
             --disable-nls \
             --enable-languages=c,c++ \
             --disable-shared \
+            --with-pic \
             --enable-threads=posix \
             --disable-libssp \
             --disable-libmudflap \
@@ -141,6 +142,11 @@ build_gcc() {
             --disable-libstdcxx-filesystem-ts \
             --disable-libstdcxx-backtrace \
             --disable-libstdcxx-verbose)
+    # --with-pic makes libtool build even the --disable-shared static target libs
+    # (libgcc, libstdc++, libsupc++) as PIC, so their objects can go into a shared
+    # object (libSDL3.so) or a PIE.  PIC code still links into the static -no-pie
+    # apps, so this is the single C++ runtime.  scripts/build-libstdcxx-pic.sh
+    # retrofits an existing non-PIC toolchain without a full rebuild.
     log "building gcc"
     make -C "$build" -j"$JOBS" all-gcc
     log "building libgcc"
