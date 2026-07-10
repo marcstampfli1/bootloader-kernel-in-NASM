@@ -71,6 +71,11 @@ static void die(const char* msg, unsigned n) {
     syscall1(SYS_EXIT, 127);
 }
 
+// The main executable's program headers, saved from the auxv for the runtime
+// loader (dlopen): it derives the exe's load base + dynamic symbol table from
+// these to resolve a .so's imports against the exe's exported .dynsym.
+unsigned long __libc_phdr = 0, __libc_phent = 0, __libc_phnum = 0;
+
 // crt0 passes envp; auxv follows the envp NULL terminator.
 void __makaos_tls_init(char** envp) {
     // Walk to the end of envp, then read the auxv pairs that follow.
@@ -84,6 +89,9 @@ void __makaos_tls_init(char** envp) {
         else if (aux[0] == AT_PHENT) phent = aux[1];
         else if (aux[0] == AT_PHNUM) phnum = aux[1];
     }
+    __libc_phdr = (unsigned long)phdr;
+    __libc_phent = (unsigned long)phent;
+    __libc_phnum = (unsigned long)phnum;
 
     s_tls_filesz = (size_t)(__tdata_end - __tdata_start);
     size_t memsz = (size_t)(__tbss_end - __tdata_start);

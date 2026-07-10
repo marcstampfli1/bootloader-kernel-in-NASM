@@ -33,6 +33,7 @@ typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;
 
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
+#define PT_PHDR 6
 #define PF_X 1
 #define PF_W 2
 #define PF_R 4
@@ -70,6 +71,13 @@ typedef struct dso {
 static dso_t* s_loaded = NULL;   // head of loaded-object list
 static char   s_err[160];        // last error (dlerror)
 static int    s_err_set = 0;
+
+// Main-executable symbol scope: the exe exports its symbols (libc etc.) via
+// --export-dynamic, so a .so's imports resolve against it.  Derived once from
+// the auxv program headers libc saved (base via PT_PHDR, dynsym via PT_DYNAMIC).
+extern unsigned long __libc_phdr, __libc_phent, __libc_phnum;
+static dso_t s_exe;
+static int   s_exe_ready = 0;
 
 static void set_err(const char* a, const char* b) {
     // Compose "a: b" into s_err (no snprintf dependency in this TU).
@@ -112,12 +120,42 @@ static const Elf64_Sym* dso_lookup(const dso_t* d, const char* name) {
     return NULL;
 }
 
-// Resolve `name` to a runtime address across all loaded objects (global scope).
-// Returns 0 if unresolved (caller decides whether that is fatal).
+// Populate the main-executable scope from the auxv program headers (once).
+// exe_base = AT_PHDR - the PT_PHDR link vaddr; the exe's dynsym/strtab/hash come
+// from PT_DYNAMIC.  The exe's .dynamic d_ptr fields are link-relative (the
+// kernel does not relocate them), so add exe_base.
+static void init_exe_scope(void) {
+    if (s_exe_ready) return;
+    s_exe_ready = 1;                       // attempt once; stays zeroed on failure
+    if (!__libc_phdr || !__libc_phent || !__libc_phnum) return;
+    unsigned long base = 0, dyn_v = 0; int have_base = 0;
+    for (unsigned long i = 0; i < __libc_phnum; i++) {
+        const Elf64_Phdr* p = (const Elf64_Phdr*)(__libc_phdr + i * __libc_phent);
+        if (p->p_type == PT_PHDR)    { base = __libc_phdr - p->p_vaddr; have_base = 1; }
+        if (p->p_type == PT_DYNAMIC) dyn_v = p->p_vaddr;
+    }
+    if (!have_base || !dyn_v) return;
+    for (const Elf64_Dyn* e = (const Elf64_Dyn*)(base + dyn_v); e->d_tag != DT_NULL; e++) {
+        switch (e->d_tag) {
+            case DT_SYMTAB: s_exe.symtab = (const Elf64_Sym*)(base + e->d_un); break;
+            case DT_STRTAB: s_exe.strtab = (const char*)(base + e->d_un); break;
+            case DT_HASH:   s_exe.hash   = (const uint32_t*)(base + e->d_un); break;
+        }
+    }
+    s_exe.base = base;
+}
+
+// Resolve `name` to a runtime address: loaded objects first (global scope), then
+// the main executable's exported symbols.  Returns 0 if unresolved.
 static unsigned long resolve_sym(const char* name) {
     for (dso_t* d = s_loaded; d; d = d->next) {
         const Elf64_Sym* s = dso_lookup(d, name);
         if (s) return d->base + s->st_value;
+    }
+    init_exe_scope();
+    if (s_exe.hash) {
+        const Elf64_Sym* s = dso_lookup(&s_exe, name);
+        if (s) return s_exe.base + s->st_value;
     }
     return 0;
 }

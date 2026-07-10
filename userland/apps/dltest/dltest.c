@@ -7,7 +7,8 @@
  *
  * Headless serial can't see stdout, so the result is signalled via a sentinel
  * page fault whose low byte encodes the checks -- PF-KILL prints
- * CR2=0x000000005EC0DE7F with comm=dltest on full pass:
+ * CR2=0x000000005EC0DEFF with comm=dltest on full pass (bit7 = the .so's libc
+ * import bound to the exe's exported strlen):
  *   bit0 dlopen mapped+relocated the .so    bit1 dlsym found dso_answer
  *   bit2 calling into the .so returns 42     bit3 the .so's own RELATIVE reloc
  *        applied (dso_name() returns "libdso")
@@ -32,6 +33,10 @@ int main(void) {
         if (answer && answer() == 42) r |= 0x04UL;
         const char* (*nm)(void) = (const char* (*)(void))dlsym(h, "dso_name");
         if (nm) { const char* n = nm(); if (n && n[0] == 'l' && n[3] == 'd' && n[5] == 'o') r |= 0x08UL; }
+        /* bit7: the .so imports libc strlen, bound against the exe's exported
+         * .dynsym (milestone 2); dso_strlen() must return strlen("abcd") == 4. */
+        int (*dslen)(void) = (int (*)(void))dlsym(h, "dso_strlen");
+        if (dslen && dslen() == 4) r |= 0x80UL;
         if (dlclose(h) == 0) r |= 0x10UL;
     }
     /* deny-by-default check: PROT_EXEC on a non-executable file must be refused. */

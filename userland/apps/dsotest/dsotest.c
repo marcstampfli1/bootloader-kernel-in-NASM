@@ -6,5 +6,10 @@
  */
 static const char *volatile s_name = "libdso";   /* -> R_X86_64_RELATIVE */
 
+/* strlen is UNDEFINED in this .so -> a JUMP_SLOT/GLOB_DAT reloc the loader must
+ * bind against the main executable's exported strlen (milestone 2). */
+extern unsigned long strlen(const char*);
+
 int dso_answer(void) { return 42; }
 const char* dso_name(void) { return s_name; }     /* returns the relocated pointer */
+int dso_strlen(void) { return (int)strlen("abcd"); }   /* calls libc via the exe scope */
