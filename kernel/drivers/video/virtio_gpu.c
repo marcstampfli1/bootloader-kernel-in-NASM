@@ -874,7 +874,8 @@ static int vgpu_ctx_attach_resource(uint32_t ctx_id, uint32_t res_id) {
 }
 
 static int vgpu_resource_create_3d(uint32_t res_id, uint32_t target, uint32_t format,
-                                   uint32_t bind, uint32_t w, uint32_t h, uint32_t depth) {
+                                   uint32_t bind, uint32_t w, uint32_t h, uint32_t depth,
+                                   uint32_t array_size, uint32_t last_level, uint32_t nr_samples) {
     vgpu_resource_create_3d_t req = {0};
     req.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
     req.resource_id = res_id;
@@ -884,7 +885,12 @@ static int vgpu_resource_create_3d(uint32_t res_id, uint32_t target, uint32_t fo
     req.width       = w;
     req.height      = h;
     req.depth       = depth ? depth : 1u;
-    req.array_size  = 1;
+    // array_size is the layer count -- 6 for a cube map, N*6 for a cube array,
+    // else the array length.  Hardcoding 1 (as before) made the host reject
+    // every cube map ("unexpected array size 1"), so thread the real value.
+    req.array_size  = array_size ? array_size : 1u;
+    req.last_level  = last_level;
+    req.nr_samples  = nr_samples;
     virtio_gpu_ctrl_hdr_t resp = {0};
     if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
     return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
@@ -976,7 +982,7 @@ static void virtio_gpu_virgl_selftest(void) {
           && vgpu_resource_create_3d(VIRGL_TEST_RES, PIPE_TEXTURE_2D,
                                      VIRGL_FORMAT_B8G8R8A8_UNORM,
                                      VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW,
-                                     VIRGL_TEST_W, VIRGL_TEST_H, 1)
+                                     VIRGL_TEST_W, VIRGL_TEST_H, 1, 1, 0, 0)
           && virtio_gpu_resource_attach_backing_single(VIRGL_TEST_RES, bp, bytes)
           && vgpu_ctx_attach_resource(VIRGL_TEST_CTX, VIRGL_TEST_RES);
     if (!ok) { kprintf("[virtio-gpu] virgl selftest: setup FAILED\n"); goto out; }
@@ -1030,7 +1036,7 @@ static void virtio_gpu_virgl_clear_selftest(void) {
     int ok = vgpu_ctx_create(VIRGL_CLEAR_CTX, 0)
           && vgpu_resource_create_3d(VIRGL_CLEAR_RES, PIPE_TEXTURE_2D,
                                      VIRGL_FORMAT_B8G8R8A8_UNORM, VIRGL_BIND_RENDER_TARGET,
-                                     VIRGL_CLEAR_W, VIRGL_CLEAR_H, 1)
+                                     VIRGL_CLEAR_W, VIRGL_CLEAR_H, 1, 1, 0, 0)
           && virtio_gpu_resource_attach_backing_single(VIRGL_CLEAR_RES, bp, bytes)
           && vgpu_ctx_attach_resource(VIRGL_CLEAR_CTX, VIRGL_CLEAR_RES);
     if (!ok) { kprintf("[virtio-gpu] virgl clear: setup FAILED\n"); goto out; }
@@ -1137,9 +1143,11 @@ int virtio_gpu_3d_context_destroy(uint32_t ctx_id) {
     return vgpu_ctx_destroy(ctx_id) ? 0 : -EIO;
 }
 int virtio_gpu_3d_resource_create(uint32_t res_id, uint32_t target, uint32_t format,
-                                   uint32_t bind, uint32_t w, uint32_t h, uint32_t depth) {
+                                   uint32_t bind, uint32_t w, uint32_t h, uint32_t depth,
+                                   uint32_t array_size, uint32_t last_level, uint32_t nr_samples) {
     if (!s_virgl) return -ENODEV;
-    return vgpu_resource_create_3d(res_id, target, format, bind, w, h, depth) ? 0 : -EIO;
+    return vgpu_resource_create_3d(res_id, target, format, bind, w, h, depth,
+                                   array_size, last_level, nr_samples) ? 0 : -EIO;
 }
 int virtio_gpu_3d_ctx_attach_resource(uint32_t ctx_id, uint32_t res_id) {
     return vgpu_ctx_attach_resource(ctx_id, res_id) ? 0 : -EIO;

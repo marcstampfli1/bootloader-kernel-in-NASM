@@ -69,7 +69,8 @@ int virtio_gpu_3d_get_capset(uint32_t capset_id, uint32_t version,
 int virtio_gpu_3d_context_create(uint32_t ctx_id, uint32_t capset_id);
 int virtio_gpu_3d_context_destroy(uint32_t ctx_id);
 int virtio_gpu_3d_resource_create(uint32_t res_id, uint32_t target, uint32_t format,
-                                   uint32_t bind, uint32_t w, uint32_t h, uint32_t depth);
+                                   uint32_t bind, uint32_t w, uint32_t h, uint32_t depth,
+                                   uint32_t array_size, uint32_t last_level, uint32_t nr_samples);
 int virtio_gpu_3d_ctx_attach_resource(uint32_t ctx_id, uint32_t res_id);
 // TRANSFER_TO/FROM_HOST_3D of box [x,y..x+w,y+h] at `offset` in the backing.
 int virtio_gpu_3d_transfer(int to_host, uint32_t ctx_id, uint32_t res_id,

@@ -3121,7 +3121,8 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
 
     uint32_t res_id = alloc_res_id();
     rc = virtio_gpu_3d_resource_create(res_id, a.target, a.format, a.bind,
-                                       a.width, a.height, a.depth ? a.depth : 1);
+                                       a.width, a.height, a.depth ? a.depth : 1,
+                                       a.array_size, a.last_level, a.nr_samples);
     if (rc == 0 && !virtio_gpu_resource_attach_backing_single(res_id, phys, bytes)) rc = -EIO;
     if (rc == 0) rc = virtio_gpu_3d_ctx_attach_resource(c->virgl_ctx_id, res_id);
     if (rc != 0) {
