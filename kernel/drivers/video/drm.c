@@ -3195,7 +3195,17 @@ static int drm_ioctl_virtgpu_execbuffer(vfs_file_t* f, uint64_t arg) {
         }
         for (uint32_t i = 0; i < a.num_bo_handles; i++) {
             drm_res3d_t* r = find_res3d(c, handles[i]);
-            if (r && r->res_id && !r->ctx_attached) {
+            // Owned resources are attached once (they are also attached at
+            // create time, when the host resource definitely exists).  BORROWED
+            // (PRIME-imported) resources -- e.g. the compositor sampling a
+            // client's shared GL swapchain buffer -- are RE-ATTACHED every
+            // submit: the host resource is owned by the exporter's context, and
+            // a single lazy attach to the importer's context can be dropped or
+            // race the exporter's create, leaving it permanently "Illegal
+            // resource N" in this context (the every-other-buffer compositor
+            // flicker).  vrend's ctx-attach is idempotent, so re-attaching each
+            // submit self-heals a lost attach with negligible cost.
+            if (r && r->res_id && (!r->ctx_attached || r->borrowed)) {
                 virtio_gpu_3d_ctx_attach_resource(c->virgl_ctx_id, r->res_id);
                 r->ctx_attached = 1;
             }
