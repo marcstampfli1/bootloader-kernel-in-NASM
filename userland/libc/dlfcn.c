@@ -88,6 +88,7 @@ typedef struct dso {
     unsigned long long ino;      // (dev,ino) is the dedup key -- robust to path
     int              dev;        //   aliasing (symlinks, relative vs absolute, /lib/x vs x)
     int              refcnt;
+    int              closing;    // guard: a dtor that dlclose()s its own handle
 } dso_t;
 
 static dso_t* s_loaded = NULL;      // head of loaded-object list (under s_lock)
@@ -443,6 +444,8 @@ int dlclose(void* handle) {
     dl_lock();
     dso_t* d = (dso_t*)handle;
     if (--d->refcnt <= 0) {
+        if (d->closing) { dl_unlock(); return 0; }  // re-entrant self-close from a dtor
+        d->closing = 1;
         run_array(d, d->fini_arr, d->fini_sz, 1);   // destructors (DT_FINI_ARRAY), reverse, bounded
         // Note: DT_NEEDED deps are left loaded (no per-object dep list yet); a
         // small leak, not a correctness bug.
