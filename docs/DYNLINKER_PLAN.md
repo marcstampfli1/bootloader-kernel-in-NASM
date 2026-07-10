@@ -66,9 +66,15 @@ ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
    refcount; `DT_FINI_ARRAY` on dlclose.  Tested: libdso2.so as a DT_NEEDED dep,
    dlopen(NULL)+dlsym.  TODO: per-object dep list so dlclose unloads deps;
    `dlerror` is not yet per-thread (TLS) -- fine until threads dlopen.
-4. Dynamic TLS: `__tls_get_addr` + per-thread DTV + `DTPMOD64`/`DTPOFF64`/
-   `TPOFF64`, integrated with `__makaos_tls_init` + pthreads. THE hard part;
-   SDL3/Mesa need it. DONE: a `__thread` `.so` works across threads.
+4. Dynamic TLS -- **DONE** (the hard part).  `__tls_get_addr(module,offset)` +
+   a per-thread DTV (a `__thread` array in the static TLS -> lock-free hot path);
+   the loader registers each `.so`'s `PT_TLS` as a module and resolves
+   `DTPMOD64`->id / `DTPOFF64`->offset.  The `.so` binds `__tls_get_addr` against
+   the exe's exported one.  General-dynamic only: `TPOFF64` (initial-exec) in a
+   `.so` is rejected.  Module id + offset bounded (V12).  Tested: tlsdso.so's
+   `__thread` counter is per-thread across a spawned thread (CR2=0x5EC03FFF).
+   TODO: cross-module `__thread` imports (defining-module lookup); TLS unload on
+   dlclose (module slots + per-thread blocks currently leak).
 5. Build `libSDL3.so`; sdl2-compat builds unmodified (its dlopen(libSDL3) works);
    revert SDL/Mesa static-bind hacks; then DarkPlaces dynamic loading + Xonotic;
    foundation for LWJGL/JVM. DONE: sdl2-compat runs a trivial SDL2 app.
