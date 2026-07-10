@@ -16,6 +16,14 @@
 #include "kprintf.h"
 #include "tsc.h"
 
+/* Loud per-load demand-paging trace ([elf] lazy).  Bring-up instrumentation,
+ * OFF by default so it never drowns userspace serial output; per the log.h
+ * convention (compile-time per-subsystem gate).  -DCONFIG_DEBUG_DEMAND_PAGING=1
+ * to re-enable.  Shared with the [pf] warmth trace in syscall.c. */
+#ifndef CONFIG_DEBUG_DEMAND_PAGING
+#define CONFIG_DEBUG_DEMAND_PAGING 0
+#endif
+
 // Returns 1 if the program-header table [e_phoff, e_phoff + e_phnum*sizeof
 // (Elf64_Phdr)) lies fully within a file of `size` bytes with NO 64-bit
 // overflow; 0 otherwise.  The old inline check `e_phoff + phnum*56 > size`
@@ -1018,9 +1026,10 @@ static task_t* elf_load_vfs(vfs_file_t* f, uint32_t pid) {
     int64_t n = vfs_read(f, hdr, PAGE_SIZE);
     uint64_t t1 = tsc_read_ns();
     if (n < (int64_t)sizeof(Elf64_Ehdr)) { kfree(hdr); return NULL; }
-    kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
-            f->path[0] ? f->path : "?",
-            (uint32_t)((t1 - t0) / 1000u));
+    if (CONFIG_DEBUG_DEMAND_PAGING)
+        kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
+                f->path[0] ? f->path : "?",
+                (uint32_t)((t1 - t0) / 1000u));
     task_t* t = elf_load(hdr, (uint64_t)n, pid, f);
     kfree(hdr);
     return t;
@@ -1037,9 +1046,10 @@ static task_t* elf_load_vfs_with_argv(vfs_file_t* f, uint32_t pid,
     int64_t n = vfs_read(f, hdr, PAGE_SIZE);
     uint64_t t1 = tsc_read_ns();
     if (n < (int64_t)sizeof(Elf64_Ehdr)) { kfree(hdr); return NULL; }
-    kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
-            f->path[0] ? f->path : "?",
-            (uint32_t)((t1 - t0) / 1000u));
+    if (CONFIG_DEBUG_DEMAND_PAGING)
+        kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
+                f->path[0] ? f->path : "?",
+                (uint32_t)((t1 - t0) / 1000u));
     task_t* t = elf_load_with_argv(hdr, (uint64_t)n, pid, argv, envp, stdio, f);
     kfree(hdr);
     return t;

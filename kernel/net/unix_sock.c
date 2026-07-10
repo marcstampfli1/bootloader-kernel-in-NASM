@@ -1,5 +1,12 @@
 #include "unix_sock.h"
 #include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
+
+/* Per-close unix-socket trace (added chasing a wayland bind EADDRINUSE).  Loud;
+ * OFF by default per the log.h per-subsystem gate convention so it never drowns
+ * userspace serial.  -DCONFIG_DEBUG_UNIX_SOCK=1 to re-enable. */
+#ifndef CONFIG_DEBUG_UNIX_SOCK
+#define CONFIG_DEBUG_UNIX_SOCK 0
+#endif
 #include "kheap.h"
 #include "uaccess.h"   // copy_to_user (shared decl)
 #include "errno.h"
@@ -392,19 +399,20 @@ void unix_sock_close(vfs_file_t* self) {
     extern void kprintf(const char*, ...);
     unix_sock_t* s = (unix_sock_t*)self->ctx;
     if (!s) {
-        kprintf("[unix] close: no ctx on file %p (nothing to free)\n",
-                (void*)self);
+        if (CONFIG_DEBUG_UNIX_SOCK)
+            kprintf("[unix] close: no ctx on file %p (nothing to free)\n",
+                    (void*)self);
         kfree(self); return;
     }
 
-    /* Unconditional entry log so we can see every unix sock close,
-     * whether it's bound or not.  (Observed: second dwl's bind got
-     * EADDRINUSE on /tmp/wayland-0 even though the first dwl was
-     * dead — need to know if the close ran at all.) */
-    kprintf("[unix] close: path=\"%s\" state=%u type=%d %s\n",
-            s->path[0] ? s->path : "(unbound)",
-            (unsigned)s->state, (int)s->type,
-            s->path[0] ? "evicting from ns" : "not in ns");
+    /* Entry log so we can see every unix sock close, bound or not.  (Observed:
+     * second dwl's bind got EADDRINUSE on /tmp/wayland-0 even though the first
+     * dwl was dead -- need to know if the close ran at all.) */
+    if (CONFIG_DEBUG_UNIX_SOCK)
+        kprintf("[unix] close: path=\"%s\" state=%u type=%d %s\n",
+                s->path[0] ? s->path : "(unbound)",
+                (unsigned)s->state, (int)s->type,
+                s->path[0] ? "evicting from ns" : "not in ns");
 
     // If this socket is still CONNECTING (queued on a listener's backlog and
     // not yet accepted), mark it dead UNDER s_unix_pair_lock so a concurrent

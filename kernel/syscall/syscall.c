@@ -13,6 +13,17 @@
 #include "log.h"
 #include "trace.h"
 
+/* Loud per-fault bring-up traces, OFF by default (log.h per-subsystem gate
+ * convention) so they never drown userspace serial.  -D<NAME>=1 to re-enable.
+ *   DEMAND_PAGING: [pf] cache-warmth + [elf] lazy exec header timing.
+ *   SOCKET:        [socket-dbg] every socket() domain/type/proto. */
+#ifndef CONFIG_DEBUG_DEMAND_PAGING
+#define CONFIG_DEBUG_DEMAND_PAGING 0
+#endif
+#ifndef CONFIG_DEBUG_SOCKET
+#define CONFIG_DEBUG_SOCKET 0
+#endif
+
 /* ── Syscall tracing helpers ─────────────────────────────────────────
  *
  * Defined up-front so early handlers (sys_open) can use them too.
@@ -761,9 +772,10 @@ static uint64_t sys_exit(uint64_t code) {
         if (g_current->pf_disk || g_current->pf_cache) {
             uint32_t total = g_current->pf_disk + g_current->pf_cache;
             uint32_t pct   = total ? (g_current->pf_cache * 100u / total) : 0u;
-            kprintf("[pf] %s: %u disk  %u cache  (%u%% warm)\n",
-                    g_current->comm,
-                    g_current->pf_disk, g_current->pf_cache, pct);
+            if (CONFIG_DEBUG_DEMAND_PAGING)
+                kprintf("[pf] %s: %u disk  %u cache  (%u%% warm)\n",
+                        g_current->comm,
+                        g_current->pf_disk, g_current->pf_cache, pct);
         }
 
         // Set exit code + disposition via the one shared mechanism (also used
@@ -1047,8 +1059,9 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     int64_t hdr_n = f->read(f, hdr_buf, PAGE_SIZE);
     uint64_t t1 = tsc_read_ns();
     if (hdr_n < (int64_t)sizeof(Elf64_Ehdr)) { kfree(hdr_buf); vfs_close(f); goto enoexec; }
-    kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
-            resolved, (uint32_t)((t1 - t0) / 1000u));
+    if (CONFIG_DEBUG_DEMAND_PAGING)
+        kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
+                resolved, (uint32_t)((t1 - t0) / 1000u));
 
     phys_addr_t new_pml4;
     mm_t*       new_mm;
@@ -3275,8 +3288,9 @@ static void fdput(vfs_file_t* f) { vfs_close(f); }
 static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto);
 static uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto) {
     uint64_t r = sys_socket_inner(domain, type, proto);
-    kprintf("[socket-dbg] domain=%u type=%u proto=%u -> %ld\n",
-            (uint32_t)domain, (uint32_t)type, (uint32_t)proto, (int64_t)r);
+    if (CONFIG_DEBUG_SOCKET)
+        kprintf("[socket-dbg] domain=%u type=%u proto=%u -> %ld\n",
+                (uint32_t)domain, (uint32_t)type, (uint32_t)proto, (int64_t)r);
     return r;
 }
 static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto) {
