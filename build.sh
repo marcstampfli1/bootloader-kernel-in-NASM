@@ -439,10 +439,16 @@ fi
 # libdso.so: a no-import shared object built with `ld -shared` (stock -shared
 # script produces ET_DYN + SysV HASH + dynsym).  dltest: a PIE that dlopen()s
 # it via the real libc loader, dlsym()s + calls into it, then dlclose()s.
+# libdso2.so: a dependency of libdso.so (soname libdso2.so -> DT_NEEDED).
+"$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
+   -c "$USERLAND_DIR/apps/dsotest2/dsotest2.c" -o "$BUILD_DIR/user_dsotest2.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -shared -m elf_x86_64_makaos \
+   -soname libdso2.so --build-id=none "$BUILD_DIR/user_dsotest2.o" -o "$BUILD_DIR/libdso2.so"
+# libdso.so: links against libdso2.so -> gets a DT_NEEDED the loader must satisfy.
 "$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
    -c "$USERLAND_DIR/apps/dsotest/dsotest.c" -o "$BUILD_DIR/user_dsotest.o"
 "$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -shared -m elf_x86_64_makaos \
-   --build-id=none "$BUILD_DIR/user_dsotest.o" -o "$BUILD_DIR/libdso.so"
+   --build-id=none "$BUILD_DIR/user_dsotest.o" "$BUILD_DIR/libdso2.so" -o "$BUILD_DIR/libdso.so"
 # libdsobad.so: imports a strong undefined symbol -> dlopen must reject it.
 "$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
    -c "$USERLAND_DIR/apps/dsobad/dsobad.c" -o "$BUILD_DIR/user_dsobad.o"
@@ -975,6 +981,8 @@ if [ -f "$BUILD_DIR/user_tone.elf" ]; then
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_piehello.elf" bin/piehello
     [ -f "$BUILD_DIR/libdso.so" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libdso.so" lib/libdso.so
+    [ -f "$BUILD_DIR/libdso2.so" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libdso2.so" lib/libdso2.so
     [ -f "$BUILD_DIR/libdsobad.so" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libdsobad.so" lib/libdsobad.so
     [ -f "$BUILD_DIR/user_dltest.elf" ] && \

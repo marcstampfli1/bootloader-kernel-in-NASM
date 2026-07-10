@@ -14,7 +14,11 @@ extern unsigned long strlen(const char*);
  * dlopen must still SUCCEED (loader hardening -- weak symbols are not fatal). */
 extern void dso_absent_weak(void) __attribute__((weak));
 
+/* dso2_value lives in libdso2.so, a DT_NEEDED dependency of this .so. */
+extern int dso2_value(void);
+
 int dso_answer(void) { return 42; }
 const char* dso_name(void) { return s_name; }     /* returns the relocated pointer */
 int dso_strlen(void) { return (int)strlen("abcd"); }   /* calls libc via the exe scope */
 void* dso_weak(void) { return (void*)dso_absent_weak; }  /* == 0 when weak-unresolved */
+int dso_dep(void) { return dso2_value() + 1; }    /* calls into the DT_NEEDED dep */

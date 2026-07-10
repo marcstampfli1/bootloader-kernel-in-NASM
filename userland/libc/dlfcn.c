@@ -40,6 +40,7 @@ typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;
 #define ET_DYN 3
 #define SHN_UNDEF 0
 #define DT_NULL 0
+#define DT_NEEDED 1
 #define DT_HASH 4
 #define DT_STRTAB 5
 #define DT_SYMTAB 6
@@ -50,8 +51,11 @@ typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;
 #define STB_WEAK 2
 #define DT_INIT_ARRAY 25
 #define DT_INIT_ARRAYSZ 27
+#define DT_FINI_ARRAY 26
+#define DT_FINI_ARRAYSZ 28
 #define DT_JMPREL 23
 #define DT_PLTRELSZ 2
+#define MAX_NEEDED 24
 #define R_X86_64_64 1
 #define R_X86_64_GLOB_DAT 6
 #define R_X86_64_JUMP_SLOT 7
@@ -69,6 +73,9 @@ typedef struct dso {
     const char*      strtab;     // DT_STRTAB
     uint64_t         strsz;      // DT_STRSZ -- bounds st_name (fail closed on corrupt .so)
     const uint32_t*  hash;       // DT_HASH (SysV): [nbucket, nchain, bucket[], chain[]]
+    const unsigned long* fini_arr; // DT_FINI_ARRAY (run in reverse on dlclose)
+    uint64_t         fini_sz;
+    char             path[96];   // opened path -- dedup key for re-dlopen / shared deps
     int              refcnt;
 } dso_t;
 
@@ -245,10 +252,34 @@ static int apply_rela(dso_t* d, const Elf64_Rela* rela, uint64_t sz) {
     return 0;
 }
 
+// dlopen(NULL) returns this handle for the global scope (main exe + all loaded
+// objects); dlsym on it searches everything via resolve_sym.
+static dso_t s_global;
+
+// Resolve a DT_NEEDED name to a path: absolute if it has a '/', else /lib/<name>.
+static void dep_path(const char* name, char* out, unsigned outsz) {
+    unsigned i = 0; int slash = 0;
+    for (const char* p = name; *p; p++) if (*p == '/') slash = 1;
+    if (!slash) for (const char* p = "/lib/"; *p && i + 1 < outsz; p++) out[i++] = *p;
+    for (const char* p = name; *p && i + 1 < outsz; p++) out[i++] = *p;
+    out[i] = 0;
+}
+
+// Remove `d` from the loaded list (used on a failed load).
+static void unpublish(dso_t* d) {
+    for (dso_t** pp = &s_loaded; *pp; pp = &(*pp)->next)
+        if (*pp == d) { *pp = d->next; break; }
+}
+
 void* dlopen(const char* path, int flags) {
     (void)flags;
     s_err_set = 0;
-    if (!path) { set_err("dlopen: NULL path (self-scope not yet supported)", 0); return NULL; }
+    if (!path) return &s_global;   // global-scope handle (RTLD_DEFAULT-like)
+
+    // Dedup: a re-dlopen of an already-loaded object bumps its refcount and
+    // returns the same handle (also breaks circular DT_NEEDED chains below).
+    for (dso_t* e = s_loaded; e; e = e->next)
+        if (strcmp(e->path, path) == 0) { e->refcnt++; return e; }
 
     int fd = open(path, O_RDONLY, 0);
     if (fd < 0) { set_err("dlopen: cannot open", path); return NULL; }
@@ -297,14 +328,18 @@ void* dlopen(const char* path, int flags) {
     if (!d) { set_err("dlopen: out of memory", 0); munmap(res, span); return NULL; }
     memset(d, 0, sizeof *d);
     d->base = base; d->map_start = (unsigned long)res; d->map_len = span; d->refcnt = 1;
+    { unsigned i = 0; for (const char* p = path; *p && i < sizeof(d->path) - 1; p++) d->path[i++] = *p;
+      d->path[i] = 0; }
 
     // Parse the dynamic section (resident at base + dyn_vaddr).
     const Elf64_Dyn* dyn = (const Elf64_Dyn*)(base + dyn_vaddr);
     const Elf64_Rela* rela = NULL; uint64_t rela_sz = 0;
     const Elf64_Rela* jmprel = NULL; uint64_t jmprel_sz = 0;
     const unsigned long* init_arr = NULL; uint64_t init_sz = 0;
+    uint64_t needed[MAX_NEEDED]; int n_needed = 0;
     for (const Elf64_Dyn* e = dyn; e->d_tag != DT_NULL; e++) {
         switch (e->d_tag) {
+            case DT_NEEDED:       if (n_needed < MAX_NEEDED) needed[n_needed++] = e->d_un; break;
             case DT_SYMTAB:       d->symtab = (const Elf64_Sym*)(base + e->d_un); break;
             case DT_STRTAB:       d->strtab = (const char*)(base + e->d_un); break;
             case DT_STRSZ:        d->strsz  = e->d_un; break;
@@ -315,16 +350,29 @@ void* dlopen(const char* path, int flags) {
             case DT_PLTRELSZ:     jmprel_sz = e->d_un; break;
             case DT_INIT_ARRAY:   init_arr  = (const unsigned long*)(base + e->d_un); break;
             case DT_INIT_ARRAYSZ: init_sz   = e->d_un; break;
+            case DT_FINI_ARRAY:   d->fini_arr = (const unsigned long*)(base + e->d_un); break;
+            case DT_FINI_ARRAYSZ: d->fini_sz  = e->d_un; break;
         }
     }
 
-    // Publish into the global scope BEFORE relocating so the object's own
-    // defined symbols (and previously-loaded objects) are visible.
+    // Publish BEFORE loading dependencies + relocating so the object's own
+    // symbols are visible to its deps' relocations, and a circular DT_NEEDED
+    // chain dedups against the already-published object instead of recursing.
     d->next = s_loaded; s_loaded = d;
 
+    // Load DT_NEEDED dependencies (recursively); each publishes itself, so this
+    // object's relocations below can bind against them.
+    for (int i = 0; i < n_needed; i++) {
+        if (!d->strtab || needed[i] >= d->strsz) continue;
+        char dp[128]; dep_path(d->strtab + needed[i], dp, sizeof dp);
+        if (!dlopen(dp, flags)) {
+            set_err("dlopen: dependency failed", dp);
+            unpublish(d); munmap(res, span); free(d); return NULL;
+        }
+    }
+
     if (apply_rela(d, rela, rela_sz) != 0 || apply_rela(d, jmprel, jmprel_sz) != 0) {
-        s_loaded = d->next;                    // unpublish
-        munmap(res, span); free(d); return NULL;
+        unpublish(d); munmap(res, span); free(d); return NULL;
     }
 
     // Constructors (DT_INIT_ARRAY).
@@ -340,17 +388,29 @@ void* dlopen(const char* path, int flags) {
 void* dlsym(void* handle, const char* name) {
     s_err_set = 0;
     if (!handle || !name) { set_err("dlsym: bad argument", 0); return NULL; }
+    if (handle == &s_global) {              // dlopen(NULL): search the global scope
+        unsigned long v = resolve_sym(name);
+        if (!v) { set_err("dlsym: symbol not found", name); return NULL; }
+        return (void*)v;
+    }
     const Elf64_Sym* s = dso_lookup((dso_t*)handle, name);
     if (!s) { set_err("dlsym: symbol not found", name); return NULL; }
     return (void*)(((dso_t*)handle)->base + s->st_value);
 }
 
 int dlclose(void* handle) {
-    if (!handle) return 0;
+    if (!handle || handle == &s_global) return 0;
     dso_t* d = (dso_t*)handle;
     if (--d->refcnt > 0) return 0;
-    for (dso_t** pp = &s_loaded; *pp; pp = &(*pp)->next)
-        if (*pp == d) { *pp = d->next; break; }
+    // Destructors (DT_FINI_ARRAY), reverse order.
+    if (d->fini_arr && d->fini_sz)
+        for (long i = (long)(d->fini_sz / sizeof(unsigned long)) - 1; i >= 0; i--) {
+            void (*fn)(void) = (void (*)(void))d->fini_arr[i];
+            if (fn && (unsigned long)fn != ~0UL) fn();
+        }
+    // Note: DT_NEEDED deps are left loaded (no per-object dep list yet); a small
+    // leak, not a correctness bug.
+    unpublish(d);
     munmap((void*)d->map_start, d->map_len);
     free(d);
     return 0;
