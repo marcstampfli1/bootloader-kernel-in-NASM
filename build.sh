@@ -977,6 +977,18 @@ echo "root's secret — maka cannot read this" > "$BUILD_DIR/etc_stage/root_secr
 debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/root_secret.txt root/secret.txt" > /dev/null 2>&1 || true
 ext2_setperm "$BUILD_DIR/ext2.img" /root/secret.txt 0100600 0 0
 
+# Quake shareware data for DarkPlaces (DarkPlaces-Quake / gamedir id1): install
+# build/quake-id1/pak0.pak (staged by scripts/fetch-quake-shareware.sh) so
+# `dplaunch` has content to render.  Absent unless fetched -- default images ship
+# without it.  Run headless via scripts/run-gl.sh (autologin root:/bin/dplaunch).
+if [ -f "$BUILD_DIR/quake-id1/pak0.pak" ]; then
+  debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /root/id1" > /dev/null 2>&1 || true
+  ext2_setperm "$BUILD_DIR/ext2.img" /root/id1 0040755 0 0
+  debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/quake-id1/pak0.pak root/id1/pak0.pak" > /dev/null 2>&1 || true
+  ext2_setperm "$BUILD_DIR/ext2.img" /root/id1/pak0.pak 0100644 0 0
+  echo "[build] installed Quake shareware pak0.pak at /root/id1 (DarkPlaces data)"
+fi
+
 echo "[+] /etc/passwd and /etc/shadow installed"
 
 # ── Service definitions ───────────────────────────────────────────────────
