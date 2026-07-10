@@ -1,26 +1,35 @@
 /*
- * pietest -- minimal PIE self-relocation smoke test (Phase 0/1 of the dynamic
- * loader).  Freestanding, no libc.  A .data pointer -> .rodata forces an
- * R_X86_64_RELATIVE the kernel ELF loader must fix up; if it doesn't, write(2)
- * gets a base-0 pointer and prints garbage (or faults).  Prints the marker and
- * exits 42, so a headless serial run confirms: ET_DYN loaded at a bias, RELATIVE
- * relocs applied, entry reached, syscalls work.
+ * pietest -- PIE self-relocation smoke test (dynamic loader Phase 0/1).
+ *
+ * Freestanding, no libc.  A headless serial capture cannot see userland stdout
+ * (the tty0 console renders to the framebuffer once it is up), so pietest
+ * signals its result the one way the kernel ALWAYS mirrors to serial: a fatal
+ * page fault.  It stores to a sentinel address whose low nibble encodes the
+ * outcome, so the kernel's PF-KILL dump prints  CR2=0x000000005EC0DE0X  with
+ * comm=pietest:
+ *
+ *   bit0  R_X86_64_RELATIVE applied: `pmsg` relocated to a real mapped address
+ *         (>= 0x100000, not the base-0 link value) AND the byte it points at is
+ *         the expected 'P'.
+ *   bit1  the reloc-target page kept its file backing: `canary` is intact, i.e.
+ *         the loader did NOT zero-fill the page around the relocated word.
+ *
+ * Full pass  => CR2=0x000000005EC0DE03.  Any other value pinpoints what broke
+ * (…01 = data-backing lost, …02 = reloc not applied, …00 = both).
  *
  * Built with: cc -fPIC -ffreestanding -c ; ld -pie --export-dynamic -e _start
  */
 static const char msg[] = "PIE-RELOC-OK\n";
-static const char *volatile pmsg = msg;   /* absolute ptr -> R_X86_64_RELATIVE */
-
-static long sc3(long n, long a, long b, long c) {
-    long r;
-    __asm__ volatile("syscall" : "=a"(r)
-                     : "a"(n), "D"(a), "S"(b), "d"(c)
-                     : "rcx", "r11", "memory");
-    return r;
-}
+static const char *volatile pmsg = msg;          /* stored ptr -> R_X86_64_RELATIVE */
+static volatile unsigned canary = 0xCAFEBABEu;   /* .data, NOT relocated */
 
 void _start(void) {
-    sc3(0 /*SYS_WRITE*/, 1, (long)pmsg, 13);   /* fd 1, "PIE-RELOC-OK\n", 13 */
-    sc3(1 /*SYS_EXIT*/, 42, 0, 0);
+    unsigned long p = (unsigned long)pmsg;
+    unsigned long r = 0x5EC0DE00UL;
+    /* Check pmsg as a VALUE first (a broken reloc leaves it base-0, < 0x100000),
+     * so a wild deref can never corrupt the sentinel we are about to fault on. */
+    if (p >= 0x100000UL && ((const char*)p)[0] == 'P') r |= 0x01UL;
+    if (canary == 0xCAFEBABEu)                         r |= 0x02UL;
+    *(volatile unsigned char*)r = 0;   /* PF-KILL: CR2 encodes the result */
     for (;;) { }
 }

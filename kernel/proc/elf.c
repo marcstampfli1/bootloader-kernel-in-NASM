@@ -103,6 +103,28 @@ void elf_phtab_bounds_selftest(void) {
 }
 #endif
 
+// ── Shared segment-page population (eager map + PIE reloc fault-in) ────────
+// Both the eager load path and the PIE self-relocation pass need to fill one
+// 4KiB frame with a segment's on-disk bytes (zero-filling the BSS tail).  One
+// function so they cannot drift.  `frame_hhdm` is the HHDM-mapped frame; the
+// page it fills covers base-0 vaddr [page_v0, page_v0+PAGE_SIZE) of `ph`.
+static void elf_fill_page_from_file(const uint8_t* data, uint64_t size,
+                                    const Elf64_Phdr* ph, uint64_t page_v0,
+                                    uint8_t* frame_hhdm) {
+    __builtin_memset(frame_hhdm, 0, PAGE_SIZE);
+    uint64_t page_end = page_v0 + PAGE_SIZE;
+    uint64_t file_beg = ph->p_vaddr;                 // base-0 (load_bias applied by caller)
+    uint64_t file_end = ph->p_vaddr + ph->p_filesz;
+    if (file_beg < page_end && file_end > page_v0) {
+        uint64_t copy_beg = file_beg > page_v0 ? file_beg : page_v0;
+        uint64_t copy_end = file_end < page_end ? file_end : page_end;
+        uint64_t foff     = ph->p_offset + (copy_beg - file_beg);
+        uint64_t nbytes   = copy_end - copy_beg;
+        if (foff + nbytes <= size)
+            __builtin_memcpy(frame_hhdm + (copy_beg - page_v0), data + foff, nbytes);
+    }
+}
+
 // ── Internal: load ELF into a fresh address space ─────────────────────────
 // Allocates new PML4 + mm_t, maps PT_LOAD segments, sets up brk and stack VMA.
 // Does NOT create a kstack or fd_table — those are for elf_load only.
@@ -243,21 +265,8 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                     return 0;
                 }
                 uint8_t* fptr = (uint8_t*)(frame + HHDM_OFFSET);
-                __builtin_memset(fptr, 0, PAGE_SIZE);
-
-                virt_addr_t page_end      = page + PAGE_SIZE;
-                virt_addr_t file_start_va = ph->p_vaddr + load_bias;
-                virt_addr_t file_end_va   = ph->p_vaddr + load_bias + ph->p_filesz;
-                if (file_start_va < page_end && file_end_va > page) {
-                    virt_addr_t copy_start = (file_start_va > page) ? file_start_va : page;
-                    virt_addr_t copy_end   = (file_end_va < page_end) ? file_end_va : page_end;
-                    uint64_t    frame_off  = copy_start - page;
-                    uint64_t    file_off   = ph->p_offset + (copy_start - file_start_va);
-                    uint64_t    nbytes     = copy_end - copy_start;
-                    if (file_off + nbytes <= size) {
-                        __builtin_memcpy(fptr + frame_off, data + file_off, nbytes);
-                    }
-                }
+                // page is load_bias-adjusted; the helper works in base-0 vaddrs.
+                elf_fill_page_from_file(data, size, ph, page - load_bias, fptr);
                 if (!vmm_page_map(pml4, page, frame, pte_flags)) {
                     // OOM on an intermediate PT page: this frame is NOT mapped,
                     // so vmm_free_user won't reclaim it (free it here) and the
@@ -280,12 +289,20 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
 
     // ── PIE self-relocation (R_X86_64_RELATIVE) ──────────────────────────
     // A statically-linked PIE (ET_DYN) is linked at base 0 and carries only
-    // RELATIVE relocs.  Apply them now that the segments are mapped, writing
-    // through the physical frame (vmm_page_phys + HHDM) so a read-only / RELRO
-    // page is not a problem.  Without this every absolute pointer in the image
-    // (vtables, .data.rel.ro, string/reloc tables, __init_array) stays base-0
-    // -> wild pointers the instant the program runs.  Imported symbols are the
-    // dynamic loader's job, not this static-PIE path.
+    // RELATIVE relocs.  Apply them now, writing through the physical frame
+    // (frame + HHDM) so a read-only / RELRO page is no obstacle.  Without this
+    // every absolute pointer in the image (vtables, .data.rel.ro, string/reloc
+    // tables, __init_array) stays base-0 -> wild pointers the instant the
+    // program runs.  Imported symbols are the dynamic loader's job, not this
+    // static-PIE path.
+    //
+    // Under the lazy (file-backed) path the reloc-target page is usually NOT
+    // resident yet.  We must NOT fault it in as a ZERO page (vmm_get_user_pages
+    // does that) -- that would drop every non-relocated byte on the page.
+    // Instead we populate the page from the file image (`data`, the same bytes
+    // isr14 would pull from disk) and map JUST that page; the rest of the image
+    // stays demand-paged.  Reloc entries on pointer-sized data are 8-aligned,
+    // so a single 8-byte write never straddles a page boundary.
     if (load_bias != 0) {
         uint64_t dyn_vaddr = 0, dyn_filesz = 0;
         for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
@@ -318,14 +335,38 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
             for (uint64_t o = 0; o + rela_ent <= rela_sz; o += rela_ent) {
                 const Elf64_Rela* r = (const Elf64_Rela*)(data + rela_off + o);
                 if (ELF64_R_TYPE(r->r_info) != R_X86_64_RELATIVE) continue;
-                virt_addr_t va = load_bias + r->r_offset;
-                // Segments are demand-paged, so the target page may not be
-                // resident yet -- vmm_get_user_pages faults it in (copying the
-                // file backing) and returns its HHDM pointer.
-                void* pg = 0;
-                if (vmm_get_user_pages(pml4, va & ~(virt_addr_t)0xFFF, 1, &pg) != 1
-                    || !pg) continue;
-                *(uint64_t*)((uintptr_t)pg + (va & 0xFFF)) =
+                uint64_t    off0 = r->r_offset;          // base-0 target vaddr
+                virt_addr_t va   = load_bias + off0;      // runtime target vaddr
+                virt_addr_t page = va & ~(virt_addr_t)0xFFF;
+                phys_addr_t phys = vmm_page_phys(pml4, page);
+                if (phys == PMM_INVALID_ADDR) {
+                    // Not resident (lazy path): populate this ONE page the SAME
+                    // way isr14 would demand-fault it -- via the VMA's file_off,
+                    // which correctly handles a page that straddles a segment
+                    // boundary (`data` is the same bytes isr14 would pread).  The
+                    // rest of the image stays demand-paged.
+                    vma_t* vma = mm_vma_find(mm, page);
+                    if (!vma) continue;
+                    phys_addr_t frame = pmm_buddy_alloc(0);
+                    if (frame == PMM_INVALID_ADDR) continue;
+                    uint8_t* dst = (uint8_t*)(frame + HHDM_OFFSET);
+                    __builtin_memset(dst, 0, PAGE_SIZE);
+                    if (vma->flags & VMA_FILE) {
+                        uint64_t pg_off = page - vma->start;
+                        if (pg_off < vma->file_len) {
+                            uint64_t src = vma->file_off + pg_off;
+                            uint64_t n   = PAGE_SIZE;
+                            if (pg_off + n > vma->file_len) n = vma->file_len - pg_off;
+                            if (src + n <= size) __builtin_memcpy(dst, data + src, n);
+                        }
+                    }
+                    if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma->flags))) {
+                        pmm_buddy_free(frame, 0);
+                        continue;
+                    }
+                    phys = frame;
+                }
+                *(uint64_t*)((uintptr_t)(phys + HHDM_OFFSET) + (va & 0xFFF)) =
                     load_bias + (uint64_t)r->r_addend;
             }
         }
