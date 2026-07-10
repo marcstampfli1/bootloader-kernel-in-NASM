@@ -13,7 +13,10 @@
 // byte tail overflow + subsequent ldmxcsr of garbage manifested as
 // RBP corruption after ft_smooth_render's internal callback returned
 // (observed via Alt+Shift+Enter → foot PF-KILL in glyph rasterize).
-typedef struct { long __jb[9]; } jmp_buf[1];
+// Tagged `__jmp_buf_tag` (the glibc name) so glibc-style code that casts to
+// `struct __jmp_buf_tag *` before setjmp (e.g. DarkPlaces' libpng path) type-
+// checks.  Tag only -- the layout is unchanged (9 longs / 72 bytes).
+typedef struct __jmp_buf_tag { long __jb[9]; } jmp_buf[1];
 typedef jmp_buf sigjmp_buf;
 
 int  setjmp(jmp_buf env);
