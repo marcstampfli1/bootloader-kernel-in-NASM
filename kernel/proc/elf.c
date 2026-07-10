@@ -103,26 +103,20 @@ void elf_phtab_bounds_selftest(void) {
 }
 #endif
 
-// ── Shared segment-page population (eager map + PIE reloc fault-in) ────────
-// Both the eager load path and the PIE self-relocation pass need to fill one
-// 4KiB frame with a segment's on-disk bytes (zero-filling the BSS tail).  One
-// function so they cannot drift.  `frame_hhdm` is the HHDM-mapped frame; the
-// page it fills covers base-0 vaddr [page_v0, page_v0+PAGE_SIZE) of `ph`.
-static void elf_fill_page_from_file(const uint8_t* data, uint64_t size,
-                                    const Elf64_Phdr* ph, uint64_t page_v0,
-                                    uint8_t* frame_hhdm) {
-    __builtin_memset(frame_hhdm, 0, PAGE_SIZE);
-    uint64_t page_end = page_v0 + PAGE_SIZE;
-    uint64_t file_beg = ph->p_vaddr;                 // base-0 (load_bias applied by caller)
-    uint64_t file_end = ph->p_vaddr + ph->p_filesz;
-    if (file_beg < page_end && file_end > page_v0) {
-        uint64_t copy_beg = file_beg > page_v0 ? file_beg : page_v0;
-        uint64_t copy_end = file_end < page_end ? file_end : page_end;
-        uint64_t foff     = ph->p_offset + (copy_beg - file_beg);
-        uint64_t nbytes   = copy_end - copy_beg;
-        if (foff + nbytes <= size)
-            __builtin_memcpy(frame_hhdm + (copy_beg - page_v0), data + foff, nbytes);
-    }
+// ── Shared segment-page fill (eager map + PIE reloc fault-in) ──────────────
+// Fill one 4KiB frame (`dst`, HHDM-mapped) with a file-backed segment's bytes
+// for the page at `pg_off` (offset of the page within the page-aligned VMA /
+// segment start), read from the in-memory ELF image `data`.  Zero-fills the
+// page and the BSS tail.  `file_off` is the file byte offset of the VMA start,
+// `file_len` its file-backed length -- the SAME coordinates and span primitive
+// (vma_file_page_span) the lazy demand-fault (isr14) uses, so an eagerly loaded
+// segment and a demand-paged one are byte-identical.  One fill model, no drift.
+static void elf_fill_page(const uint8_t* data, uint64_t size, uint64_t file_off,
+                          uint64_t file_len, uint64_t pg_off, uint8_t* dst) {
+    __builtin_memset(dst, 0, PAGE_SIZE);
+    uint64_t n   = vma_file_page_span(pg_off, file_len);
+    uint64_t src = file_off + pg_off;
+    if (n && src + n <= size) __builtin_memcpy(dst, data + src, n);
 }
 
 // ── Internal: load ELF into a fresh address space ─────────────────────────
@@ -231,14 +225,17 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
         virt_addr_t seg_start = page_align_down(ph->p_vaddr + load_bias);
         virt_addr_t seg_end   = page_align_up(ph->p_vaddr + load_bias + ph->p_memsz);
 
+        // File backing for this segment in page-aligned VMA coordinates, shared
+        // by the lazy VMA, the eager fill, and the demand-fault handler so all
+        // three agree byte-for-byte.  file_off: ELF file offset of the segment's
+        // page-aligned start (p_offset & PAGE_MASK == p_vaddr & PAGE_MASK by the
+        // ELF alignment invariant, so rounding down is exact).  file_len: bytes
+        // from file_off that are file-backed (the rest is BSS/zero tail).
+        uint64_t file_off = ph->p_offset & ~(uint64_t)PAGE_MASK;
+        uint64_t file_len = (ph->p_offset & PAGE_MASK) + ph->p_filesz;
+
         if (backing_file) {
             // ── Lazy path: file-backed VMA, pages faulted in on demand ────
-            // file_off: ELF file offset for the start of this page-aligned
-            //   segment.  p_offset & PAGE_MASK == p_vaddr & PAGE_MASK (ELF
-            //   alignment invariant), so rounding down to page is safe.
-            uint64_t file_off = ph->p_offset & ~(uint64_t)PAGE_MASK;
-            // file_len: bytes from file_off that are file-backed (rest = BSS).
-            uint64_t file_len = (ph->p_offset & PAGE_MASK) + ph->p_filesz;
             if (!mm_vma_add_file(mm, seg_start, seg_end, prot_flags,
                                  backing_file, file_off, file_len)) {
                 mm_destroy(mm);
@@ -265,8 +262,7 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                     return 0;
                 }
                 uint8_t* fptr = (uint8_t*)(frame + HHDM_OFFSET);
-                // page is load_bias-adjusted; the helper works in base-0 vaddrs.
-                elf_fill_page_from_file(data, size, ph, page - load_bias, fptr);
+                elf_fill_page(data, size, file_off, file_len, page - seg_start, fptr);
                 if (!vmm_page_map(pml4, page, frame, pte_flags)) {
                     // OOM on an intermediate PT page: this frame is NOT mapped,
                     // so vmm_free_user won't reclaim it (free it here) and the
@@ -350,13 +346,11 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                     phys_addr_t frame = pmm_buddy_alloc(0);
                     if (frame == PMM_INVALID_ADDR) continue;
                     uint8_t* dst = (uint8_t*)(frame + HHDM_OFFSET);
-                    __builtin_memset(dst, 0, PAGE_SIZE);
-                    if (vma->flags & VMA_FILE) {
-                        uint64_t pg_off = page - vma->start;
-                        uint64_t n      = vma_file_page_span(pg_off, vma->file_len);
-                        uint64_t src    = vma->file_off + pg_off;
-                        if (n && src + n <= size) __builtin_memcpy(dst, data + src, n);
-                    }
+                    if (vma->flags & VMA_FILE)
+                        elf_fill_page(data, size, vma->file_off, vma->file_len,
+                                      page - vma->start, dst);
+                    else
+                        __builtin_memset(dst, 0, PAGE_SIZE);   // anonymous -> zero page
                     if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma->flags))) {
                         pmm_buddy_free(frame, 0);
                         continue;
