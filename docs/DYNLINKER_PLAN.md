@@ -22,14 +22,18 @@ that forces a fixed base (so `-pie` still emitted `ET_EXEC`, `PT_DYNAMIC=0`).
 ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
 
 ## Phases (each with a provable milestone)
-0. Toolchain emits PIE + `.so`:
-   - PIE/ET_DYN linker script (base-0, PT_DYNAMIC, .dynsym/.hash) + a `-shared`
-     script; provide via `-T` or fix binutils ld scripts if the PIE (.xd) script
-     is missing.
-   - Recompile libc + crt0 (`entry.asm` -> RIP-relative) + userland `-fPIC/-fPIE`.
-   - Reconfigure/re-spec gcc only if specs keep forcing no-pie.
-   - DONE: `cc -fPIE -pie -Wl,--export-dynamic hi.c` -> ET_DYN + host sym in
-     `.dynsym` + `R_X86_64_RELATIVE`; `cc -shared` -> a real `.so`.
+0. Toolchain emits PIE + `.so` -- DE-RISKED, NO binutils rebuild:
+   - PROVEN: `ld -pie` (binutils 2.42) already produces a correct ET_DYN +
+     PT_DYNAMIC; the `.xd` script is base-0 ET_DYN. The ONLY blocker is gcc's
+     DRIVER suppressing `-pie` (even `-Wl,-pie` came out ET_EXEC -- gcc adds a
+     conflicting `-no-pie`/default script). Fix by either (a) a `-specs=` file
+     overriding the pie/link spec, or (b) linking the final exe via `ld`
+     directly (gather crt + libgcc + libs). No gcc/binutils rebuild needed.
+   - Recompile libc + crt0 (`entry.asm` -> RIP-relative) + userland `-fPIC/-fPIE`
+     (libc.a has non-PIC R_X86_64_32S; port libs are mostly already -fPIC).
+   - `-shared` for `.so`s uses the `.xs`/`.xd` script the same way (via ld).
+   - DONE: an `ld -pie --export-dynamic` link -> ET_DYN + host sym in `.dynsym` +
+     `R_X86_64_RELATIVE`; `ld -shared` -> a real `.so`.
 1. Kernel ET_DYN exec: load base, map PT_LOADs, apply exe `RELATIVE`/`IRELATIVE`
    relocs, jump `base+entry`; aux vector (AT_PHDR/PHENT/PHNUM/BASE/ENTRY/EXECFN).
    DONE: a PIE hello runs.
