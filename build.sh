@@ -1253,6 +1253,12 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # (the parser already works -- it compiled "us").  Installed at
     # /etc/keymap.xkb below; applies to every keyboard.
     printf 'input type:keyboard xkb_file /etc/keymap.xkb\n' >> "$BUILD_DIR/etc_stage/sway_config"
+    # Launch DarkPlaces (Quake) with Mod1+d; auto-launch it on startup when the
+    # Quake data is present so the desktop boots straight into the game.
+    printf 'bindsym Mod1+d exec /bin/dplaunch\n' >> "$BUILD_DIR/etc_stage/sway_config"
+    if [ -f "$BUILD_DIR/quake-id1/pak0.pak" ]; then
+        printf 'exec /bin/dplaunch\n' >> "$BUILD_DIR/etc_stage/sway_config"
+    fi
     debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir etc/sway" > /dev/null 2>&1 || true
     debugfs -w "$BUILD_DIR/ext2.img" \
         -R "write $BUILD_DIR/etc_stage/sway_config etc/sway/config" > /dev/null 2>&1 || true
