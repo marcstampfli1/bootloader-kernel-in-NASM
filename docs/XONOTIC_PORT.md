@@ -40,13 +40,19 @@ from automation (it froze the host GPU before).
    DarkPlaces links `-lSDL2` (this libSDL2.a) and reaches SDL3 at runtime, no hack.
    [OBSOLETE ORIGINAL NOTE kept for context: "MakaOS has no dlopen, so this needs
    a static-symbol-bind patch..." -- superseded by the loader.]
-2. **libGL desktop front-end** OR confirm DarkPlaces resolves GL via
-   SDL_GL_GetProcAddress (it does -- no libGL link needed).
-3. **Disk image bump**: EXT2_SECTORS in build.sh (currently 384 MiB) -> ~2 GiB
-   for Xonotic assets (or ship a minimal map subset first).
-4. **Build DarkPlaces** (126 C files) in PRELOAD static mode: patch out the
-   `dlopen` path + stub backtrace; link SDL2(compat)+GL+ogg/vorbis/jpeg/png/z;
-   fix MakaOS libc gaps as they surface.
+2. **libGL desktop front-end** -- **N/A**: DarkPlaces resolves GL via
+   SDL_GL_GetProcAddress (confirmed), no libGL link.
+3. **Disk image bump**: chosen path is MINIMAL data first (image stays ~512 MiB-
+   1 GiB, engine + a tiny data/); the ~2 GiB full-Xonotic bump comes later.
+4. **Build DarkPlaces** -- **DONE** (scripts/port-darkplaces.sh): the 114-TU SDL
+   client compiles + links as a PIE (4.6 MB, /bin/darkplaces).  NO dlopen patch
+   needed (the loader exists; PRELOAD statically links codecs anyway).  Links
+   sdl2-compat (libSDL2.a -> dlopen libSDL3.so.0) + z/jpeg/png/ogg/vorbis;
+   theora/curl/xmp stay runtime-dlopen'd (absent = off); libav/d0_blind_id/
+   Windows TUs excluded.  Its POSIX surface was already covered -- only THREE
+   small libc additions were needed: memccpy, select (SYS_SELECT wrapper), the
+   glibc __jmp_buf_tag tag; plus a real latent fix (the exe now self-applies its
+   initial-exec TLS relocs so libc's errno works -- see DYNLINKER_PLAN.md).
 5. **Assets**: fetch Xonotic data (or a minimal `data/` + one map .pk3),
    install into the image like doom1.wad.
 6. **Headless launch** via run-gl.sh; iterate on serial until it inits GL,
