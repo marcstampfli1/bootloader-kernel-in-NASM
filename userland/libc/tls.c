@@ -55,6 +55,13 @@ size_t __makaos_tls_block_size(void) {
     return s_tls_size + 16 + s_tls_align;
 }
 
+// The main executable's aligned static-TLS block size == align_up(p_memsz,
+// p_align).  The dlopen loader needs it to service a general-dynamic TLS access
+// (__tls_get_addr) that resolves to the exe's OWN local-exec block: a __thread
+// var at PT_TLS offset O lives at tp - tls_size + O (variant II, above).  One
+// source of truth -- the loader must not recompute align_up and risk drifting.
+size_t __makaos_static_tls_size(void) { return s_tls_size; }
+
 // Lay a TLS image into `block`; returns the thread pointer (%fs value).
 void* __makaos_tls_setup_block(void* block) {
     char*  b  = (char*)align_up((uintptr_t)block, s_tls_align);

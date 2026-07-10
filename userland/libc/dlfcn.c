@@ -105,10 +105,21 @@ typedef struct dso {
 // automatically per-thread).  The static executable stays local-exec (TPOFF) --
 // this path is only for dynamically loaded modules.
 typedef struct { unsigned long module, offset; } tls_index;
-typedef struct { const char* tdata; unsigned long filesz, memsz; } tls_module_t;
-static tls_module_t s_tls_mod[MAX_TLS_MODULES];   // [0] unused; ids start at 1
-static int          s_tls_nmod = 1;
+// is_static marks the main executable's module: its __thread vars live in the
+// per-thread STATIC TLS (the tdata/tbss below %fs that crt0/tls.c laid out),
+// reached from %fs -- NOT a lazily-malloc'd block like a dlopen'd .so's.
+typedef struct { const char* tdata; unsigned long filesz, memsz; int is_static; } tls_module_t;
+#define EXE_TLS_MODID 1                            // reserved id for the main exe
+static tls_module_t s_tls_mod[MAX_TLS_MODULES];   // [0] unused; [1] the exe
+static int          s_tls_nmod = 2;               // dynamic (.so) ids start at 2
 static __thread void* g_dtv[MAX_TLS_MODULES];     // per-thread block per module (NULL = unallocated)
+
+extern unsigned long __makaos_static_tls_size(void);  // libc: align_up(p_memsz,p_align)
+
+// Read the thread pointer (%fs base == TCB; self-pointer stored at %fs:0).
+static inline char* tls_tp(void) {
+    void* tp; __asm__ __volatile__("mov %%fs:0, %0" : "=r"(tp)); return (char*)tp;
+}
 
 void* __tls_get_addr(tls_index* ti) {
     unsigned long m = ti->module;
@@ -119,6 +130,11 @@ void* __tls_get_addr(tls_index* ti) {
     // this reads them locklessly -- and keeps the hot TLS path lock-free.
     if (m == 0 || m >= (unsigned long)s_tls_nmod) return (void*)0;
     if (ti->offset >= s_tls_mod[m].memsz) return (void*)0;
+    // The main exe's TLS is the static block: a var at PT_TLS offset O is at
+    // tp - tls_size + O (variant II).  Matches the exe's own local-exec accesses
+    // to the SAME var (e.g. a .so and the exe sharing libc's errno), per thread.
+    if (s_tls_mod[m].is_static)
+        return tls_tp() - s_tls_mod[m].memsz + ti->offset;
     void* blk = g_dtv[m];                          // __thread -> this thread only
     if (!blk) {
         tls_module_t mod = s_tls_mod[m];
@@ -213,6 +229,11 @@ static void init_exe_scope(void) {
         }
     }
     s_exe.base = base;
+    // Register the main exe as TLS module EXE_TLS_MODID so a .so's cross-module
+    // __thread import (e.g. libc's errno) resolves here.  Its block is the static
+    // TLS (reached from %fs), sized by libc's authoritative align_up(p_memsz).
+    s_tls_mod[EXE_TLS_MODID].is_static = 1;
+    s_tls_mod[EXE_TLS_MODID].memsz     = __makaos_static_tls_size();
 }
 
 // Resolve `name` to a runtime address: loaded objects first (global scope), then
@@ -226,6 +247,26 @@ static unsigned long resolve_sym(const char* name) {
     if (s_exe.hash) {
         const Elf64_Sym* s = dso_lookup(&s_exe, name);
         if (s) return s_exe.base + s->st_value;
+    }
+    return 0;
+}
+
+// Resolve a cross-module __thread symbol (a general-dynamic TLS reloc whose
+// symbol is UNDEFINED in the referencing object, e.g. a .so importing libc's
+// `errno`) to its DEFINING module: the (module id, in-block offset) pair that
+// __tls_get_addr consumes.  For a TLS symbol st_value IS the PT_TLS-block offset
+// (not a load address), so it is used directly -- never base-relocated.  Global
+// scope order matches resolve_sym: loaded .so's first, then the main exe.
+// Returns 1 on success.
+static int tls_resolve(const char* name, unsigned long* mod, unsigned long* off) {
+    for (dso_t* e = s_loaded; e; e = e->next) {
+        const Elf64_Sym* s = dso_lookup(e, name);
+        if (s && e->tls_modid) { *mod = (unsigned long)e->tls_modid; *off = s->st_value; return 1; }
+    }
+    init_exe_scope();
+    if (s_exe.hash && s_tls_mod[EXE_TLS_MODID].is_static) {
+        const Elf64_Sym* s = dso_lookup(&s_exe, name);
+        if (s) { *mod = EXE_TLS_MODID; *off = s->st_value; return 1; }
     }
     return 0;
 }
@@ -288,11 +329,30 @@ static int apply_rela(dso_t* d, const Elf64_Rela* rela, uint64_t sz) {
         // __tls_get_addr resolves per-thread.  Handled before symbol resolution
         // because DTPMOD64 usually has sym 0 (this module's own TLS).
         if (type == R_X86_64_DTPMOD64 || type == R_X86_64_DTPOFF64 || type == R_X86_64_TPOFF64) {
+            if (type == R_X86_64_TPOFF64) {
+                set_err("dlopen: initial-exec TLS (TPOFF64) in a .so unsupported", 0); return -1;
+            }
             uint32_t tsym = ELF64_R_SYM(r->r_info);
             const Elf64_Sym* ts = (tsym && d->hash && tsym < d->hash[1]) ? &d->symtab[tsym] : (const Elf64_Sym*)0;
-            if (type == R_X86_64_DTPMOD64)      *where = (uint64_t)d->tls_modid;      // own module
-            else if (type == R_X86_64_DTPOFF64) *where = (ts ? ts->st_value : 0) + (uint64_t)r->r_addend;
-            else { set_err("dlopen: initial-exec TLS (TPOFF64) in a .so unsupported", 0); return -1; }
+            unsigned long mod, off;
+            if (ts && ts->st_shndx == SHN_UNDEF) {
+                // Cross-module __thread import (e.g. libc's errno): the var lives
+                // in whichever module DEFINES it, not here.  Resolve globally.
+                const char* nm = (ts->st_name < d->strsz) ? d->strtab + ts->st_name : "";
+                if (!tls_resolve(nm, &mod, &off)) {
+                    // A weak undefined TLS import legitimately yields module 0 /
+                    // offset 0 (__tls_get_addr returns NULL); a strong one is fatal.
+                    if (ELF_ST_BIND(ts->st_info) == STB_WEAK) { mod = 0; off = 0; }
+                    else { set_err("dlopen: undefined TLS symbol", nm); return -1; }
+                }
+            } else {
+                // Own module: a __thread var defined here (or a STB_LOCAL access
+                // with sym 0).  st_value is its offset within this .so's block.
+                mod = (unsigned long)d->tls_modid;
+                off = ts ? ts->st_value : 0;
+            }
+            if (type == R_X86_64_DTPMOD64) *where = (uint64_t)mod;
+            else                           *where = off + (uint64_t)r->r_addend;
             continue;
         }
 

@@ -73,8 +73,14 @@ ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
    the exe's exported one.  General-dynamic only: `TPOFF64` (initial-exec) in a
    `.so` is rejected.  Module id + offset bounded (V12).  Tested: tlsdso.so's
    `__thread` counter is per-thread across a spawned thread (CR2=0x5EC03FFF).
-   TODO: cross-module `__thread` imports (defining-module lookup); TLS unload on
-   dlclose (module slots + per-thread blocks currently leak).
+   CROSS-MODULE `__thread` **DONE** (Phase 5 needed it for libc's `errno`): a
+   GD-TLS reloc against an UNDEFINED symbol resolves to its DEFINING module via
+   `tls_resolve` (loaded `.so`s, then the exe).  The main exe is reserved TLS
+   module id 1 (`is_static`): `__tls_get_addr(1, off)` returns the per-thread
+   static-TLS address `tp - tls_size + off` (matching the exe's own local-exec
+   access to the same var), where `tls_size = __makaos_static_tls_size()` from
+   libc.  So a `.so` and the exe share libc's `errno` per thread.
+   TODO: TLS unload on dlclose (module slots + per-thread blocks currently leak).
 5. Build `libSDL3.so`; sdl2-compat builds unmodified (its dlopen(libSDL3) works);
    revert SDL/Mesa static-bind hacks; then DarkPlaces dynamic loading + Xonotic;
    foundation for LWJGL/JVM. DONE: sdl2-compat runs a trivial SDL2 app.
