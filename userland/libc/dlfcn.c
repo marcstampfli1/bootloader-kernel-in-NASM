@@ -547,8 +547,14 @@ static void* dlopen_impl(const char* path, int flags) {
 void* dlopen(const char* path, int flags) {
     s_err_set = 0;
     if (!path) return &s_global;   // global-scope handle (RTLD_DEFAULT-like)
+    // A bare soname (no '/') searches the library dir, like standard dlopen and
+    // our own DT_NEEDED resolution -- so dlopen("libSDL3.so") finds /lib/libSDL3.so
+    // (sdl2-compat and other libraries dlopen by soname, unmodified).  A path with
+    // a '/' (absolute or relative) is used as-is.  Same rule as dep_path (DRY).
+    char resolved[128];
+    dep_path(path, resolved, sizeof resolved);
     dl_lock();
-    void* r = dlopen_impl(path, flags);
+    void* r = dlopen_impl(resolved, flags);
     dl_unlock();
     return r;
 }
