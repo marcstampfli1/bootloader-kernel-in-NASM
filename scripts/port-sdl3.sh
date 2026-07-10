@@ -112,6 +112,7 @@ configure() {
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
         -DCMAKE_INSTALL_PREFIX=/usr \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DSDL_SHARED=OFF \
         -DSDL_STATIC=ON \
         -DSDL_TEST=OFF \

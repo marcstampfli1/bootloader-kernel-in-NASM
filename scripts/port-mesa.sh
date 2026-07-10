@@ -285,6 +285,7 @@ if [ ! -d "$MESA_BUILD" ]; then
         --libdir=lib \
         -Dc_args="$MESA_DEFS" \
         -Dcpp_args="$MESA_DEFS" \
+        -Db_staticpic=true \
         -Ddefault_library=static \
         -Dgallium-drivers=virgl \
         -Dvulkan-drivers= \
