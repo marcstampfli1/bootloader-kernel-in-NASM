@@ -435,6 +435,22 @@ fi
    --start-group "$SYSROOT/usr/lib/libc.a" --end-group \
    -o "$BUILD_DIR/user_piehello.elf"
 
+# ── dlopen (dynamic loader Phase 2) ──────────────────────────────────────
+# libdso.so: a no-import shared object built with `ld -shared` (stock -shared
+# script produces ET_DYN + SysV HASH + dynsym).  dltest: a PIE that dlopen()s
+# it via the real libc loader, dlsym()s + calls into it, then dlclose()s.
+"$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
+   -c "$USERLAND_DIR/apps/dsotest/dsotest.c" -o "$BUILD_DIR/user_dsotest.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -shared -m elf_x86_64_makaos \
+   --build-id=none "$BUILD_DIR/user_dsotest.o" -o "$BUILD_DIR/libdso.so"
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
+   -c "$USERLAND_DIR/apps/dltest/dltest.c" -o "$BUILD_DIR/user_dltest.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
+   --export-dynamic -e _entry --build-id=none -T "$USERLAND_DIR/link-pie.ld" \
+   "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_dltest.o" \
+   --start-group "$SYSROOT/usr/lib/libc.a" --end-group \
+   -o "$BUILD_DIR/user_dltest.elf"
+
 # ── SDL3 apps ────────────────────────────────────────────────────────
 # libSDL3.a now uses the static-EGL path (no dlopen; SDL_egl.o references the
 # EGL entry points directly), so EVERY SDL video app pulls SDL_egl.o and must
@@ -827,6 +843,7 @@ SHADOW_EOF
 # Directories: root-owned, 0755 (rwxr-xr-x) except /root (0700) and /tmp (1777).
 debugfs -w "$BUILD_DIR/ext2.img" <<'DEBUGFS_EOF' > /dev/null 2>&1
 mkdir bin
+mkdir lib
 mkdir etc
 mkdir etc/services
 mkdir home
@@ -838,6 +855,7 @@ DEBUGFS_EOF
 # Set directory permissions (type bits: 0040000 = directory).
 ext2_setperm "$BUILD_DIR/ext2.img" /         0040755 0 0      # / root:root rwxr-xr-x
 ext2_setperm "$BUILD_DIR/ext2.img" /bin      0040755 0 0      # /bin root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /lib      0040755 0 0      # /lib root:root rwxr-xr-x
 ext2_setperm "$BUILD_DIR/ext2.img" /etc      0040755 0 0      # /etc root:root rwxr-xr-x
 ext2_setperm "$BUILD_DIR/ext2.img" /home     0040755 0 0      # /home root:root rwxr-xr-x
 ext2_setperm "$BUILD_DIR/ext2.img" /tmp      0041777 0 0      # /tmp root:root rwxrwxrwx + sticky
@@ -950,6 +968,10 @@ if [ -f "$BUILD_DIR/user_tone.elf" ]; then
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_pietest.elf" bin/pietest
     [ -f "$BUILD_DIR/user_piehello.elf" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_piehello.elf" bin/piehello
+    [ -f "$BUILD_DIR/libdso.so" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libdso.so" lib/libdso.so
+    [ -f "$BUILD_DIR/user_dltest.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_dltest.elf" bin/dltest
 fi
 if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello
