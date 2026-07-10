@@ -103,9 +103,18 @@ if [ "${CONSOLE_SERIAL:-0}" = "1" ]; then
 fi
 
 # ── User compile flags ─────────────────────────────────────────────────────
+# -fPIE (position-independent) so every userland object -- libc especially --
+# can link into a PIE (ET_DYN) for the dynamic loader.  -fPIE, NOT -fPIC: the
+# main executable's own __thread TLS stays LOCAL-EXEC (TPOFF, resolved at link
+# time); -fPIC would default __thread to general-dynamic and pull in
+# __tls_get_addr (dynamic TLS -- a later phase).  PIE objects carry only
+# R_X86_64_RELATIVE (GOT/data, applied by the kernel loader) + TPOFF relocs, no
+# absolute R_X86_64_32/32S, so `ld -pie` accepts libc.a.  Apps still LINK as
+# static ET_EXEC via the gcc driver (-static); PIE codegen runs fine at a fixed
+# base, so this is transparent to them until they are linked -pie later.
 USER_CFLAGS=(
   -ffreestanding -m64 -mno-red-zone
-  -fno-pie -fno-pic -fno-plt
+  -fPIE -fno-plt
   -fno-stack-protector -fno-builtin
   -fno-asynchronous-unwind-tables -fno-unwind-tables
   -O0 -Wall -Wextra
@@ -411,6 +420,20 @@ fi
    -c "$USERLAND_DIR/apps/pietest/pietest.c" -o "$BUILD_DIR/user_pietest.o"
 "$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -pie --export-dynamic -e _start \
    --build-id=none "$BUILD_DIR/user_pietest.o" -o "$BUILD_DIR/user_pietest.elf"
+
+# ── piehello -- Phase 0 milestone: a REAL libc program as a static PIE ────
+# Compiled -fPIE (via USER_CFLAGS) and linked with crt0 (_entry) + the now-PIC
+# libc.a via `ld -pie` directly (gcc's driver forces -static -T fixed-base
+# makaos-link.ld -> ET_EXEC).  We use link-pie.ld (base-0 ET_DYN, the stock -pie
+# layout + libc's __tdata_end/__tbss_end TLS symbols) so PT_DYNAMIC carries the
+# RELATIVE relocs the kernel applies and crt0's TLS/init_array symbols resolve.
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
+   -c "$USERLAND_DIR/apps/piehello/piehello.c" -o "$BUILD_DIR/user_piehello.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
+   --export-dynamic -e _entry --build-id=none -T "$USERLAND_DIR/link-pie.ld" \
+   "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_piehello.o" \
+   --start-group "$SYSROOT/usr/lib/libc.a" --end-group \
+   -o "$BUILD_DIR/user_piehello.elf"
 
 # ── SDL3 apps ────────────────────────────────────────────────────────
 # libSDL3.a now uses the static-EGL path (no dlopen; SDL_egl.o references the
@@ -925,6 +948,8 @@ if [ -f "$BUILD_DIR/user_tone.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_tone.elf" bin/tone
     [ -f "$BUILD_DIR/user_pietest.elf" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_pietest.elf" bin/pietest
+    [ -f "$BUILD_DIR/user_piehello.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_piehello.elf" bin/piehello
 fi
 if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello
