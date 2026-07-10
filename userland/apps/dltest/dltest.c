@@ -16,6 +16,12 @@
  *   bit5 SECURITY (ASVS V4 deny-by-default): a NON-executable file (/etc/passwd,
  *        mode 0644) is correctly REFUSED an mmap PROT_EXEC -- the exec-mmap right
  *        is granted only for files the caller may execute, so this must fail.
+ *   bit7 the .so's libc import (strlen) bound to the exe's exported .dynsym
+ *   bit8 loader hardening: a WEAK undefined symbol resolves to 0 (dlopen still
+ *        succeeds), so dso_weak() returns NULL
+ *   bit9 loader hardening: a .so importing a STRONG undefined symbol is REJECTED
+ *        (dlopen returns NULL) and cleaned up, not half-loaded
+ * Full pass: CR2=0x000000005EC0DFFF.
  */
 extern void* dlopen(const char*, int);
 extern void* dlsym(void*, const char*);
@@ -37,6 +43,9 @@ int main(void) {
          * .dynsym (milestone 2); dso_strlen() must return strlen("abcd") == 4. */
         int (*dslen)(void) = (int (*)(void))dlsym(h, "dso_strlen");
         if (dslen && dslen() == 4) r |= 0x80UL;
+        /* bit8: a weak-undefined symbol resolved to 0, dlopen still succeeded. */
+        void* (*wk)(void) = (void* (*)(void))dlsym(h, "dso_weak");
+        if (wk && wk() == (void*)0) r |= 0x100UL;
         if (dlclose(h) == 0) r |= 0x10UL;
     }
     /* deny-by-default check: PROT_EXEC on a non-executable file must be refused. */
@@ -47,6 +56,9 @@ int main(void) {
                        2 /*MAP_PRIVATE*/, pf, 0);
         if (m == (void*)-1) r |= 0x40UL;    /* bit6: PROT_EXEC correctly DENIED */
     }
-    *(volatile unsigned char*)r = 0;   /* PF-KILL: CR2=0x5EC0DE3F on full pass */
+    /* bit9: a .so with a strong undefined import must be REJECTED (returns NULL). */
+    void* hb = dlopen("/lib/libdsobad.so", 2 /*RTLD_NOW*/);
+    if (hb == (void*)0) r |= 0x200UL;
+    *(volatile unsigned char*)r = 0;   /* PF-KILL: CR2=0x5EC0DFFF on full pass */
     return 0;
 }

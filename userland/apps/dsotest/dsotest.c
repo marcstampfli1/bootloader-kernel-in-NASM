@@ -10,6 +10,11 @@ static const char *volatile s_name = "libdso";   /* -> R_X86_64_RELATIVE */
  * bind against the main executable's exported strlen (milestone 2). */
 extern unsigned long strlen(const char*);
 
+/* A WEAK undefined symbol: no object provides it, so it must resolve to 0 and
+ * dlopen must still SUCCEED (loader hardening -- weak symbols are not fatal). */
+extern void dso_absent_weak(void) __attribute__((weak));
+
 int dso_answer(void) { return 42; }
 const char* dso_name(void) { return s_name; }     /* returns the relocated pointer */
 int dso_strlen(void) { return (int)strlen("abcd"); }   /* calls libc via the exe scope */
+void* dso_weak(void) { return (void*)dso_absent_weak; }  /* == 0 when weak-unresolved */

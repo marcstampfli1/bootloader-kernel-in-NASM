@@ -443,6 +443,11 @@ fi
    -c "$USERLAND_DIR/apps/dsotest/dsotest.c" -o "$BUILD_DIR/user_dsotest.o"
 "$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -shared -m elf_x86_64_makaos \
    --build-id=none "$BUILD_DIR/user_dsotest.o" -o "$BUILD_DIR/libdso.so"
+# libdsobad.so: imports a strong undefined symbol -> dlopen must reject it.
+"$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
+   -c "$USERLAND_DIR/apps/dsobad/dsobad.c" -o "$BUILD_DIR/user_dsobad.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -shared -m elf_x86_64_makaos \
+   --build-id=none "$BUILD_DIR/user_dsobad.o" -o "$BUILD_DIR/libdsobad.so"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
    -c "$USERLAND_DIR/apps/dltest/dltest.c" -o "$BUILD_DIR/user_dltest.o"
 "$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
@@ -970,6 +975,8 @@ if [ -f "$BUILD_DIR/user_tone.elf" ]; then
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_piehello.elf" bin/piehello
     [ -f "$BUILD_DIR/libdso.so" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libdso.so" lib/libdso.so
+    [ -f "$BUILD_DIR/libdsobad.so" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libdsobad.so" lib/libdsobad.so
     [ -f "$BUILD_DIR/user_dltest.elf" ] && \
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_dltest.elf" bin/dltest
 fi

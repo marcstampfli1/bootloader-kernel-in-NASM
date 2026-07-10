@@ -45,6 +45,9 @@ typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;
 #define DT_SYMTAB 6
 #define DT_RELA 7
 #define DT_RELASZ 8
+#define DT_STRSZ 10
+#define ELF_ST_BIND(i) ((i) >> 4)
+#define STB_WEAK 2
 #define DT_INIT_ARRAY 25
 #define DT_INIT_ARRAYSZ 27
 #define DT_JMPREL 23
@@ -64,6 +67,7 @@ typedef struct dso {
     unsigned long    map_len;
     const Elf64_Sym* symtab;     // DT_SYMTAB (runtime addr)
     const char*      strtab;     // DT_STRTAB
+    uint64_t         strsz;      // DT_STRSZ -- bounds st_name (fail closed on corrupt .so)
     const uint32_t*  hash;       // DT_HASH (SysV): [nbucket, nchain, bucket[], chain[]]
     int              refcnt;
 } dso_t;
@@ -109,12 +113,17 @@ static unsigned long elf_hash(const char* s) {
 static const Elf64_Sym* dso_lookup(const dso_t* d, const char* name) {
     if (!d->hash || !d->symtab || !d->strtab) return NULL;
     uint32_t nbucket = d->hash[0];
-    if (!nbucket) return NULL;
+    uint32_t nchain  = d->hash[1];          // == symtab entry count; bounds every index
+    if (!nbucket || !nchain) return NULL;
     const uint32_t* bucket = d->hash + 2;
     const uint32_t* chain  = bucket + nbucket;
-    for (uint32_t i = bucket[elf_hash(name) % nbucket]; i != 0; i = chain[i]) {
+    // Bound every step by nchain -> no OOB read, and cap iterations so a cyclic
+    // chain in a corrupt .so cannot spin forever (fail closed, V12).
+    uint32_t i = bucket[elf_hash(name) % nbucket];
+    for (uint32_t steps = 0; i != 0 && i < nchain && steps < nchain; i = chain[i], steps++) {
         const Elf64_Sym* s = &d->symtab[i];
-        if (s->st_shndx != SHN_UNDEF && strcmp(name, d->strtab + s->st_name) == 0)
+        if (s->st_shndx != SHN_UNDEF && s->st_name < d->strsz
+            && strcmp(name, d->strtab + s->st_name) == 0)
             return s;
     }
     return NULL;
@@ -139,6 +148,7 @@ static void init_exe_scope(void) {
         switch (e->d_tag) {
             case DT_SYMTAB: s_exe.symtab = (const Elf64_Sym*)(base + e->d_un); break;
             case DT_STRTAB: s_exe.strtab = (const char*)(base + e->d_un); break;
+            case DT_STRSZ:  s_exe.strsz  = e->d_un; break;
             case DT_HASH:   s_exe.hash   = (const uint32_t*)(base + e->d_un); break;
         }
     }
@@ -203,14 +213,28 @@ static int apply_rela(dso_t* d, const Elf64_Rela* rela, uint64_t sz) {
     for (uint64_t o = 0; o + sizeof(Elf64_Rela) <= sz; o += sizeof(Elf64_Rela)) {
         const Elf64_Rela* r = (const Elf64_Rela*)((const uint8_t*)rela + o);
         uint32_t type = ELF64_R_TYPE(r->r_info);
-        uint64_t* where = (uint64_t*)(d->base + r->r_offset);
+        // The reloc target must lie inside this object's own mapped span, or a
+        // corrupt .so would scribble the exe/heap.  Fail closed (V12).
+        unsigned long w = d->base + r->r_offset;
+        if (w < d->map_start || w + sizeof(uint64_t) > d->map_start + d->map_len) {
+            set_err("dlopen: reloc offset out of range", 0); return -1;
+        }
+        uint64_t* where = (uint64_t*)w;
         if (type == R_X86_64_RELATIVE) { *where = d->base + (uint64_t)r->r_addend; continue; }
 
-        const Elf64_Sym* s = &d->symtab[ELF64_R_SYM(r->r_info)];
+        // Bound the symbol index + name against the .so's tables (OOB guard).
+        uint32_t symi = ELF64_R_SYM(r->r_info);
+        if (!d->hash || symi >= d->hash[1]) { set_err("dlopen: bad reloc symbol index", 0); return -1; }
+        const Elf64_Sym* s = &d->symtab[symi];
+        if (s->st_name >= d->strsz) { set_err("dlopen: bad reloc symbol name", 0); return -1; }
         const char* name = d->strtab + s->st_name;
         const Elf64_Sym* def = dso_lookup(d, name);
         unsigned long val = def ? d->base + def->st_value : resolve_sym(name);
-        if (!val && s->st_shndx == SHN_UNDEF) { set_err("dlopen: undefined symbol", name); return -1; }
+        // A WEAK undefined symbol legitimately resolves to 0; only a STRONG
+        // undefined that no object provides is fatal.
+        if (!val && s->st_shndx == SHN_UNDEF && ELF_ST_BIND(s->st_info) != STB_WEAK) {
+            set_err("dlopen: undefined symbol", name); return -1;
+        }
         switch (type) {
             case R_X86_64_GLOB_DAT:
             case R_X86_64_JUMP_SLOT: *where = val; break;
@@ -283,6 +307,7 @@ void* dlopen(const char* path, int flags) {
         switch (e->d_tag) {
             case DT_SYMTAB:       d->symtab = (const Elf64_Sym*)(base + e->d_un); break;
             case DT_STRTAB:       d->strtab = (const char*)(base + e->d_un); break;
+            case DT_STRSZ:        d->strsz  = e->d_un; break;
             case DT_HASH:         d->hash   = (const uint32_t*)(base + e->d_un); break;
             case DT_RELA:         rela      = (const Elf64_Rela*)(base + e->d_un); break;
             case DT_RELASZ:       rela_sz   = e->d_un; break;
