@@ -17,12 +17,30 @@
  *   bit9  a .so importing a STRONG undefined symbol is REJECTED + cleaned up
  *   bit10 DT_NEEDED: libdso.so pulls in libdso2.so; dso_dep() == 100
  *   bit11 dlopen(NULL) global scope: dlsym finds the exe's strlen
+ *   bit12 THREAD-SAFETY: 3 threads hammer dlopen/dlsym/call/dlclose of the same
+ *         .so concurrently; the loader lock + refcount keep it correct (no
+ *         crash, every call returns 42).  Full pass => CR2=0x5EC01FFF.
  */
+#include <pthread.h>
 extern void* dlopen(const char*, int);
 extern void* dlsym(void*, const char*);
 extern int   dlclose(void*);
 extern int   open(const char*, int, ...);
 extern void* mmap(void*, unsigned long, int, int, int, long);
+
+// Concurrent load/use/unload of the same object -- races the loaded-object list
+// + refcount; without the lock this corrupts or double-frees.
+static void* hammer(void* a) {
+    (void)a;
+    for (int k = 0; k < 300; k++) {
+        void* hh = dlopen("/lib/libdso.so", 2);
+        if (!hh) return (void*)0;
+        int (*ans)(void) = (int (*)(void))dlsym(hh, "dso_answer");
+        if (!ans || ans() != 42) { dlclose(hh); return (void*)0; }
+        if (dlclose(hh) != 0) return (void*)0;
+    }
+    return (void*)1;
+}
 
 int main(void) {
     unsigned long r = 0x5EC00000UL;
@@ -59,6 +77,16 @@ int main(void) {
     void* g = dlopen((const char*)0, 2);
     if (g && dlsym(g, "strlen") != (void*)0) r |= 0x800UL;
 
-    *(volatile unsigned char*)r = 0;   /* PF-KILL: CR2=0x5EC00FFF on full pass */
+    /* thread-safety: 3 concurrent hammer loops of the same .so must all succeed. */
+    pthread_t t1, t2;
+    void *r1 = (void*)0, *r2 = (void*)0;
+    int c1 = pthread_create(&t1, (void*)0, hammer, (void*)0);
+    int c2 = pthread_create(&t2, (void*)0, hammer, (void*)0);
+    void* rm = hammer((void*)0);
+    if (c1 == 0) pthread_join(t1, &r1);
+    if (c2 == 0) pthread_join(t2, &r2);
+    if (rm == (void*)1 && c1 == 0 && r1 == (void*)1 && c2 == 0 && r2 == (void*)1) r |= 0x1000UL;
+
+    *(volatile unsigned char*)r = 0;   /* PF-KILL: CR2=0x5EC01FFF on full pass */
     return 0;
 }

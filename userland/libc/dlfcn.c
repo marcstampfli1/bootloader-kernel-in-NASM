@@ -18,7 +18,17 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+
+// One RECURSIVE lock serialises all loader state (the loaded-object list, the
+// exe scope, refcounts).  Recursive so a DT_NEEDED dependency load, or a .so
+// constructor/destructor that itself calls dlopen/dlclose, re-enters safely
+// instead of self-deadlocking.
+static pthread_mutex_t s_lock = { .kind = PTHREAD_MUTEX_RECURSIVE };
+static void dl_lock(void)   { pthread_mutex_lock(&s_lock); }
+static void dl_unlock(void) { pthread_mutex_unlock(&s_lock); }
 
 // ── Minimal ELF64 (userland has no <elf.h>) ────────────────────────────────
 typedef struct { uint8_t e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version;
@@ -75,13 +85,14 @@ typedef struct dso {
     const uint32_t*  hash;       // DT_HASH (SysV): [nbucket, nchain, bucket[], chain[]]
     const unsigned long* fini_arr; // DT_FINI_ARRAY (run in reverse on dlclose)
     uint64_t         fini_sz;
-    char             path[96];   // opened path -- dedup key for re-dlopen / shared deps
+    unsigned long long ino;      // (dev,ino) is the dedup key -- robust to path
+    int              dev;        //   aliasing (symlinks, relative vs absolute, /lib/x vs x)
     int              refcnt;
 } dso_t;
 
-static dso_t* s_loaded = NULL;   // head of loaded-object list
-static char   s_err[160];        // last error (dlerror)
-static int    s_err_set = 0;
+static dso_t* s_loaded = NULL;      // head of loaded-object list (under s_lock)
+static __thread char s_err[160];    // last error -- per-thread (POSIX dlerror is per-thread)
+static __thread int  s_err_set = 0;
 
 // Main-executable symbol scope: the exe exports its symbols (libc etc.) via
 // --export-dynamic, so a .so's imports resolve against it.  Derived once from
@@ -286,18 +297,21 @@ static void unpublish(dso_t* d) {
         if (*pp == d) { *pp = d->next; break; }
 }
 
-void* dlopen(const char* path, int flags) {
+// Core loader, called with s_lock held (the public dlopen wrapper + DT_NEEDED
+// recursion both come through here).
+static void* dlopen_impl(const char* path, int flags) {
     (void)flags;
-    s_err_set = 0;
-    if (!path) return &s_global;   // global-scope handle (RTLD_DEFAULT-like)
-
-    // Dedup: a re-dlopen of an already-loaded object bumps its refcount and
-    // returns the same handle (also breaks circular DT_NEEDED chains below).
-    for (dso_t* e = s_loaded; e; e = e->next)
-        if (strcmp(e->path, path) == 0) { e->refcnt++; return e; }
 
     int fd = open(path, O_RDONLY, 0);
     if (fd < 0) { set_err("dlopen: cannot open", path); return NULL; }
+
+    // Dedup by (dev, ino): a re-dlopen of the same underlying file -- via any
+    // path alias -- bumps the refcount and returns the same handle (also breaks
+    // circular DT_NEEDED chains, since the object is already published below).
+    struct stat st;
+    if (fstat(fd, &st) != 0) { set_err("dlopen: fstat failed", path); close(fd); return NULL; }
+    for (dso_t* e = s_loaded; e; e = e->next)
+        if (e->ino == st.st_ino && e->dev == st.st_dev) { close(fd); e->refcnt++; return e; }
 
     Elf64_Ehdr eh;
     if (lseek(fd, 0, 0) != 0 || read(fd, &eh, sizeof eh) != (long)sizeof eh
@@ -343,8 +357,7 @@ void* dlopen(const char* path, int flags) {
     if (!d) { set_err("dlopen: out of memory", 0); munmap(res, span); return NULL; }
     memset(d, 0, sizeof *d);
     d->base = base; d->map_start = (unsigned long)res; d->map_len = span; d->refcnt = 1;
-    { unsigned i = 0; for (const char* p = path; *p && i < sizeof(d->path) - 1; p++) d->path[i++] = *p;
-      d->path[i] = 0; }
+    d->ino = st.st_ino; d->dev = st.st_dev;   // dedup key
 
     // Parse the dynamic section (resident at base + dyn_vaddr).
     const Elf64_Dyn* dyn = (const Elf64_Dyn*)(base + dyn_vaddr);
@@ -385,7 +398,7 @@ void* dlopen(const char* path, int flags) {
     for (int i = 0; i < n_needed; i++) {
         if (!d->strtab || needed[i] >= d->strsz) continue;
         char dp[128]; dep_path(d->strtab + needed[i], dp, sizeof dp);
-        if (!dlopen(dp, flags)) {
+        if (!dlopen_impl(dp, flags)) {   // already under s_lock
             set_err("dlopen: dependency failed", dp);
             unpublish(d); munmap(res, span); free(d); return NULL;
         }
@@ -399,29 +412,45 @@ void* dlopen(const char* path, int flags) {
     return d;
 }
 
+void* dlopen(const char* path, int flags) {
+    s_err_set = 0;
+    if (!path) return &s_global;   // global-scope handle (RTLD_DEFAULT-like)
+    dl_lock();
+    void* r = dlopen_impl(path, flags);
+    dl_unlock();
+    return r;
+}
+
 void* dlsym(void* handle, const char* name) {
     s_err_set = 0;
     if (!handle || !name) { set_err("dlsym: bad argument", 0); return NULL; }
+    dl_lock();
+    void* r = NULL;
     if (handle == &s_global) {              // dlopen(NULL): search the global scope
         unsigned long v = resolve_sym(name);
-        if (!v) { set_err("dlsym: symbol not found", name); return NULL; }
-        return (void*)v;
+        if (v) r = (void*)v;
+    } else {
+        const Elf64_Sym* s = dso_lookup((dso_t*)handle, name);
+        if (s) r = (void*)(((dso_t*)handle)->base + s->st_value);
     }
-    const Elf64_Sym* s = dso_lookup((dso_t*)handle, name);
-    if (!s) { set_err("dlsym: symbol not found", name); return NULL; }
-    return (void*)(((dso_t*)handle)->base + s->st_value);
+    dl_unlock();
+    if (!r) set_err("dlsym: symbol not found", name);
+    return r;
 }
 
 int dlclose(void* handle) {
     if (!handle || handle == &s_global) return 0;
+    dl_lock();
     dso_t* d = (dso_t*)handle;
-    if (--d->refcnt > 0) return 0;
-    run_array(d, d->fini_arr, d->fini_sz, 1);   // destructors (DT_FINI_ARRAY), reverse, bounded
-    // Note: DT_NEEDED deps are left loaded (no per-object dep list yet); a small
-    // leak, not a correctness bug.
-    unpublish(d);
-    munmap((void*)d->map_start, d->map_len);
-    free(d);
+    if (--d->refcnt <= 0) {
+        run_array(d, d->fini_arr, d->fini_sz, 1);   // destructors (DT_FINI_ARRAY), reverse, bounded
+        // Note: DT_NEEDED deps are left loaded (no per-object dep list yet); a
+        // small leak, not a correctness bug.
+        unpublish(d);
+        munmap((void*)d->map_start, d->map_len);
+        free(d);
+    }
+    dl_unlock();
     return 0;
 }
 

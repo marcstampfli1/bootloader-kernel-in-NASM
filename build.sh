@@ -322,6 +322,8 @@ USER_RT=(
     "$BUILD_DIR/user_string.o"
     "$BUILD_DIR/user_stdlib.o"
     "$BUILD_DIR/user_dlfcn.o"
+    "$BUILD_DIR/user_pthread.o"        # dlfcn's loader lock -> pthread_mutex_*
+    "$BUILD_DIR/user_pthread_tramp.o"  # pthread.o -> pthread_trampoline
     "$BUILD_DIR/user_locale.o"
     "$BUILD_DIR/user_langinfo.o"
     "$BUILD_DIR/user_assert.o"
