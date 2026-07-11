@@ -2708,33 +2708,25 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
             vfs_file_t* f = fdget(fd);
             if (!f) goto fail_unmap;
 
-            // DRM dumb-buffer mmap: resolve offset → contiguous backing,
-            // install PTEs eagerly.  No VMA accounting for free/rcu —
-            // the buffer's phys is owned by drm.c's per-fd dumb list
-            // and freed via DESTROY_DUMB / drm_close.
-            extern int64_t drm_resolve_dumb_mmap(vfs_file_t*, uint64_t,
-                                                   uint64_t, phys_addr_t*,
-                                                   uint64_t*);
+            // DRM buffer mmap: install PTEs for the object's scatter-gather
+            // backing.  ZERO faults -- the pages are already resident (shmem_
+            // create_dma).  No VMA accounting for free/rcu: the backing is owned
+            // by drm.c's per-fd dumb/res3d objects (shmem) and freed via
+            // DESTROY_DUMB / drm_close, not by VMA refs.
+            extern int64_t drm_mmap_backing(vfs_file_t*, uint64_t, uint64_t,
+                                            phys_addr_t, virt_addr_t, uint64_t);
             extern int drm_is_drm_file(vfs_file_t*);
             if (drm_is_drm_file(f)) {
-                phys_addr_t dphys = 0;
-                uint64_t    dlen  = 0;
-                int64_t rc = drm_resolve_dumb_mmap(f, off, len, &dphys, &dlen);
-                if (rc != 0) { fdput(f); goto fail_unmap; }
-
-                // Mark the VMA as a direct physical mapping.  Without
-                // VMA_MMIO, fork()'s COW clone treated this like a
-                // private anon mapping: the parent's first post-fork
-                // pixel write COPIED the framebuffer page and every
-                // render after that landed in the copy while the GPU
-                // kept scanning the original — dwl forking to spawn
-                // foot turned its first swapchain buffer permanently
-                // black (and the cursor buffer invisible).  VMA_MMIO
-                // makes the clone share the PTEs and the teardown /
-                // munmap paths leave the pages alone: their lifetime
-                // is owned by drm.c's dumb/fb structures, not by VMA
-                // refs (so no pmm_ref_inc here either — the old ref
-                // leaked on every teardown skip).
+                // Mark the VMA as a direct physical mapping.  Without VMA_MMIO,
+                // fork()'s COW clone treated this like a private anon mapping:
+                // the parent's first post-fork pixel write COPIED the framebuffer
+                // page and every render after that landed in the copy while the
+                // GPU kept scanning the original — dwl forking to spawn foot
+                // turned its first swapchain buffer permanently black (and the
+                // cursor invisible).  VMA_MMIO makes the clone share the PTEs and
+                // the teardown / munmap paths leave the pages alone: their
+                // lifetime is owned by drm.c's dumb/fb structures (the shmem
+                // backing), not by VMA refs (so no pmm_ref here either).
                 {
                     extern vma_t* mm_vma_find(mm_t*, virt_addr_t);
                     spin_lock(&mm->vma_lock);
@@ -2744,11 +2736,8 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 }
                 uint64_t pte = mm_vma_pte_flags(vma_flags);
                 phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
-                for (uint64_t i = 0; i < npages; i++) {
-                    if (!vmm_page_map(pml4, vaddr + i * 4096u,
-                                       dphys + i * 4096u, pte)) {
-                        fdput(f); goto fail_unmap;
-                    }
+                if (drm_mmap_backing(f, off, len, pml4, vaddr, pte) != 0) {
+                    fdput(f); goto fail_unmap;
                 }
                 fdput(f);
                 return vaddr;

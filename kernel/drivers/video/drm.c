@@ -24,6 +24,7 @@
 #include "checked.h"   // ckd_mul_u64 / mul_within_u32 (overflow-safe sizing)
 #include "pmm.h"
 #include "vmm.h"
+#include "shmem.h"     // shmem_create_dma: pinned scatter-gather resource backing
 #include "process.h"
 #include "smp.h"
 #include "sched.h"      // g_current
@@ -402,9 +403,9 @@ typedef struct drm_dumb {
     uint32_t           pitch;          // bytes per row
     uint64_t           size;           // total bytes
     uint32_t           vgpu_res_id;    // device-global resource id
-    phys_addr_t        phys;           // backing pages (contiguous)
-    uint32_t           bytes_alloc;    // pow-2 page-rounded allocation
-    uint8_t            order;          // buddy order actually used
+    shmem_t*           backing;        // scatter-gather DMA backing (shmem_create_dma);
+                                       // shared via shmem_ref, freed via shmem_unref
+    uint32_t           bytes_alloc;    // page-rounded allocation (backing->npages*4096)
     struct drm_dumb*   next;
 } drm_dumb_t;
 
@@ -419,9 +420,8 @@ typedef struct drm_fb {
     uint32_t           pitch;
     uint32_t           format;         // DRM_FORMAT_*
     uint32_t           vgpu_res_id;    // independent scan-out ref
-    phys_addr_t        phys;           // backing pages
+    shmem_t*           backing;        // scatter-gather DMA backing (shared via shmem_ref)
     uint32_t           bytes_alloc;
-    uint8_t            order;
     uint8_t            is_3d;          // 1 = borrows a virgl 3D resource (res3d
                                        // owns res_id+pages); do not create/free them
     struct drm_fb*     next;
@@ -471,8 +471,7 @@ typedef struct drm_res3d {
     uint32_t    width, height;
     uint32_t    format;         // virgl format
     uint32_t    bytes;          // page-rounded backing allocation
-    phys_addr_t phys;           // backing pages (physically contiguous)
-    uint8_t     order;          // buddy order used
+    shmem_t*    backing;        // scatter-gather DMA backing (shared via shmem_ref)
     uint8_t     borrowed;       // 1 = PRIME-imported clone: references an existing
                                 // host virgl resource, does NOT own it (the
                                 // exporting res3d does), so free must NOT unref it
@@ -549,12 +548,11 @@ static drm_res3d_t* find_res3d(drm_client_t* c, uint32_t handle) {
     return (r->handle == handle) ? r : NULL;   // handle==0 => freed slot
 }
 
-// Free one 3D bo: unref the device resource + release backing pages + clear slot.
-// Pages are released via per-page pmm_ref_dec (NOT pmm_buddy_free): a PRIME
-// export / import shares these pages and holds its own per-page refs, so a
-// block free here would pull them out from under a live dma-buf.  The buddy
-// allocator stamps rc=1 at alloc, so ref_dec frees only when the last holder
-// (this bo + every dma-buf/import) has let go.
+// Free one 3D bo: unref the device resource + drop this bo's backing ref + clear
+// slot.  The backing is a refcounted shmem object shared by the owner AND every
+// borrowed PRIME clone / fb / cursor; shmem_unref frees (and unpins) the pages
+// only when the last holder lets go, so a free here never pulls them out from
+// under a live dma-buf or scanout.
 // ── Host-resource refcount (keyed by res_id, cross-client) ──────────────────
 // A virgl resource can be referenced by its creating res3d (owner) AND by
 // borrowed PRIME-imported clones in OTHER DRM clients -- wlroots renders in one
@@ -602,14 +600,66 @@ static void res_host_unref(uint32_t res_id) {
     if (destroy) virtio_gpu_resource_unref(res_id);
 }
 
+// ── Scatter-gather resource backing (SCALABILITY_DEBT #14) ───────────────────
+// A resource's backing is a shmem_create_dma object: scattered, pinned, fully-
+// resident pages (no physical-contiguity requirement).  Sharing a backing (a
+// dumb + its fb + a PRIME clone + a pinned cursor) is ONE shmem_ref; the pages
+// free (and unpin) when the last holder drops its ref via shmem_unref.  The
+// device sg list is built from shm->pages[]; userspace mmap batch-installs PTEs
+// over the same pages with zero faults (they are already resident).
+
+// Build the device mem_entry list from a backing's page vector -- coalescing
+// physically-adjacent pages into runs (shmem_create_dma's large blocks collapse
+// to a handful of runs) -- and ATTACH_BACKING it.  Returns 1 on success.
+static int drm_backing_attach(uint32_t res_id, shmem_t* shm) {
+    uint32_t np = shm->npages;
+    if (np == 0) return 0;
+    // Count coalesced runs first so we allocate exactly what we need (not one
+    // slot per page): shmem_create_dma clusters into few runs.
+    uint32_t nr = 0;
+    for (uint32_t i = 0; i < np; i++)
+        if (i == 0 || shm->pages[i] != shm->pages[i - 1] + 4096u) nr++;
+    vgpu_sg_run_t* runs = (vgpu_sg_run_t*)kmalloc((uint64_t)nr * sizeof(*runs));
+    if (!runs) return 0;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < np; i++) {
+        if (i == 0 || shm->pages[i] != shm->pages[i - 1] + 4096u) {
+            runs[k].addr = shm->pages[i]; runs[k].npages = 1; k++;
+        } else {
+            runs[k - 1].npages++;
+        }
+    }
+    int ok = virtio_gpu_resource_attach_backing_sg(res_id, runs, nr);
+    kfree(runs);
+    return ok;
+}
+
+// Install userspace PTEs for a backing (mmap): map `npages` from vaddr onto the
+// backing's scattered frames.  ZERO faults -- the pages are already resident
+// (shmem_create_dma).  The caller marks the VMA VMA_MMIO: drm owns the page
+// lifetime via the object ref, so no per-PTE pmm_ref is taken (teardown must not
+// touch these frames; they free with the backing).
+static int64_t drm_backing_map_user(shmem_t* shm, phys_addr_t pml4,
+                                    virt_addr_t vaddr, uint64_t pte,
+                                    uint64_t npages) {
+    if (!shm || npages > shm->npages) return -EINVAL;
+    for (uint64_t i = 0; i < npages; i++) {
+        if (!vmm_page_map(pml4, vaddr + i * 4096u, shm->pages[i], pte))
+            return -EFAULT;
+    }
+    return 0;
+}
+
 static void res3d_free(drm_res3d_t* r) {
     if (!r || r->handle == 0) return;
     // Refcounted: the owner AND every borrowed clone hold a reference; the host
     // resource is destroyed only when the last one is freed (see res_host_ref).
+    // Detach the device resource FIRST (res_host_unref destroys it on the last
+    // holder), then drop this holder's backing ref: the owner and every borrowed
+    // clone hold their own shmem_ref, so the scattered+pinned pages free (and
+    // unpin) only when the last one releases.
     if (r->res_id) res_host_unref(r->res_id);
-    if (r->phys)
-        for (uint32_t i = 0; i < r->bytes / 4096u; i++)
-            pmm_ref_dec(r->phys + (phys_addr_t)i * 4096u);
+    if (r->backing) shmem_unref(r->backing);
     // Release the per-task memory charge taken at create time.  Borrowed clones
     // reference the exporter's backing and were never charged, so skip them.
     // Without this the per-task charge (drm_per_task_limit) only grows -- a GL
@@ -713,44 +763,34 @@ static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
     uint64_t size;
     if (drm_dumb_size(a.width, a.height, a.bpp, &pitch, &size) != 0) return -EINVAL;
     uint64_t pages = (size + 4095) / 4096;
-    uint8_t  order = 0;
-    while (((uint64_t)1 << order) < pages) order++;
-    uint32_t bytes_alloc = (uint32_t)((uint64_t)1 << order) * 4096u;
+    // Page-rounded, NOT power-of-2-rounded: scatter-gather backing has no
+    // contiguous-block requirement, so the old order-rounding (up to 2x waste)
+    // is gone.
+    uint32_t bytes_alloc = (uint32_t)(pages * 4096u);
 
-    // Memory-accounting check BEFORE the buddy alloc — reject early
-    // if this client is over quota.  Applies to both real userland
-    // tasks and kthreads; kthreads have drm_bytes_charged=0 by default.
+    // Memory-accounting check BEFORE allocating — reject early if this client is
+    // over quota.  Applies to userland tasks and kthreads (drm_bytes_charged=0).
     int rc = drm_charge(g_current, bytes_alloc);
     if (rc < 0) return rc;
 
-    phys_addr_t phys = pmm_buddy_alloc(order);
-    if (phys == PMM_INVALID_ADDR) { drm_uncharge(g_current, bytes_alloc); return -ENOMEM; }
-
-    uint8_t* virt = (uint8_t*)((uintptr_t)phys + HHDM_OFFSET);
-    __builtin_memset(virt, 0, bytes_alloc);
-
-    // The allocator already stamps every page of the block at rc=1 — that
-    // IS this dumb buffer's reference.  An extra per-page pmm_ref_inc here
-    // double-counted, so DESTROY_DUMB's single pmm_ref_dec only reached
-    // rc=1 and the framebuffer pages leaked forever.  fb (ADDFB2) and
-    // GETFB-minted handles take their OWN +1 each, so the page frees only
-    // when the dumb AND every fb/handle have released — exactly right.
+    // Scatter-gather DMA backing: scattered, pinned, fully-resident pages (no
+    // physical contiguity, no fragmentation cliff, zeroed on alloc).  The shmem
+    // object owns rc=1 per page (== this dumb's reference); shmem_unref frees +
+    // unpins them when the last holder (dumb + any fb / GETFB handle sharing it)
+    // drops its ref.
+    shmem_t* shm = shmem_create_dma((uint32_t)pages);
+    if (!shm) { drm_uncharge(g_current, bytes_alloc); return -ENOMEM; }
 
     uint32_t res_id = alloc_res_id();
-    // Error paths free the block via per-page pmm_ref_dec (alloc rc=1 →
-    // 0), NOT pmm_buddy_free at block order — pmm_ref_dec already returns
-    // each page to the buddy when its refcount hits zero.
     if (b->resource_create(res_id, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
                              a.width, a.height) != 0) {
-        for (uint32_t i = 0; i < bytes_alloc / 4096u; i++)
-            pmm_ref_dec(phys + (phys_addr_t)i * 4096u);
+        shmem_unref(shm);
         drm_uncharge(g_current, bytes_alloc);
         return -EIO;
     }
-    if (b->resource_attach_backing(res_id, phys, bytes_alloc) != 0) {
+    if (!drm_backing_attach(res_id, shm)) {
         b->resource_destroy(res_id);
-        for (uint32_t i = 0; i < bytes_alloc / 4096u; i++)
-            pmm_ref_dec(phys + (phys_addr_t)i * 4096u);
+        shmem_unref(shm);
         drm_uncharge(g_current, bytes_alloc);
         return -EIO;
     }
@@ -758,7 +798,7 @@ static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
     drm_dumb_t* d = (drm_dumb_t*)kmalloc(sizeof(*d));
     if (!d) {
         b->resource_destroy(res_id);
-        pmm_buddy_free(phys, order);
+        shmem_unref(shm);
         drm_uncharge(g_current, bytes_alloc);
         return -ENOMEM;
     }
@@ -769,9 +809,8 @@ static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
     d->pitch       = pitch;
     d->size        = size;
     d->vgpu_res_id = res_id;
-    d->phys        = phys;
+    d->backing     = shm;
     d->bytes_alloc = bytes_alloc;
-    d->order       = order;
     d->next        = c->dumbs;
     c->dumbs       = d;
 
@@ -814,19 +853,13 @@ static void dumb_free(drm_dumb_t* d, task_t* owner) {
     // vgpu_res_id==0 marks a handle minted by GETFB around an fb's
     // backing — it owns page refs but no virtio-gpu resource.
     if (b && d->vgpu_res_id) b->resource_destroy(d->vgpu_res_id);
-    // pmm_ref_dec is the authoritative free path: it returns each
-    // page to the buddy allocator when its refcount hits 0.  A fb
-    // created via ADDFB2 took its OWN ref on every backing page, so
-    // when the dumb's handle is destroyed while the fb still holds
-    // the memory (wlroots' close_all_bo_handles pattern), ref counts
-    // go 2→1 and the pages stay live until drm_fb_free drops the
-    // last ref.  The previous code also called pmm_buddy_free here
-    // which double-freed the pages while they were still in use —
-    // buddy's freelist `next` pointer at offset 0 of the block got
-    // overwritten by the live fb's pixel writes → the next buddy
-    // alloc chased a corrupted `next` → #GP.
-    for (uint32_t i = 0; i < d->bytes_alloc / 4096u; i++)
-        pmm_ref_dec(d->phys + (phys_addr_t)i * 4096u);
+    // Drop this dumb's ref on the shared scatter-gather backing.  A fb (ADDFB2)
+    // or a GETFB-minted handle over the same backing holds its OWN shmem_ref, so
+    // when the dumb handle is destroyed while the fb still maps the memory
+    // (wlroots' close_all_bo_handles), the object refcount goes 2->1 and the
+    // pinned pages stay live until the fb drops the last ref — no early free
+    // under a live mapping.
+    if (d->backing) shmem_unref(d->backing);
     drm_uncharge(owner, d->bytes_alloc);
     kfree(d);
 }
@@ -893,12 +926,11 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
         pr_warn("drm", "ADDFB2: handle %u not found", a.handles[0]);
         return -ENOENT;
     }
-    uint32_t    src_w     = d ? d->width       : r->width;
-    uint32_t    src_h     = d ? d->height      : r->height;
-    phys_addr_t src_phys  = d ? d->phys        : r->phys;
-    uint32_t    src_bytes = d ? d->bytes_alloc : r->bytes;
-    uint8_t     src_order = d ? d->order       : r->order;
-    uint32_t    src_pitch = d ? d->pitch       : (r->width * 4u);
+    uint32_t    src_w       = d ? d->width       : r->width;
+    uint32_t    src_h       = d ? d->height      : r->height;
+    shmem_t*    src_backing = d ? d->backing     : r->backing;
+    uint32_t    src_bytes   = d ? d->bytes_alloc : r->bytes;
+    uint32_t    src_pitch   = d ? d->pitch       : (r->width * 4u);
     if (a.width > src_w || a.height > src_h) {
         pr_warn("drm", "ADDFB2: size %ux%u > bo %ux%u",
                 a.width, a.height, src_w, src_h);
@@ -926,7 +958,7 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
             b2->resource_create(fb_res_id,
                                 VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
                                 a.width, a.height) != 0 ||
-            b2->resource_attach_backing(fb_res_id, src_phys, src_bytes) != 0) {
+            !drm_backing_attach(fb_res_id, src_backing)) {
             if (b2) b2->resource_destroy(fb_res_id);
             return -EIO;
         }
@@ -944,24 +976,22 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
     fb->pitch       = a.pitches[0] ? a.pitches[0] : src_pitch;
     fb->format      = a.pixel_format;
     fb->vgpu_res_id = fb_res_id;
-    fb->phys        = src_phys;
+    fb->backing     = src_backing;
     fb->bytes_alloc = src_bytes;
-    fb->order       = src_order;
     fb->is_3d       = is_3d;
     // 3D: the fb scans out a borrowed host resource; take a host-resource ref so
     // it survives the exporting client rotating/freeing its swapchain while this
     // fb is still displayed (dropped in drm_fb_free).
     if (is_3d) res_host_ref(fb_res_id);
-    // Dumb: take independent page refs so the fb survives close_all_bo_handles().
-    // 3D: the res3d owns the pages + resource (borrowed) -- no extra refs here.
-    if (!is_3d)
-        for (uint32_t i = 0; i < src_bytes / 4096u; i++)
-            pmm_ref_inc(src_phys + (phys_addr_t)i * 4096u);
+    // The fb holds its OWN ref on the shared scatter-gather backing (dumb AND
+    // 3D), so it survives close_all_bo_handles() closing the source GEM handle
+    // and can never dangle if the source frees first (object-level refcount).
+    shmem_ref(src_backing);
     fb->next   = c->fbs;
     c->fbs     = fb;
-    pr_info("drm", "ADDFB2 fb=%u res=%u %s phys=%p %ux%u",
+    pr_info("drm", "ADDFB2 fb=%u res=%u %s %ux%u",
             fb->fb_id, fb->vgpu_res_id, is_3d ? "(3D)" : "(dumb)",
-            (void*)fb->phys, a.width, a.height);
+            a.width, a.height);
 
     a.fb_id = fb->fb_id;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
@@ -980,16 +1010,21 @@ typedef struct { uint32_t fb_id; } drm_mode_rmfb_t;
 // here is safe because the resource is still tracked by s_scanouts.
 static void drm_fb_free(drm_fb_t* fb) {
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
-    // A 3D-backed fb borrows the res3d's resource + pages; the res3d (via its
-    // GEM handle / res3d_free) owns their lifetime, so release nothing here.
-    if (fb->is_3d) { res_host_unref(fb->vgpu_res_id); kfree(fb); return; }
+    // A 3D-backed fb borrows the res3d's host resource; drop that host-resource
+    // ref and this fb's own backing ref.  The res3d holds its own refs, so the
+    // pages/resource free only when it releases too.
+    if (fb->is_3d) {
+        res_host_unref(fb->vgpu_res_id);
+        if (fb->backing) shmem_unref(fb->backing);
+        kfree(fb);
+        return;
+    }
     int active = 0;
     for (uint32_t i = 0; i < DRM_MAX_SCANOUTS; i++)
         if (s_scanouts[i].resource_id == fb->vgpu_res_id) { active = 1; break; }
     if (!active) {
         if (b && fb->vgpu_res_id) b->resource_destroy(fb->vgpu_res_id);
-        for (uint32_t i = 0; i < fb->bytes_alloc / 4096u; i++)
-            pmm_ref_dec(fb->phys + (phys_addr_t)i * 4096u);
+        if (fb->backing) shmem_unref(fb->backing);
     }
     // else: resource kept alive for the scanout; on the next commit
     // that replaces this resource, drm_commit_apply's prior hand-off
@@ -1409,25 +1444,23 @@ static int drm_ioctl_atomic(vfs_file_t* f, uint64_t arg) {
 // Given a DRM fd and the offset from MAP_DUMB, return the backing
 // physical address + byte count.  Returns 0 on success, -errno on
 // failure.  The caller's sys_mmap installs the PTEs.
-int64_t drm_resolve_dumb_mmap(vfs_file_t* f, uint64_t offset,
-                                uint64_t len, phys_addr_t* out_phys,
-                                uint64_t* out_bytes) {
+int64_t drm_mmap_backing(vfs_file_t* f, uint64_t offset, uint64_t len,
+                         phys_addr_t pml4, virt_addr_t vaddr, uint64_t pte) {
     if ((offset & 0xFF00000000000000ull) != DRM_DUMB_OFFSET_MARK) return -EINVAL;
     uint32_t handle = (uint32_t)(offset >> DRM_DUMB_OFFSET_SHIFT) & 0xFFFFFF;
     drm_client_t* c = client_of(f);
+    uint64_t npages = (len + 4095u) / 4096u;
     drm_dumb_t* d = find_dumb(c, handle);
     if (d) {
         if (len > d->bytes_alloc) return -EINVAL;
-        *out_phys = d->phys; *out_bytes = d->bytes_alloc;
-        return 0;
+        return drm_backing_map_user(d->backing, pml4, vaddr, pte, npages);
     }
     // Not a dumb: try res3d.  dumb and res3d handles come from one namespace
     // (c->next_handle), so a handle names exactly one -- no ambiguity here.
     drm_res3d_t* r = find_res3d(c, handle);
     if (r) {
         if (len > r->bytes) return -EINVAL;
-        *out_phys = r->phys; *out_bytes = r->bytes;
-        return 0;
+        return drm_backing_map_user(r->backing, pml4, vaddr, pte, npages);
     }
     return -ENOENT;
 }
@@ -1762,9 +1795,8 @@ static int drm_ioctl_gem_close(vfs_file_t* self, uint64_t arg) {
 // and res3d (render-node/virgl) buffers, so a GPU-rendered buffer can be shared
 // to the scanout path (Phase 2c, docs/VIRGL_BRINGUP.md).
 typedef struct {
-    phys_addr_t phys;      // backing pages -- this fd holds a per-page ref
+    shmem_t*    backing;   // scatter-gather backing -- this fd holds a shmem_ref
     uint32_t    bytes;     // page-rounded allocation
-    uint8_t     order;
     uint32_t    width, height, format;
     uint32_t    res_id;    // non-zero if exported from a virgl 3D resource: the
                            // host res_id, so PRIME import can rebuild a
@@ -1778,8 +1810,7 @@ static void drm_prime_close(vfs_file_t* self) {
         // handle_to_fd) so it survives the exporter closing its GEM handle while
         // the buffer is shared -- drop it here.  (See res_host_ref.)
         if (db->res_id) res_host_unref(db->res_id);
-        for (uint32_t i = 0; i < db->bytes / 4096u; i++)
-            pmm_ref_dec(db->phys + (phys_addr_t)i * 4096u);
+        if (db->backing) shmem_unref(db->backing);
         kfree(db);
     }
     kfree(self);
@@ -1817,16 +1848,16 @@ static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
     drm_client_t* c = client_of(drm_f);
     // Export a dumb (2D) OR a res3d (render-node/virgl) buffer.  For a res3d,
     // carry the host res_id so a later import rebuilds a renderable res3d.
-    phys_addr_t phys; uint32_t bytes, w, h, fmt; uint8_t order;
+    shmem_t* src_backing; uint32_t bytes, w, h, fmt;
     uint32_t src_res_id = 0;
     drm_dumb_t* d = find_dumb(c, a.handle);
     if (d) {
-        phys = d->phys; bytes = d->bytes_alloc; order = d->order;
+        src_backing = d->backing; bytes = d->bytes_alloc;
         w = d->width; h = d->height; fmt = 0;
     } else {
         drm_res3d_t* r = find_res3d(c, a.handle);
         if (!r) return -ENOENT;
-        phys = r->phys; bytes = r->bytes; order = r->order;
+        src_backing = r->backing; bytes = r->bytes;
         w = r->width; h = r->height; fmt = r->format;
         src_res_id = r->res_id;
     }
@@ -1838,29 +1869,27 @@ static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
 
     drm_dmabuf_t* db = (drm_dmabuf_t*)kmalloc(sizeof(*db));
     if (!db) { kfree(pf); return -ENOMEM; }
-    db->phys = phys; db->bytes = bytes; db->order = order;
+    db->backing = src_backing; db->bytes = bytes;
     db->width = w; db->height = h; db->format = fmt;
     db->res_id = src_res_id;
     // Own a reference to the host resource too (not just the pages): the dma-buf
     // keeps the virgl resource alive even after the exporter closes its handle,
     // so a scanout/import that still needs it does not hit a destroyed resource.
     if (src_res_id) res_host_ref(src_res_id);
-    // Own a reference to every backing page: the dma-buf keeps the memory alive
-    // even after the exporter destroys its handle.
-    for (uint32_t i = 0; i < bytes / 4096u; i++)
-        pmm_ref_inc(phys + (phys_addr_t)i * 4096u);
+    // Own a ref on the shared scatter-gather backing: the dma-buf keeps the
+    // memory alive even after the exporter destroys its handle.
+    shmem_ref(src_backing);
     pf->ctx = db;
 
     int fd = drm_install_fd(pf);
     if (fd < 0) {
-        // Unwind BOTH references taken above: the per-page refs AND the host
+        // Unwind BOTH references taken above: the backing ref AND the host
         // resource ref.  Omitting the latter stranded the host virtio-gpu
         // resource's refcount at +1 forever (the res_rc node + the host GPU
         // resource outlive the owner and every clone) when the fd table was
         // full (-ENFILE) on a res3d PRIME export.
         if (src_res_id) res_host_unref(src_res_id);
-        for (uint32_t i = 0; i < bytes / 4096u; i++)
-            pmm_ref_dec(phys + (phys_addr_t)i * 4096u);
+        shmem_unref(src_backing);
         kfree(db); kfree(pf); return fd;
     }
 
@@ -1926,11 +1955,10 @@ static int drm_ioctl_prime_fd_to_handle(vfs_file_t* drm_f, uint64_t arg) {
         drm_res3d_t* r = res3d_alloc_slot(dst, &h);
         if (!r) return -ENOMEM;
         r->res_id = db->res_id; r->width = db->width; r->height = db->height;
-        r->format = db->format; r->bytes = db->bytes; r->phys = db->phys;
-        r->order = db->order; r->borrowed = 1;
-        res_host_ref(r->res_id);   // borrowed clone holds its own reference too
-        for (uint32_t i = 0; i < db->bytes / 4096u; i++)
-            pmm_ref_inc(db->phys + (phys_addr_t)i * 4096u);
+        r->format = db->format; r->bytes = db->bytes; r->backing = db->backing;
+        r->borrowed = 1;
+        res_host_ref(r->res_id);   // borrowed clone holds its own resource ref...
+        shmem_ref(db->backing);    // ...and its own scatter-gather backing ref
         a.handle = h;
         if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) {
             res3d_free(r);   // borrowed: ref_decs pages, does NOT unref host res
@@ -1951,13 +1979,11 @@ static int drm_ioctl_prime_fd_to_handle(vfs_file_t* drm_f, uint64_t arg) {
     nd->pitch       = db->width * 4u;
     nd->size        = (uint64_t)db->bytes;
     nd->vgpu_res_id = 0;
-    nd->phys        = db->phys;
+    nd->backing     = db->backing;
     nd->bytes_alloc = db->bytes;
-    nd->order       = db->order;
     nd->next        = dst->dumbs;
     dst->dumbs      = nd;
-    for (uint32_t i = 0; i < db->bytes / 4096u; i++)
-        pmm_ref_inc(db->phys + (phys_addr_t)i * 4096u);
+    shmem_ref(db->backing);   // the clone holds its own ref on the shared backing
 
     a.handle = nd->handle;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
@@ -2457,8 +2483,7 @@ typedef struct {
     // can't return them to the buddy allocator while the device scans
     // them out.
     uint32_t cursor_res;       // device resource id (0 = none)
-    phys_addr_t cursor_phys;   // backing phys the res aliases (cache key)
-    uint32_t cursor_pin_pages; // pages we pmm_ref_inc'd (drop on re-mint)
+    shmem_t* cursor_backing;   // backing the res aliases: cache key + shmem_ref holder
     uint32_t cursor_w, cursor_h;
     uint32_t hot_x, hot_y;
     int32_t  cur_x, cur_y;   // last position (UPDATE_CURSOR needs it)
@@ -2679,14 +2704,14 @@ static int drm_ioctl_mode_getfb(vfs_file_t* self, uint64_t arg) {
     // the same backing — hand it back rather than minting a duplicate.
     drm_dumb_t* d = find_dumb(c, fb->handle);
     uint32_t out_handle;
-    if (d && d->phys == fb->phys) {
+    if (d && d->backing == fb->backing) {
         out_handle = d->handle;
     } else {
-        // Mint a new handle around the fb's backing pages.  No
-        // independent virtio-gpu resource (vgpu_res_id=0): the handle
-        // exists for SetCursor/mmap-style consumers, not scan-out —
-        // the fb keeps its own resource.  Page refs taken here are
-        // dropped by the GEM_CLOSE the caller owes us (dumb_free).
+        // Mint a new handle around the fb's backing.  No independent virtio-gpu
+        // resource (vgpu_res_id=0): the handle exists for SetCursor/mmap-style
+        // consumers, not scan-out — the fb keeps its own resource.  The backing
+        // ref taken here is dropped by the GEM_CLOSE the caller owes us
+        // (dumb_free -> shmem_unref).
         if (drm_charge(g_current, fb->bytes_alloc) != 0) return -ENOMEM;
         drm_dumb_t* nd = (drm_dumb_t*)kmalloc(sizeof(*nd));
         if (!nd) { drm_uncharge(g_current, fb->bytes_alloc); return -ENOMEM; }
@@ -2696,11 +2721,9 @@ static int drm_ioctl_mode_getfb(vfs_file_t* self, uint64_t arg) {
         nd->pitch       = fb->pitch;
         nd->size        = (uint64_t)fb->pitch * fb->height;
         nd->vgpu_res_id = 0;
-        nd->phys        = fb->phys;
+        nd->backing     = fb->backing;
         nd->bytes_alloc = fb->bytes_alloc;
-        nd->order       = fb->order;
-        for (uint32_t i = 0; i < nd->bytes_alloc / 4096u; i++)
-            pmm_ref_inc(nd->phys + (phys_addr_t)i * 4096u);
+        shmem_ref(fb->backing);   // the minted handle holds its own backing ref
         nd->next = c->dumbs;
         c->dumbs = nd;
         out_handle = nd->handle;
@@ -2750,11 +2773,9 @@ static void cursor_drop_alias(const drm_backend_ops_t* b, drm_crtc_state_t* cs) 
     // A borrowed res3d cursor's resource is owned by the res3d -- never destroy
     // it here (that would pull it out from under the res3d); just unbind.
     if (!cs->cursor_borrowed && b) b->resource_destroy(cs->cursor_res);
-    for (uint32_t i = 0; i < cs->cursor_pin_pages; i++)
-        pmm_ref_dec(cs->cursor_phys + (phys_addr_t)i * 4096u);
+    if (cs->cursor_backing) shmem_unref(cs->cursor_backing);
     cs->cursor_res       = 0;
-    cs->cursor_phys      = 0;
-    cs->cursor_pin_pages = 0;
+    cs->cursor_backing   = NULL;
     cs->cursor_latched   = 0;
     cs->cursor_borrowed  = 0;
 }
@@ -2814,10 +2835,11 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
         uint64_t cur_bytes;
         if (!drm_cursor_bytes(a.width, a.height, (uint64_t)r->bytes, &cur_bytes))
             return -EINVAL;
-        // (Re)mint the 2D ARGB alias over the now-populated backing when the phys
-        // or dimensions change; keep it across re-binds of the same buffer.
+        (void)cur_bytes;   // size validation only; backing ref'd as a unit
+        // (Re)mint the 2D ARGB alias over the now-populated backing when the
+        // backing or dimensions change; keep it across re-binds of the same buffer.
         if (cs->cursor_res &&
-            (cs->cursor_phys != r->phys ||
+            (cs->cursor_backing != r->backing ||
              cs->cursor_w != a.width || cs->cursor_h != a.height))
             cursor_drop_alias(b, cs);
         if (!cs->cursor_res) {
@@ -2825,18 +2847,17 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
             if (b->resource_create(id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
                                    a.width, a.height) != 0)
                 return -EIO;
-            if (b->resource_attach_backing(id, r->phys, r->bytes) != 0) {
+            if (!drm_backing_attach(id, r->backing)) {
                 b->resource_destroy(id);
                 return -EIO;
             }
-            uint32_t pages = (uint32_t)((cur_bytes + 4095u) / 4096u);
-            for (uint32_t i = 0; i < pages; i++)
-                pmm_ref_inc(r->phys + (phys_addr_t)i * 4096u);
-            cs->cursor_res       = id;
-            cs->cursor_phys      = r->phys;
-            cs->cursor_pin_pages = pages;
+            // Hold a ref on the aliased backing so the source buffer's pinned
+            // pages can't be freed while the cursor sprite is latched.
+            shmem_ref(r->backing);
+            cs->cursor_res      = id;
+            cs->cursor_backing  = r->backing;
             cs->cursor_w = a.width; cs->cursor_h = a.height;
-            cs->cursor_borrowed  = 0;
+            cs->cursor_borrowed = 0;
         }
         if (has_hotspot) { cs->hot_x = (uint32_t)a.hot_x; cs->hot_y = (uint32_t)a.hot_y; }
         // Push the freshly-downloaded pixels to the device cursor resource + bind.
@@ -2859,8 +2880,10 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
     // a fresh GETFB handle for the same pages (that per-commit churn was
     // the flicker).  Keyed on phys → cache hits every frame in motion and
     // when static, so the latched cursor is never destroyed mid-display.
+    (void)cur_bytes;   // drm_cursor_bytes above is the size validation; the
+                       // whole backing is ref'd as a unit (object-level).
     if (cs->cursor_res &&
-        (cs->cursor_phys != d->phys ||
+        (cs->cursor_backing != d->backing ||
          cs->cursor_w != a.width || cs->cursor_h != a.height))
         cursor_drop_alias(b, cs);
 
@@ -2871,22 +2894,18 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
         if (b->resource_create(id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
                                a.width, a.height) != 0)
             return -EIO;
-        if (b->resource_attach_backing(id, d->phys, d->bytes_alloc) != 0) {
+        if (!drm_backing_attach(id, d->backing)) {
             b->resource_destroy(id);
             return -EIO;
         }
-        // Pin the pages the device scans out for this cursor (own ref,
-        // like an fb) so the per-commit close of the transient GETFB
-        // handle — and the eventual cursor-BO teardown — can't return
-        // them to the buddy allocator while the alias is still latched.
-        uint32_t pages = (uint32_t)((cur_bytes + 4095u) / 4096u);
-        for (uint32_t i = 0; i < pages; i++)
-            pmm_ref_inc(d->phys + (phys_addr_t)i * 4096u);
-        cs->cursor_res       = id;
-        cs->cursor_phys      = d->phys;
-        cs->cursor_pin_pages = pages;
-        cs->cursor_w         = a.width;
-        cs->cursor_h         = a.height;
+        // Hold a ref on the aliased backing (like an fb) so the per-commit close
+        // of the transient GETFB handle — and the eventual cursor-BO teardown —
+        // can't free its pinned pages while the alias is still latched.
+        shmem_ref(d->backing);
+        cs->cursor_res     = id;
+        cs->cursor_backing = d->backing;
+        cs->cursor_w       = a.width;
+        cs->cursor_h       = a.height;
     }
     uint8_t hot_changed = 0;
     if (has_hotspot && ((uint32_t)a.hot_x != cs->hot_x ||
@@ -2941,7 +2960,7 @@ static int drm_atomic_apply_cursor(vfs_file_t* f, uint32_t idx, uint32_t fb_id,
     uint32_t w = fb->width, h = fb->height;
 
     // Same sprite already latched -> just move it (host keeps the sprite).
-    if (cs->cursor_latched && cs->cursor_phys == fb->phys &&
+    if (cs->cursor_latched && cs->cursor_backing == fb->backing &&
         cs->cursor_w == w && cs->cursor_h == h)
         return b->cursor_move(idx, x, y);
 
@@ -2952,21 +2971,20 @@ static int drm_atomic_apply_cursor(vfs_file_t* f, uint32_t idx, uint32_t fb_id,
 
     uint64_t cur_bytes;
     if (!drm_cursor_bytes(w, h, (uint64_t)fb->bytes_alloc, &cur_bytes)) return -EINVAL;
+    (void)cur_bytes;   // size validation only; backing ref'd as a unit
     if (cs->cursor_res &&
-        (cs->cursor_phys != fb->phys || cs->cursor_w != w || cs->cursor_h != h))
+        (cs->cursor_backing != fb->backing || cs->cursor_w != w || cs->cursor_h != h))
         cursor_drop_alias(b, cs);
     if (!cs->cursor_res) {
         uint32_t id = alloc_res_id();
         if (b->resource_create(id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, w, h) != 0)
             return -EIO;
-        if (b->resource_attach_backing(id, fb->phys, fb->bytes_alloc) != 0) {
+        if (!drm_backing_attach(id, fb->backing)) {
             b->resource_destroy(id);
             return -EIO;
         }
-        uint32_t pages = (uint32_t)((cur_bytes + 4095u) / 4096u);
-        for (uint32_t i = 0; i < pages; i++)
-            pmm_ref_inc(fb->phys + (phys_addr_t)i * 4096u);
-        cs->cursor_res = id; cs->cursor_phys = fb->phys; cs->cursor_pin_pages = pages;
+        shmem_ref(fb->backing);   // survive the source buffer's teardown while latched
+        cs->cursor_res = id; cs->cursor_backing = fb->backing;
         cs->cursor_w = w; cs->cursor_h = h; cs->cursor_borrowed = 0;
     }
     if (b->resource_transfer(cs->cursor_res, w, h) != 0) return -EIO;
@@ -3198,24 +3216,24 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
     uint64_t size64 = a.size ? a.size : (uint64_t)stride * a.height;
     if (size64 == 0 || size64 > (64u << 20)) return -EINVAL;
     uint64_t pages = (size64 + 4095) / 4096;
-    uint8_t order = 0; while (((uint64_t)1 << order) < pages) order++;
-    uint32_t bytes = (uint32_t)((uint64_t)1 << order) * 4096u;
+    uint32_t bytes = (uint32_t)(pages * 4096u);   // page-rounded (no power-of-2 waste)
 
     rc = drm_charge(g_current, bytes);
     if (rc < 0) return rc;
-    phys_addr_t phys = pmm_buddy_alloc(order);
-    if (phys == PMM_INVALID_ADDR) { drm_uncharge(g_current, bytes); return -ENOMEM; }
-    __builtin_memset((void*)((uintptr_t)phys + HHDM_OFFSET), 0, bytes);
+    // Scatter-gather DMA backing: scattered, pinned, fully-resident pages (no
+    // physical-contiguity requirement, zeroed on alloc).
+    shmem_t* shm = shmem_create_dma((uint32_t)pages);
+    if (!shm) { drm_uncharge(g_current, bytes); return -ENOMEM; }
 
     uint32_t res_id = alloc_res_id();
     rc = virtio_gpu_3d_resource_create(res_id, a.target, a.format, a.bind,
                                        a.width, a.height, a.depth ? a.depth : 1,
                                        a.array_size, a.last_level, a.nr_samples);
-    if (rc == 0 && !virtio_gpu_resource_attach_backing_single(res_id, phys, bytes)) rc = -EIO;
+    if (rc == 0 && !drm_backing_attach(res_id, shm)) rc = -EIO;
     if (rc == 0) rc = virtio_gpu_3d_ctx_attach_resource(c->virgl_ctx_id, res_id);
     if (rc != 0) {
         virtio_gpu_resource_unref(res_id);
-        pmm_buddy_free(phys, order); drm_uncharge(g_current, bytes);
+        shmem_unref(shm); drm_uncharge(g_current, bytes);
         return rc;
     }
 
@@ -3223,11 +3241,11 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
     // (grows on demand; a grow-OOM does not burn a handle number).
     uint32_t h;
     drm_res3d_t* r = res3d_alloc_slot(c, &h);
-    if (!r) { virtio_gpu_resource_unref(res_id); pmm_buddy_free(phys, order);
+    if (!r) { virtio_gpu_resource_unref(res_id); shmem_unref(shm);
               drm_uncharge(g_current, bytes); return -ENOMEM; }
     r->res_id = res_id; r->width = a.width; r->height = a.height;
     res_host_ref(res_id);   // owner holds the first reference on the host resource
-    r->format = a.format; r->bytes = bytes; r->phys = phys; r->order = order;
+    r->format = a.format; r->bytes = bytes; r->backing = shm;
 
     a.bo_handle = h; a.res_handle = res_id; a.size = (uint32_t)size64; a.stride = stride;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
