@@ -260,10 +260,10 @@ void drm_budget_selftest(void) {
 #define DRM_IOCTL_MODE_OBJ_SETPROPERTY      0xC01864BA  // 24B
 #define DRM_IOCTL_MODE_CURSOR               0xC01C64A3  // 28B
 #define DRM_IOCTL_MODE_CURSOR2              0xC02464BB  // 36B
-// Master + lease — both stubbed.  Returning -EACCES from AUTH_MAGIC
-// makes libdrm's drmIsMaster() report "not master", steering wlroots'
-// reopen_drm_node() straight to plain-open instead of the lease path.
-// CREATE_LEASE returns -EOPNOTSUPP so callers that bypass drmIsMaster
+// Master + lease.  AUTH_MAGIC returns -EINVAL for magic==0 and 0 for any
+// non-zero token; libdrm's drmIsMaster() infers "master" iff drmAuthMagic(fd,0)
+// does NOT return -EACCES, so -EINVAL reports every (single-client) open as
+// master.  CREATE_LEASE returns -EOPNOTSUPP so callers that bypass drmIsMaster
 // fall back gracefully rather than aborting.
 #define DRM_IOCTL_AUTH_MAGIC                0x40046411
 #define DRM_IOCTL_GET_MAGIC                 0x80046402

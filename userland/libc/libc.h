@@ -104,10 +104,11 @@ typedef uint32_t           socklen_t;
 #define _IOFBF      0
 #define _IOLBF      1
 #define _IONBF      2
-#define LOCALEDIR   "/usr/share/locale"
-#ifndef PACKAGE
-#define PACKAGE     "bash"
-#endif
+// NOTE: PACKAGE / LOCALEDIR (gettext message-catalog identity) were removed
+// from this shared header -- they are per-program autoconf identity and do not
+// belong in the system libc.  A program that uses gettext (e.g. a local bash
+// build) must define its own PACKAGE/LOCALEDIR via its build (-DPACKAGE=...),
+// exactly as upstream autoconf does.
 
 #define NULL ((void*)0)
 #define EXIT_SUCCESS 0

@@ -595,3 +595,36 @@ The original debt writeup, for history:
   contiguous, correctly sized, and correctly attached; the 16x16 round-trip
   selftest proves the mechanism. Contiguity is a scaling problem, not a
   correctness one here.
+
+---
+
+## 15. libiconv is an identity-only stub (UTF-8/ASCII passthrough)
+
+- **What**: the ported `iconv` (`userland/compat/linux/libiconv/iconv.c`, formerly
+  heredoc'd in `scripts/port-libiconv.sh`) accepts only UTF-8/ASCII aliases and
+  does a bounded `memcpy`; `iconv_open` returns EINVAL for any real charset.  No
+  transcoding.
+- **Where**: `userland/compat/linux/libiconv/`.
+- **Scale failure**: any GLib/gettext consumer converting a non-UTF-8 charset
+  (legacy locale data, some font/text pipelines, file names in other encodings)
+  gets EINVAL or wrong bytes.  Fine while everything is UTF-8; breaks the moment a
+  real conversion is needed.
+- **Target**: a real charset-conversion primitive -- port GNU libiconv, or a
+  shared MakaOS converter table -- exposed as the general Linux `iconv` surface.
+- **Blocking order**: independent; do when a port needs non-UTF-8 conversion.
+
+## 16. libdrm device enumeration is a synthesized single device
+
+- **What**: `scripts/port-libdrm.sh` Python-patches `drmGetDevice2` /
+  `drmGetDevices2` / `drmGetDeviceFromDevId` to return ONE hardcoded virtio-gpu
+  device (PCI `0x1af4:0x1050`, bus `0000:00:04.0`, nodes card0 + renderD128)
+  instead of enumerating real devices.
+- **Where**: `scripts/port-libdrm.sh` (the `makaos_synth_virtio_device` patch).
+- **Scale failure**: multi-GPU (iGPU + dGPU), a different PCI slot, or any
+  non-virtio DRM device is invisible; the PCI IDs are wrong for real hardware.
+  Mesa/libdrm see exactly one fixed device.
+- **Target**: real enumeration via the **same kernel device registry as #2
+  (libudev)** -- both want "list the devices + their bus topology + IDs".  libdrm
+  becomes a thin client of that registry.
+- **Blocking order**: kernel device registry (shared with #2), then rewrite the
+  three enumerators as registry queries instead of a synth patch.
