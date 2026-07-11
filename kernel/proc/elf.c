@@ -757,15 +757,16 @@ static task_t* elf_build_task(phys_addr_t pml4, mm_t* mm, uint32_t pid,
     t->sigstate.pending   = 0;
     t->sigstate.blocked   = 0;
     t->sigstate.sigframe_rsp = 0;
-    // exec resets all caught signals to SIG_DFL (POSIX).  The task_t was
-    // freshly allocated, so handlers[] is otherwise slab poison (0x5aa5..) --
-    // leaving it makes signal_setup_frame read poison as a "handler" and
-    // force-SIGKILL the process the moment ANY signal is delivered for an
-    // unregistered slot (e.g. SIGCHLD when a child exits).  That was the
-    // silent killer of sway/svcmgr/login behind the desktop presentation
-    // stall: a compositor died as soon as a helper (swaybg, status cmd,
-    // config `exec`) exited.  Fresh-zeroed pages masked it intermittently.
-    __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
+    // Fresh per-process signal dispositions (all SIG_DFL), refcounted and
+    // shared across any threads this image later spawns.  A NULL here (OOM)
+    // must abort the build: the first signal path derefs t->sighand, and a
+    // slab-poison "handler" would force-SIGKILL the process on the very first
+    // signal (this was the silent killer of sway/svcmgr/login behind the
+    // desktop stall -- a compositor died the moment a helper exited/SIGCHLD'd).
+    t->sighand = sighand_alloc();
+    if (!t->sighand) {
+        task_files_release(files); task_mm_release(tmm); kfree(t); return NULL;
+    }
     // exec also resets these per-task fields, which the elf.c exec paths
     // previously left as slab garbage (a drift from process.c's task init):
     //   cleartid_addr -- a garbage value makes exit write 0 to a wild futex
@@ -939,12 +940,13 @@ void task_init_selftest(void) {
     if (t->on_cpu != 0)        fails++;
     if (t->syscall_a5 != 0 || t->syscall_a6 != 0) fails++;
     if (t->kthread_ctx != NULL) fails++;
-    // sigstate reset: pending/blocked/frame clear + handlers all zeroed.
+    // sigstate reset: pending/blocked/frame clear + a fresh all-SIG_DFL sighand.
     if (t->sigstate.pending != 0 || t->sigstate.blocked != 0) fails++;
     if (t->sigstate.sigframe_rsp != 0) fails++;
-    {
-        const volatile uint8_t* hb = (const volatile uint8_t*)&t->sigstate.handlers;
-        for (unsigned i = 0; i < sizeof(t->sigstate.handlers); i++)
+    if (!t->sighand) fails++;
+    else {
+        const volatile uint8_t* hb = (const volatile uint8_t*)&t->sighand->handlers;
+        for (unsigned i = 0; i < sizeof(t->sighand->handlers); i++)
             if (hb[i] != 0) { fails++; break; }
     }
     // Misc scalars.
@@ -971,6 +973,7 @@ void task_init_selftest(void) {
     kstack_free(t->kstack_top);
     task_mm_release(t->mm_shared);
     task_files_release(t->files_shared);
+    sighand_release(t->sighand);
     kfree(t->cwd);
     unveil_free(&t->unveil);
     kfree(t);

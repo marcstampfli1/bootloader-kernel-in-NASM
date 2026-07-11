@@ -50,7 +50,7 @@ static int64_t pipe_read(vfs_file_t* self, void* buf, uint64_t len) {
 
             WAIT_EVENT_HOOK(self->waitq,
                             p->count != 0 || p->writer_refs == 0,
-                            if (signal_has_actionable(&g_current->sigstate)) {
+                            if (signal_has_actionable(&g_current->sigstate, g_current->sighand)) {
                                 if (total > 0) return (int64_t)total;
                                 return (int64_t)-EINTR;
                             });
@@ -83,7 +83,7 @@ static int deliver_sigpipe(void) {
     uint32_t bit = 1u << (SIGPIPE - 1);
     // Suppressed: blocked mask or SIG_IGN handler.
     if (ss->blocked & bit) return 0;
-    if (ss->handlers[SIGPIPE].sa_handler == (uint64_t)SIG_IGN) return 0;
+    if (g_current->sighand->handlers[SIGPIPE].sa_handler == (uint64_t)SIG_IGN) return 0;
     serial_puts_dbg("[pipe] SIGPIPE → pid=");
     serial_hex_dbg((uint64_t)g_current->pid);
     signal_send(g_current, SIGPIPE);
@@ -117,7 +117,7 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
         if (full) {
             WAIT_EVENT_HOOK(self->waitq,
                             p->count != PIPE_BUF_SIZE || p->reader_refs == 0,
-                            if (signal_has_actionable(&g_current->sigstate)) {
+                            if (signal_has_actionable(&g_current->sigstate, g_current->sighand)) {
                                 if (total > 0) return (int64_t)total;
                                 return (int64_t)-EINTR;
                             });

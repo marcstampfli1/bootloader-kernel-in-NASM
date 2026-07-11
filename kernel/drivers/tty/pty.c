@@ -251,7 +251,7 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
     if (mb_empty(pty) && !pty->slave_open_count) return 0; // EOF
     WAIT_EVENT_HOOK(&pty->master_waitq,
                     !mb_empty(pty) || !pty->slave_open_count,
-                    if (signal_has_actionable(&g_current->sigstate))
+                    if (signal_has_actionable(&g_current->sigstate, g_current->sighand))
                         return -4 /*EINTR*/;);
     if (mb_empty(pty)) return 0;  // woke on EOF
 
@@ -353,7 +353,7 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
     if (tty->rd_head == tty->rd_tail && !ctx->pty->master_open) return 0; // EOF
     WAIT_EVENT_HOOK(&tty->waitq,
                     tty->rd_head != tty->rd_tail || !ctx->pty->master_open,
-                    if (signal_has_actionable(&g_current->sigstate))
+                    if (signal_has_actionable(&g_current->sigstate, g_current->sighand))
                         return -4 /*EINTR*/;);
     if (tty->rd_head == tty->rd_tail) return 0;  // woke on EOF
 

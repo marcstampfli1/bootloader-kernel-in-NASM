@@ -123,7 +123,7 @@ int ksec_request(const ksec_request_t* req, ksec_response_t* resp) {
     while (!slot->done) {
         spin_unlock(&s_ksec_lock);
         sched_sleep();
-        if (signal_has_actionable(&g_current->sigstate)) {
+        if (signal_has_actionable(&g_current->sigstate, g_current->sighand)) {
             spin_lock(&s_ksec_lock);
             slot->seq = 0; slot->waiter = NULL;
             spin_unlock(&s_ksec_lock);

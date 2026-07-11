@@ -388,7 +388,7 @@ static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     // since the signal stays queued until signal_deliver_pending runs.
     WAIT_EVENT_HOOK(&tty->waitq,
                     !rb_empty(tty->rd_head, tty->rd_tail),
-                    if (signal_has_actionable(&g_current->sigstate))
+                    if (signal_has_actionable(&g_current->sigstate, g_current->sighand))
                         return -4 /*EINTR*/;);
 
     // Drain under the per-tty lock via the shared cooked-byte path.

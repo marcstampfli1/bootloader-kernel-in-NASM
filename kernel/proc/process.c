@@ -335,12 +335,11 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->cleartid_addr     = 0;
     t->drm_bytes_charged = 0;
     t->drm_priority      = 0;
-    // Zero the whole handlers[] array.  task_t comes out of kmalloc
-    // uninitialised, so handlers[].sa_handler could hold slab garbage.
-    // On first signal delivery the kernel would treat that garbage as
-    // a canonical user pointer and iretq into non-canonical memory,
-    // #GP'ing the kernel.  SIG_DFL == 0 is exactly what memset gives us.
-    __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
+    // Signal dispositions live in a refcounted, thread-group-shared sighand_t
+    // (POSIX: per-process).  Allocate a fresh table (all SIG_DFL).  Best-effort
+    // here (this fn is void); the caller MUST verify t->sighand != NULL and
+    // abort task creation on failure, else the first signal path derefs NULL.
+    t->sighand = sighand_alloc();
     t->umask            = 0022u; // default umask: rwxr-xr-x
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
@@ -418,6 +417,9 @@ task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
     // They don't do userspace I/O; any kernel-side printing goes direct to fb.
 
     task_init_common(t, pid, TASK_FLAG_KTHREAD, mm, files);
+    if (!t->sighand) {   // sighand_alloc OOM: undo files + mm + t
+        task_files_release(files); task_mm_release(mm); kfree(t); return NULL;
+    }
 
     virt_addr_t kstack_top = kstack_alloc();
     t->kstack_top = kstack_top;
@@ -482,6 +484,9 @@ task_t* task_create_user(phys_addr_t code_phys, uint32_t code_pages, uint32_t pi
     mm->brk       = heap_start;
 
     task_init_common(t, pid, 0, tmm, files);
+    if (!t->sighand) {   // sighand_alloc OOM: undo files + mm + t
+        task_files_release(files); task_mm_release(tmm); kfree(t); return NULL;
+    }
 
     virt_addr_t kstack_top = kstack_alloc();
     t->kstack_top = kstack_top;
@@ -535,6 +540,7 @@ static void task_free_rcu(void* data) {
     kstack_free(t->kstack_top);
     task_mm_release(t->mm_shared);
     task_files_release(t->files_shared);
+    sighand_release(t->sighand);   // drop this thread's ref; free at group exit
     kfree(t->cwd);
     unveil_free(&t->unveil);
     // Disown any signalfd that still references this task (an inherited or
@@ -786,15 +792,16 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     t->mlfq_ticks_left  = 0;
     t->wake_pending     = 0;
     t->sigstate.pending = 0;
-    // fork(): inherit the parent's signal mask and sigactions, matching
-    // POSIX.  exec() later clears user handlers back to SIG_DFL (see
-    // sys_exec).  Copy the whole handlers array so sa_mask/sa_flags
-    // come with; signum 0 is never used but copying it is free.
+    // fork(): inherit the parent's signal mask, and take a PRIVATE COPY of the
+    // parent's dispositions (POSIX: the child is a new process, not a thread, so
+    // it does NOT share the handler table).  exec() later resets caught handlers
+    // to SIG_DFL (see sys_exec).
     t->sigstate.blocked = parent->sigstate.blocked;
     t->sigstate.sigframe_rsp = 0;
-    __builtin_memcpy(t->sigstate.handlers,
-                     parent->sigstate.handlers,
-                     sizeof(t->sigstate.handlers));
+    t->sighand = sighand_copy(parent->sighand);
+    if (!t->sighand) {   // OOM: unwind the child's files + mm + task_t
+        task_files_release(files); task_mm_release(tmm); kfree(t); return NULL;
+    }
     // signalfd subscribers are per-task; child starts with none (parent's
     // signalfds stay on the parent).  Linux fork() does the same — fds
     // are duplicated in the fd table but each signalfd's wait_queue list

@@ -8,6 +8,33 @@
 #include "fb.h"
 #include "errno.h"   // ESRCH (signal_send_pid)
 #include "uaccess.h" // _access_ok: shared user-range validator (was sig_user_range_ok)
+#include "kheap.h"   // kmalloc/kfree (sighand_t lifecycle)
+
+// ── sighand_t lifecycle (shared per-process signal disposition table) ──────
+// Refcounted, allocated on the kernel heap.  A thread group shares one; fork
+// copies; exit releases.  See signal.h for the sharing contract.
+sighand_t* sighand_alloc(void) {
+    sighand_t* sh = kmalloc(sizeof(sighand_t));
+    if (!sh) return NULL;
+    sh->refs = 1;
+    __builtin_memset(sh->handlers, 0, sizeof(sh->handlers));   // all SIG_DFL
+    return sh;
+}
+
+sighand_t* sighand_copy(const sighand_t* src) {
+    sighand_t* sh = kmalloc(sizeof(sighand_t));
+    if (!sh) return NULL;
+    sh->refs = 1;
+    if (src) __builtin_memcpy(sh->handlers, src->handlers, sizeof(sh->handlers));
+    else     __builtin_memset(sh->handlers, 0, sizeof(sh->handlers));
+    return sh;
+}
+
+void sighand_release(sighand_t* sh) {
+    if (!sh) return;
+    if (__atomic_sub_fetch(&sh->refs, 1, __ATOMIC_ACQ_REL) == 0)
+        kfree(sh);
+}
 
 // ── Saved user context access ────────────────────────────────────────────
 // The authoritative copy of a syscall's saved user registers lives on
@@ -222,7 +249,7 @@ static void signal_force_kill(int sig, const char* why, uint64_t rsp, uint64_t f
     kprintf("[signal] %s kill: comm=\"%s\" sig=%d kf_rsp=%p frame=%p\n",
             why, g_current->comm, sig, (void*)rsp, (void*)fb);
     atomic_or(&g_current->sigstate.pending, 1u << (uint32_t)(SIGKILL - 1));
-    g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
+    g_current->sighand->handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
 }
 
 // SA_SIGINFO delivery: build a Linux-style rt_sigframe { pretcode, ucontext,
@@ -474,7 +501,7 @@ int signal_fault_deliverable(struct task_t* t, int sig) {
     if (!t || sig < 1 || sig >= NSIG) return 0;
     if (((task_t*)t)->flags & TASK_FLAG_KTHREAD) return 0;
     const sigstate_t* ss = &((task_t*)t)->sigstate;
-    uint64_t h = ss->handlers[sig].sa_handler;
+    uint64_t h = ((task_t*)t)->sighand->handlers[sig].sa_handler;
     if (h == (uint64_t)SIG_DFL || h == (uint64_t)SIG_IGN) return 0;
     if (ss->blocked & (1u << (uint32_t)(sig - 1))) return 0;
     return 1;
@@ -483,7 +510,7 @@ int signal_fault_deliverable(struct task_t* t, int sig) {
 void signal_deliver_fault(int sig, interrupt_frame_t* f) {
     if (!g_current || sig < 1 || sig >= NSIG) return;
     sigstate_t* ss = &g_current->sigstate;
-    k_sigaction_t* ka = &ss->handlers[sig];
+    k_sigaction_t* ka = &g_current->sighand->handlers[sig];
     uint32_t bit = 1u << (uint32_t)(sig - 1);
 
     // Not deliverable (SIG_DFL / SIG_IGN / blocked / kthread): a synchronous
@@ -543,7 +570,7 @@ void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax) {
     // Clear the pending bit atomically before dispatching.
     atomic_clear_bit(&ss->pending, (unsigned)bit);
 
-    k_sigaction_t* ka = &ss->handlers[sig < NSIG ? sig : 0];
+    k_sigaction_t* ka = &g_current->sighand->handlers[sig < NSIG ? sig : 0];
     uint64_t handler = (sig < NSIG) ? ka->sa_handler : (uint64_t)SIG_DFL;
 
     // SIG_IGN: silently discard.

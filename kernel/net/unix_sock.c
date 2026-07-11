@@ -1047,7 +1047,7 @@ vfs_file_t* unix_sock_accept(vfs_file_t* f) {
         WAIT_EVENT_HOOK(&listener->waitq,
                         listener->backlog_head != NULL
                             || listener->state != UNIX_STATE_LISTENING,
-                        if (signal_has_actionable(&g_current->sigstate))
+                        if (signal_has_actionable(&g_current->sigstate, g_current->sighand))
                             return NULL;);
         if (listener->state != UNIX_STATE_LISTENING) return NULL;
 
@@ -1227,7 +1227,7 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
     // EINTR path below.
     WAIT_EVENT_HOOK(&s->waitq,
                     s->state != UNIX_STATE_CONNECTING,
-                    if (signal_has_actionable(&g_current->sigstate)) {
+                    if (signal_has_actionable(&g_current->sigstate, g_current->sighand)) {
                         // Claim the bail UNDER s_unix_pair_lock (same lock accept
                         // claims with, so the two cannot interleave).  If we are
                         // still CONNECTING we win -> mark DISCONNECTED and return
@@ -1314,7 +1314,7 @@ int unix_sock_send_ex(vfs_file_t* f, const void* buf, uint32_t len,
                                 peer->buf_count < UNIX_BUF_SIZE
                                     || !s->peer
                                     || s->state == UNIX_STATE_DISCONNECTED,
-                                if (signal_has_actionable(&g_current->sigstate)) {
+                                if (signal_has_actionable(&g_current->sigstate, g_current->sighand)) {
                                     ret = total > 0 ? (int)total : -EINTR;
                                     goto stream_out;
                                 });
@@ -1355,7 +1355,7 @@ int unix_sock_recv_ex(vfs_file_t* f, void* buf, uint32_t len, int nonblock) {
             WAIT_EVENT_HOOK(&s->waitq,
                             s->buf_count != 0
                                 || s->state == UNIX_STATE_DISCONNECTED,
-                            if (signal_has_actionable(&g_current->sigstate))
+                            if (signal_has_actionable(&g_current->sigstate, g_current->sighand))
                                 return -EINTR;);
             if (s->buf_count == 0) return 0; // EOF
         }
@@ -1395,7 +1395,7 @@ int unix_sock_recv_ex(vfs_file_t* f, void* buf, uint32_t len, int nonblock) {
         WAIT_EVENT_HOOK(&s->waitq,
                         s->dgram_head != NULL
                             || s->state == UNIX_STATE_DISCONNECTED,
-                        if (signal_has_actionable(&g_current->sigstate))
+                        if (signal_has_actionable(&g_current->sigstate, g_current->sighand))
                             return -EINTR;);
         if (!s->dgram_head) return 0;
     }
@@ -1594,7 +1594,7 @@ vfs_file_t* unix_sock_recvfd(vfs_file_t* sock) {
         WAIT_EVENT_HOOK(&s->waitq,
                         anc->count != 0
                             || (s->state == UNIX_STATE_DISCONNECTED && !s->peer),
-                        if (signal_has_actionable(&g_current->sigstate))
+                        if (signal_has_actionable(&g_current->sigstate, g_current->sighand))
                             return NULL;);
         if (anc->count == 0) return NULL;
     }

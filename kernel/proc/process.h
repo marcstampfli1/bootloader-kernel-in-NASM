@@ -126,6 +126,9 @@ typedef struct __attribute__((aligned(16))) task_t {
 
     task_mm_t*    mm_shared;     // ref-counted address space (never NULL)
     task_files_t* files_shared;  // ref-counted fd table    (never NULL)
+    sighand_t*    sighand;       // ref-counted signal dispositions, shared
+                                 // across a thread group (never NULL on a live
+                                 // task; POSIX per-process handler table)
 
     cpu_ctx_t     ctx;
     virt_addr_t   kstack_top;

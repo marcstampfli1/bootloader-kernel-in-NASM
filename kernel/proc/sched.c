@@ -483,6 +483,12 @@ void task_idx_tgid_walk(uint32_t tgid, void (*cb)(task_t*, void*), void* data) {
 // below are treated as read-only by every CPU's idle task.
 static task_mm_t    s_idle_mm    = { .pml4_phys = 0, .mm = NULL, .refs = 1 };
 static task_files_t s_idle_files = { .ft = NULL, .lock = SPINLOCK_INIT, .refs = 1 };
+// Shared, never-freed signal-disposition table for every per-CPU idle task.
+// Idle tasks are kernel threads that never receive signals, but every task
+// must have a non-NULL sighand (signal paths deref it).  refs=1 pins it; idle
+// tasks are permanent (never task_free_rcu'd), so it is never released.
+// BSS default = all handlers SIG_DFL.
+static sighand_t    s_idle_sighand = { .refs = 1 };
 
 extern void proc_trampoline(void);  // kernel/arch/x86_64/process_ctx_switch.asm
 
@@ -665,6 +671,7 @@ void sched_init_idle_for_cpu(uint32_t id) {
     idle->state        = TASK_RUNNING;
     idle->mm_shared    = &s_idle_mm;
     idle->files_shared = &s_idle_files;
+    idle->sighand      = &s_idle_sighand;
     idle->home_cpu     = id;
     idle->last_ran_cpu = id;
     __builtin_memcpy(idle->comm, "idle", 5);

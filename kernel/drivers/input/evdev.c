@@ -285,7 +285,7 @@ static int64_t evdev_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
         // overwrote c->reader is left intact.
         flags = spin_lock_irqsave(&d->lock);
         if (c->reader == g_current) c->reader = NULL;
-        if (signal_has_actionable(&g_current->sigstate)) {
+        if (signal_has_actionable(&g_current->sigstate, g_current->sighand)) {
             spin_unlock_irqrestore(&d->lock, flags);
             return -EINTR;
         }

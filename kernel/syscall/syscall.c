@@ -1185,12 +1185,15 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
                          g_current->pid, cuid, cgid);
     }
 
-    // Reset signal handlers to SIG_DFL (POSIX: exec clears custom handlers).
+    // Reset signal handlers to SIG_DFL (POSIX: exec clears CAUGHT handlers but
+    // keeps SIG_IGN dispositions).  Operate on the shared sighand in place: after
+    // execve the process is single-threaded (sibling stacks vanish with the old
+    // address space, and those threads self-reap, dropping their sighand refs).
     for (int si = 0; si < NSIG; si++) {
-        if (g_current->sigstate.handlers[si].sa_handler > SIG_IGN)
-            g_current->sigstate.handlers[si].sa_handler = SIG_DFL;
-        g_current->sigstate.handlers[si].sa_mask  = 0;
-        g_current->sigstate.handlers[si].sa_flags = 0;
+        if (g_current->sighand->handlers[si].sa_handler > SIG_IGN)
+            g_current->sighand->handlers[si].sa_handler = SIG_DFL;
+        g_current->sighand->handlers[si].sa_mask  = 0;
+        g_current->sighand->handlers[si].sa_flags = 0;
     }
     // Unblock all signals (POSIX: exec resets the signal mask).
     g_current->sigstate.blocked = 0;
@@ -1631,13 +1634,24 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
     t->sigstate.pending = 0;
-    // spawn() creates a fresh program image — SIG_DFL everywhere, empty
-    // mask.  SIG_DFL == 0, so a memset of handlers[] is the init.  Not
-    // doing this left handlers[] as slab garbage, which later faulted
-    // iretq with a non-canonical rip on first signal delivery.
     t->sigstate.blocked = 0;
     t->sigstate.sigframe_rsp = 0;
-    __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
+    // Signal dispositions (POSIX: per-process).  A pthread (shares the address
+    // space) SHARES the process's disposition table so a handler any thread
+    // installs is visible to all -- the JVM depends on this.  A non-SHARE_MM
+    // thread is a fresh process-like image, so it gets a private COPY (fork-like).
+    if (flags & THREAD_SHARE_MM) {
+        t->sighand = g_current->sighand;
+        __atomic_add_fetch(&t->sighand->refs, 1, __ATOMIC_RELAXED);
+    } else {
+        t->sighand = sighand_copy(g_current->sighand);
+        if (!t->sighand) {
+            task_files_release(t->files_shared);
+            task_mm_release(t->mm_shared);
+            pid_free(t->pid); kfree(t);
+            return (uint64_t)-ENOMEM;
+        }
+    }
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
     // Threads inherit the spawner's TLS pointer only as a placeholder —
@@ -2338,7 +2352,7 @@ static uint64_t sys_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t oldact_pt
     // signal_deliver_fault (build the frame from the exception trap frame).
     if (sig == SIGKILL || sig == SIGSTOP) return (uint64_t)-EINVAL;
 
-    k_sigaction_t* ka = &g_current->sigstate.handlers[sig];
+    k_sigaction_t* ka = &g_current->sighand->handlers[sig];
 
     if (oldact_ptr) {
         k_sigaction_t snap = *ka;  // atomic-enough copy for !SMP-writer

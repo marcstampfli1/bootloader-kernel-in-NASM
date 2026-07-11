@@ -110,7 +110,7 @@ int64_t futex_wait(uint32_t* uaddr, uint32_t val, uint64_t timeout_ns) {
     int64_t rc = 0;
 
     while (!__atomic_load_n(&w.woken, __ATOMIC_ACQUIRE)) {
-        if (signal_has_actionable(&g_current->sigstate)) { rc = -EINTR; break; }
+        if (signal_has_actionable(&g_current->sigstate, g_current->sighand)) { rc = -EINTR; break; }
         if (deadline) {
             uint64_t now = tsc_read_ns();
             if (now >= deadline) { rc = -ETIMEDOUT; break; }

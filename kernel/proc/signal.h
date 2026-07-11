@@ -164,13 +164,25 @@ _Static_assert(__builtin_offsetof(k_rt_sigframe_t, uc) == 8, "uc after pretcode"
 typedef struct {
     volatile uint32_t pending;           // bitmap of pending signals (1<<(sig-1))
     uint32_t          blocked;           // bitmap of blocked signals
-    k_sigaction_t     handlers[NSIG];    // per-signal user action (0 = SIG_DFL)
     uint64_t          sigframe_rsp;      // address of the frame on the user stack
     uint64_t          fault_addr;        // CR2 of the last user #PF -> siginfo.si_addr
     uint8_t           siginfo_frame;     // 1 = last delivery built an rt_sigframe
                                          // (SA_SIGINFO); sys_sigreturn restores from
                                          // its ucontext instead of the sigframe_t
 } sigstate_t;
+
+// ── Per-PROCESS signal dispositions (shared across a thread group) ─────────
+// POSIX: sigaction() dispositions are per-PROCESS, not per-thread.  Every thread
+// of a process shares ONE handler table (unlike the per-thread pending/blocked
+// masks in sigstate_t).  Refcounted and shared exactly like task_mm_t /
+// task_files_t: a pthread (sys_thread THREAD_SHARE_MM) bumps refs and shares;
+// fork copies; exec resets; exit releases.  So a handler one thread installs is
+// visible to all -- the JVM installs SIGSEGV/SIGFPE handlers in one thread that
+// every mutator thread must honour.  Never NULL on a live task.
+typedef struct {
+    uint32_t      refs;                  // refcount (atomic add/sub)
+    k_sigaction_t handlers[NSIG];        // per-signal user action (0 = SIG_DFL)
+} sighand_t;
 
 // ── Neutral interrupted-context capture ───────────────────────────────────
 // A signal frame is built from the interrupted user register state, which can
@@ -223,6 +235,15 @@ void signal_deliver_fault(int sig, struct interrupt_frame_t* f);
 // uses this to suppress its PF-KILL banner for a deliverable fault.
 int signal_fault_deliverable(struct task_t* t, int sig);
 
+// ── sighand_t lifecycle (shared per-process disposition table) ────────────
+// alloc: fresh table, all SIG_DFL, refs=1.  copy: fresh table (refs=1) with the
+// source's handlers duplicated (fork / non-shared thread).  release: drop a
+// ref, free at 0.  Sharing between threads is a plain atomic refs++ at the call
+// site (mirrors mm_shared / files_shared).
+sighand_t* sighand_alloc(void);
+sighand_t* sighand_copy(const sighand_t* src);
+void       sighand_release(sighand_t* sh);
+
 // Mask of signals whose POSIX SIG_DFL action is "ignore".  If one of these
 // is pending with SIG_DFL, signal_deliver_pending silently drops it and
 // blocking syscalls must NOT return EINTR for it (that was the SIGCHLD
@@ -231,7 +252,9 @@ int signal_fault_deliverable(struct task_t* t, int sig);
 
 // Returns 1 if there is a pending signal that would actually interrupt a
 // blocking syscall (has a user handler, or SIG_DFL with non-ignore default).
-static inline int signal_has_actionable(const sigstate_t* ss) {
+// Takes both the per-thread sigstate (pending/blocked) and the per-process
+// sighand (dispositions), which now live in separate structs.
+static inline int signal_has_actionable(const sigstate_t* ss, const sighand_t* sh) {
     uint32_t eff = ss->pending & ~ss->blocked;
     if (!eff) return 0;
     // A bit is actionable iff its handler is not SIG_IGN and it's not a
@@ -241,7 +264,7 @@ static inline int signal_has_actionable(const sigstate_t* ss) {
         int bit = __builtin_ctz(mask);
         mask &= mask - 1;
         int sig = bit + 1;
-        uint64_t h = ss->handlers[sig].sa_handler;
+        uint64_t h = sh->handlers[sig].sa_handler;
         if (h == (uint64_t)SIG_IGN) continue;
         if (h == (uint64_t)SIG_DFL && (SIG_DFL_IGNORE_MASK & (1u << bit))) continue;
         return 1;
