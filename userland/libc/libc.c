@@ -14,7 +14,17 @@
 // poisoned every multithreaded port: one thread's failed open changed
 // another thread's error-handling branch).  Lives in .tbss; crt0 sets
 // up the TLS block before anything can touch it.
+//
+// POSIX makes `errno` a MACRO (*__errno_location()) -- see errno.h -- so that
+// system-header `#ifndef errno` fallback guards (e.g. libgcc's tsystem.h) work
+// instead of colliding with a bare `__thread int errno` declaration.  The
+// STORAGE below keeps the symbol name `errno`, so every already-compiled port
+// that references the TLS symbol directly still links (no ABI break, no
+// re-port).  This TU defines the storage + the accessor, so it must see the
+// real symbol, not the macro -- #undef it here.
+#undef errno
 __thread int errno;
+int* __errno_location(void) { return &errno; }
 
 // glibc-ism: argv[0] split into "/path/to/prog" and "prog".  Several
 // upstream ports (systemd, libinput, elfutils, util-linux) log

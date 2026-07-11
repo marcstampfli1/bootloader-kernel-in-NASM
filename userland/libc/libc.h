@@ -24,8 +24,11 @@
 #define E2BIG        7
 #define EPIPE       32
 
-// ── errno global ──────────────────────────────────────────────────────────
-extern __thread int errno;
+// ── errno (POSIX macro over a per-thread int; see errno.h / libc.c) ─────────
+int* __errno_location(void);
+#ifndef errno
+#define errno (*__errno_location())
+#endif
 
 // ── Basic types ───────────────────────────────────────────────────────────
 typedef unsigned char      uint8_t;
@@ -2060,11 +2063,8 @@ int __libc_start_main(int (*main)(int, char**, char**),
                       void (*init)(void), void (*fini)(void),
                       void (*rtld_fini)(void), void* stack_end);
 
-// __errno_location — glibc's way of getting &errno (used by -D_REENTRANT code)
-static inline int* __errno_location(void) {
-    extern __thread int errno;
-    return &errno;
-}
+// __errno_location is declared once with the errno macro above (a real libc
+// function, so the errno macro cannot recurse into an inline body).
 
 // pselect — like select but with sigset mask and timespec
 static inline int pselect(int nfds, fd_set* r, fd_set* w, fd_set* e,

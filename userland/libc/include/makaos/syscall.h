@@ -169,7 +169,10 @@ static inline uint64_t syscall0(uint64_t nr) {
 
 // -errno decode: negative kernel return → set errno + return -1; positive
 // → pass through unchanged.
-extern __thread int errno;
+int* __errno_location(void);
+#ifndef errno
+#define errno (*__errno_location())
+#endif
 static inline long __syscall_ret(uint64_t r) {
     long s = (long)r;
     if (s < 0 && s > -4096) { errno = (int)-s; return -1; }
