@@ -89,3 +89,45 @@ piece (it is correct POSIX signal handling regardless of the JVM).
 - OpenJDK's build system cross-compiling to a novel target is finicky (expect
   `--openjdk-target`, a bootstrap JDK on the host, and configure hacking).
 - Latent glibc-specific assumptions surfacing one at a time.
+
+---
+
+## Update (2026-07-11): recon done, ordering confirmed, Phase-0 design locked
+
+Avian recon (source cloned to build/third_party/avian; host `javac 25` + `java`
+present; zlib/make/g++ present) found that **Avian's own posix.cpp uses
+`SA_SIGINFO` + `ucontext`** (`src/system/posix.cpp:653` sets `sa_flags=SA_SIGINFO`;
+`:965` casts the 3rd arg to `ucontext_t*`) to coordinate its stop-the-world GC
+(signal a thread, read its ucontext to walk the stack) and for SEGV null-checks.
+So the signal layer is NOT skippable for Avian -- it **is** "the missing stuff,"
+and it's the same as the OpenJDK Phase 0.  Confirmed order: **signal layer ->
+Avian -> OpenJDK.**
+
+Missing-stuff checklist (verified):
+- [x] libc `<ucontext.h>` -- glibc-layout `ucontext_t`/`mcontext_t`/`gregs[REG_*]`
+      (done: userland/libc/include/ucontext.h).
+- [ ] Kernel: `SA_SIGINFO` delivery -- evolve `signal_setup_frame`
+      (kernel/proc/signal.c) toward a Linux-style rt_sigframe:
+        1. On the user stack lay out `{ siginfo_t info; ucontext_t uc; }` below
+           the red zone (16-aligned), plus the restorer return address.
+        2. Populate `info` (si_signo, si_code, and si_addr = fault CR2 for
+           SIGSEGV/SIGBUS) and `uc.uc_mcontext.gregs[]` from the interrupted
+           context (map the existing sigframe register set into gregs order),
+           and copy the FXSAVE area into uc's fpregs.
+        3. Set `kf->rdi=sig`, `kf->rsi=&info`, `kf->rdx=&uc` (SA_SIGINFO ABI);
+           for a non-SIGINFO handler rsi/rdx are harmless.
+        4. `sys_sigreturn` restores rip/rsp/rflags/GPRs/fpu **from uc.uc_mcontext**
+           (NOT a separate saved frame) so a handler's edit to gregs[REG_RIP]
+           (JVM resume-past-fault) takes effect.  Keep all the existing frame
+           validation (range/handler/VMA checks).
+        5. Selftest: install a SIGSEGV SA_SIGINFO handler, deref NULL, in the
+           handler read si_addr==0 and advance gregs[REG_RIP] past the faulting
+           instruction; verify execution resumes (proves the JVM mechanism).
+- [ ] `pthread_kill` + a kernel per-thread signal syscall (tkill/tgkill-style)
+      -- Avian GC signals a specific thread.
+- [ ] `sigaltstack` (libc + kernel) -- SIGSEGV on an alt stack for stack-overflow.
+
+Then Phase 1: add a `scripts/port-avian.sh` that cross-builds Avian via its
+posix layer as `platform=linux` with `cxx/cc/ranlib` overridden to the makaos
+toolchain + `--sysroot`, host `javac` for the classpath/bootimage, and iterate
+on remaining missing libc symbols.
