@@ -39,6 +39,7 @@
 #define SIG_SETMASK  2
 
 // ── sigaction flags ───────────────────────────────────────────────────────
+#define SA_SIGINFO   0x00000004  // 3-arg handler: (int, siginfo_t*, ucontext_t*)
 #define SA_RESTORER  0x04000000  // sa_restorer field is valid
 
 // ── Per-signal kernel action ──────────────────────────────────────────────
@@ -90,6 +91,62 @@ typedef struct __attribute__((aligned(16))) {
     uint8_t  fpu[512] __attribute__((aligned(16)));
 } sigframe_t;
 
+// ── rt_sigframe (SA_SIGINFO delivery) ─────────────────────────────────────
+// Laid out on the user stack for a SA_SIGINFO handler.  MUST match userland
+// <ucontext.h> + <signal.h> byte-for-byte -- the handler reads
+// uc.uc_mcontext.gregs[REG_*] and info.si_* through those headers.  The kernel
+// populates it from the interrupted context and, on sys_sigreturn, restores
+// FROM the (possibly handler-modified) ucontext, so a JVM's edit to
+// gregs[REG_RIP] resumes execution there.  NO aligned(16) on __fpregs_mem: the
+// offset must match userland exactly; 16-byte fxsave alignment is guaranteed by
+// placing the frame at frame_base ≡ 8 (mod 16) in signal_setup_frame.
+
+// gregs index order (glibc x86-64) -- MUST match userland ucontext.h REG_*.
+enum {
+    KREG_R8=0, KREG_R9, KREG_R10, KREG_R11, KREG_R12, KREG_R13, KREG_R14, KREG_R15,
+    KREG_RDI, KREG_RSI, KREG_RBP, KREG_RBX, KREG_RDX, KREG_RAX, KREG_RCX, KREG_RSP,
+    KREG_RIP, KREG_EFL, KREG_CSGSFS, KREG_ERR, KREG_TRAPNO, KREG_OLDMASK, KREG_CR2
+};
+
+typedef struct {
+    int   si_signo, si_errno, si_code;
+    int   si_pid, si_uid, si_status;
+    void* si_addr;
+    int   si_value;
+} k_siginfo_t;
+
+typedef struct {
+    long long          gregs[23];
+    void*              fpregs;
+    unsigned long long __reserved1[8];
+} k_mcontext_t;
+
+typedef struct { void* ss_sp; int ss_flags; unsigned long ss_size; } k_stack_t;
+
+typedef struct k_ucontext {
+    unsigned long        uc_flags;
+    struct k_ucontext*   uc_link;
+    k_stack_t            uc_stack;
+    k_mcontext_t         uc_mcontext;
+    unsigned long        uc_sigmask;
+    uint8_t              __fpregs_mem[512];
+} k_ucontext_t;
+
+// On the user stack (low->high): [pretcode][uc][info].  rsp -> pretcode
+// (handler return address = restorer); rdi=sig, rsi=&info, rdx=&uc.
+typedef struct {
+    uint64_t     pretcode;
+    k_ucontext_t uc;
+    k_siginfo_t  info;
+} k_rt_sigframe_t;
+
+_Static_assert(__builtin_offsetof(k_mcontext_t, gregs) == 0, "gregs at mcontext+0");
+_Static_assert(__builtin_offsetof(k_ucontext_t, uc_mcontext) == 40, "uc_mcontext@40");
+_Static_assert(__builtin_offsetof(k_ucontext_t, __fpregs_mem) == 304, "fpregs_mem@304");
+_Static_assert(__builtin_offsetof(k_rt_sigframe_t, uc) == 8, "uc after pretcode");
+// gregs[KREG_RIP] absolute offset within k_rt_sigframe_t must be 8-mod-16-safe
+// once frame_base ≡ 8 (mod 16); the fpstate lands at frame_base+312 ≡ 0 (mod 16).
+
 // ── Per-task signal state (embedded in task_t) ────────────────────────────
 //
 // Pending signals are represented as a bitmap: bit (sig-1) in `pending` is
@@ -108,12 +165,35 @@ typedef struct {
     volatile uint32_t pending;           // bitmap of pending signals (1<<(sig-1))
     uint32_t          blocked;           // bitmap of blocked signals
     k_sigaction_t     handlers[NSIG];    // per-signal user action (0 = SIG_DFL)
-    uint64_t          sigframe_rsp;      // address of sigframe_t on user stack
+    uint64_t          sigframe_rsp;      // address of the frame on the user stack
+    uint64_t          fault_addr;        // CR2 of the last user #PF -> siginfo.si_addr
+    uint8_t           siginfo_frame;     // 1 = last delivery built an rt_sigframe
+                                         // (SA_SIGINFO); sys_sigreturn restores from
+                                         // its ucontext instead of the sigframe_t
 } sigstate_t;
+
+// ── Neutral interrupted-context capture ───────────────────────────────────
+// A signal frame is built from the interrupted user register state, which can
+// come from EITHER a syscall kframe (syscall-return delivery) or an exception
+// trap frame (synchronous-fault delivery).  sig_uctx_t decouples the frame
+// builder from the source; sig_redirect_t is the handler-entry context the
+// builder produces, which the caller loads into whichever return frame it owns.
+// One shared builder, so the two delivery paths cannot drift.
+typedef struct {
+    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rip, rsp, rflags;
+} sig_uctx_t;
+
+typedef struct {
+    uint64_t rip, rsp, rflags;   // handler entry point + stack + flags
+    uint64_t rdi, rsi, rdx;      // SysV handler args: sig, &siginfo, &ucontext
+} sig_redirect_t;
 
 // ── API ───────────────────────────────────────────────────────────────────
 
 struct task_t;
+struct interrupt_frame_t;
 
 void signal_send(struct task_t* t, int sig);
 void signal_send_group(uint32_t tgid, int sig);
@@ -128,6 +208,20 @@ int  signal_may(const struct task_t* sender, const struct task_t* target);
 int  signal_send_pid_user(struct task_t* sender, uint32_t pid, int sig);
 void signal_send_pgrp_user(struct task_t* sender, uint32_t pgid, int sig);
 void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax);
+
+// Deliver `sig` raised by a synchronous CPU exception (page fault, #DE, #UD,
+// #GP, ...) to the faulting task.  If a catchable user handler is installed and
+// the signal is unblocked, builds the signal frame on the user stack and
+// redirects the trap frame (via `f`) into the handler so it runs on iretq --
+// the JVM's SIGSEGV null-check / SIGFPE div-by-zero resume mechanism.  Otherwise
+// (SIG_DFL / SIG_IGN / blocked) forces the default action and terminates: a
+// synchronous fault cannot be ignored, since returning would re-fault forever.
+void signal_deliver_fault(int sig, struct interrupt_frame_t* f);
+
+// True iff a synchronous-fault `sig` would be delivered to a user handler
+// (installed, catchable, unblocked) rather than terminating `t`.  The #PF path
+// uses this to suppress its PF-KILL banner for a deliverable fault.
+int signal_fault_deliverable(struct task_t* t, int sig);
 
 // Mask of signals whose POSIX SIG_DFL action is "ignore".  If one of these
 // is pending with SIG_DFL, signal_deliver_pending silently drops it and

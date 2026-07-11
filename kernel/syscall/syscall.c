@@ -2331,7 +2331,12 @@ static inline int sigaction_addr_ok(uint64_t a) {
 
 static uint64_t sys_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t oldact_ptr) {
     if (sig < 1 || sig >= NSIG) return (uint64_t)-EINVAL;
-    if (sig == SIGKILL || sig == SIGSEGV) return (uint64_t)-EINVAL;
+    // POSIX: only SIGKILL and SIGSTOP are uncatchable.  SIGSEGV/SIGBUS/SIGFPE/
+    // SIGILL/SIGTRAP ARE catchable — a JVM installs a SIGSEGV handler for its
+    // null-check / safepoint and a SIGFPE handler for integer div-by-zero.
+    // Synchronous-fault delivery to those handlers is handled by
+    // signal_deliver_fault (build the frame from the exception trap frame).
+    if (sig == SIGKILL || sig == SIGSTOP) return (uint64_t)-EINVAL;
 
     k_sigaction_t* ka = &g_current->sigstate.handlers[sig];
 
@@ -2393,6 +2398,41 @@ static uint64_t sys_sigreturn(void) {
     uint64_t frame_base = g_current->sigstate.sigframe_rsp;
 
     if (!frame_base) return (uint64_t)-EINVAL;
+
+    // SA_SIGINFO delivery: restore FROM the rt_sigframe's ucontext, so a handler
+    // that edited uc.uc_mcontext.gregs (a JVM advancing REG_RIP past a faulting
+    // instruction, or changing REG_RSP) resumes with those values.
+    if (g_current->sigstate.siginfo_frame) {
+        k_rt_sigframe_t rf;
+        if (copy_from_user(&rf, (const void*)frame_base, sizeof(rf)) != 0)
+            return (uint64_t)-EFAULT;
+        long long* g = rf.uc.uc_mcontext.gregs;
+        uint64_t rip = (uint64_t)g[KREG_RIP], rsp = (uint64_t)g[KREG_RSP];
+        if (rip >= USER_ADDR_CEIL || rsp >= USER_ADDR_CEIL)
+            return (uint64_t)-EINVAL;
+        syscall_kframe_t* kf = SYSCALL_KFRAME(g_current);
+        kf->rip = rip; kf->rsp = rsp;
+        kf->rflags = ((uint64_t)g[KREG_EFL] & 0xCD5) | 0x202;
+        kf->rbp = (uint64_t)g[KREG_RBP]; kf->rbx = (uint64_t)g[KREG_RBX];
+        kf->r12 = (uint64_t)g[KREG_R12]; kf->r13 = (uint64_t)g[KREG_R13];
+        kf->r14 = (uint64_t)g[KREG_R14]; kf->r15 = (uint64_t)g[KREG_R15];
+        kf->rdi = (uint64_t)g[KREG_RDI]; kf->rsi = (uint64_t)g[KREG_RSI];
+        kf->rdx = (uint64_t)g[KREG_RDX]; kf->r10 = (uint64_t)g[KREG_R10];
+        kf->r8  = (uint64_t)g[KREG_R8];  kf->r9  = (uint64_t)g[KREG_R9];
+        g_current->sigstate.blocked =
+            (uint32_t)rf.uc.uc_sigmask & ~(1u << (SIGKILL - 1));
+        g_current->sigstate.sigframe_rsp  = 0;
+        g_current->sigstate.siginfo_frame = 0;
+        // fxrstor needs a 16-aligned operand; rf.uc.__fpregs_mem sits at an
+        // 8-misaligned offset within the frame, so bounce it through an aligned
+        // local (this function carries force_align_arg_pointer, so the local is
+        // truly 16-aligned).  Sanitize MXCSR (reserved bits would #GP fxrstor).
+        uint8_t fpbuf[512] __attribute__((aligned(16)));
+        __builtin_memcpy(fpbuf, rf.uc.__fpregs_mem, sizeof(fpbuf));
+        *(uint32_t*)(fpbuf + 24) &= 0x0000FFBFu;
+        __asm__ volatile("fxrstor %0" : : "m"(fpbuf));
+        return (uint64_t)g[KREG_RAX];
+    }
 
     // Copy the sigframe out of user space with full validation.  If we
     // dereferenced the user pointer directly, a corrupted sigframe_rsp

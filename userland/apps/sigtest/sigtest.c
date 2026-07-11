@@ -1,0 +1,83 @@
+// sigtest — verifies both signal-delivery paths the JVM (and the whole desktop)
+// depend on:
+//
+//   1. Syscall-return delivery: an SA_SIGINFO handler for an asynchronous signal
+//      (SIGUSR1 via raise()) runs, then sigreturn restores the interrupted
+//      context so execution continues normally.  This exercises the refactored
+//      signal_setup_frame -> build_rt_frame -> sys_sigreturn round trip.
+//
+//   2. Synchronous-fault delivery: an SA_SIGINFO handler for SIGSEGV catches a
+//      NULL dereference (#PF), reads siginfo.si_addr, and rewrites
+//      uc_mcontext.gregs[REG_RIP] to a recovery point.  On sigreturn the kernel
+//      restores RIP from the (edited) ucontext, so execution resumes at
+//      recovery() instead of re-faulting.  This is the JVM null-check mechanism
+//      and exercises signal_deliver_fault (build the frame from the trap frame).
+#include <signal.h>
+#include <ucontext.h>
+#include <stdint.h>
+#include <unistd.h>
+
+static void out(const char* s) { write(1, s, (size_t)__builtin_strlen(s)); }
+
+// ── Path 1: syscall-return delivery (async SIGUSR1) ───────────────────────
+static volatile int   g_usr1_ran   = 0;
+static volatile int   g_usr1_signo = 0;
+
+static void usr1_handler(int sig, siginfo_t* info, void* ctx) {
+    (void)sig; (void)ctx;
+    g_usr1_signo = info->si_signo;
+    g_usr1_ran   = 1;
+    // Return normally: the kernel must restore the pre-signal context so raise()
+    // resumes and returns to main.
+}
+
+// ── Path 2: synchronous-fault delivery (SIGSEGV on NULL) ──────────────────
+static volatile int   g_si_addr_ok = 0;
+
+static void recovery(void) {
+    out(g_si_addr_ok ? "[sigtest] PASS: SA_SIGINFO delivered, si_addr==NULL, "
+                       "gregs[REG_RIP] redirect resumed here\n"
+                     : "[sigtest] FAIL: si_addr mismatch\n");
+    _exit(g_si_addr_ok ? 0 : 1);
+}
+
+static void segv_handler(int sig, siginfo_t* info, void* ctx) {
+    (void)sig;
+    ucontext_t* uc = (ucontext_t*)ctx;
+    g_si_addr_ok = (info->si_addr == (void*)0);
+    // Redirect resumption to recovery(): proves the kernel restores RIP from the
+    // handler-edited ucontext (the JVM resume-past-fault mechanism).
+    uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&recovery;
+}
+
+int main(void) {
+    struct sigaction sa;
+
+    // ── Path 1: async signal via the syscall-return path ──────────────────
+    __builtin_memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = usr1_handler;
+    sa.sa_flags     = SA_SIGINFO;
+    if (sigaction(SIGUSR1, &sa, 0) != 0) { out("[sigtest] FAIL: sigaction(SIGUSR1)\n"); return 1; }
+
+    out("[sigtest] raising SIGUSR1 (syscall-return delivery)...\n");
+    raise(SIGUSR1);   // delivered on this syscall's return path; handler runs, returns
+    if (!g_usr1_ran || g_usr1_signo != SIGUSR1) {
+        out("[sigtest] FAIL: SIGUSR1 handler did not run / bad si_signo\n");
+        return 1;
+    }
+    // Reaching here proves sigreturn restored the interrupted context intact.
+    out("[sigtest] OK: syscall-path SA_SIGINFO delivered + resumed\n");
+
+    // ── Path 2: synchronous fault via the trap-frame path ─────────────────
+    __builtin_memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = segv_handler;
+    sa.sa_flags     = SA_SIGINFO;
+    if (sigaction(SIGSEGV, &sa, 0) != 0) { out("[sigtest] FAIL: sigaction(SIGSEGV)\n"); return 1; }
+
+    out("[sigtest] triggering NULL deref...\n");
+    volatile int* p = (volatile int*)0;
+    *p = 42;                       // SIGSEGV -> handler -> redirect to recovery()
+
+    out("[sigtest] FAIL: fell through after fault\n");  // never reached
+    return 1;
+}

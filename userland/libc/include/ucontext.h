@@ -10,6 +10,18 @@
 #include <stdint.h>
 #include <signal.h>
 
+// stack_t (POSIX signal/alt-stack descriptor); also used by sigaltstack.
+#ifndef _STACK_T_DEFINED
+#define _STACK_T_DEFINED
+typedef struct {
+    void*         ss_sp;
+    int           ss_flags;
+    unsigned long ss_size;
+} stack_t;
+#define SS_ONSTACK 1
+#define SS_DISABLE  2
+#endif
+
 // gregs[] index names -- MUST match the glibc x86-64 order exactly, because
 // ported code indexes gregs[REG_RIP] etc. by these values.
 enum {

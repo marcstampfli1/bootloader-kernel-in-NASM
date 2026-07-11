@@ -1,4 +1,5 @@
 #include "signal.h"
+#include "idt.h"       // trap_frame_t, interrupt_frame_t, TRAP_FROM_IFRAME (fault delivery)
 #include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "process.h"
 #include "sched.h"
@@ -214,141 +215,196 @@ void signal_send_pid_selftest(void) {
 // sig_user_range_ok that hand-reimplemented it; consolidated so the signal
 // path can never drift weaker than the syscall path.
 
-static void signal_setup_frame(int sig, k_sigaction_t* ka, uint64_t saved_rax) {
-    // Per-task saved user context — survives mid-syscall CPU migration.
-    syscall_kframe_t* kf = SYSCALL_KFRAME(g_current);
-    uint64_t user_rsp = kf->rsp;
+// Force-queue SIGKILL and take the SIG_DFL terminate path (used when the user
+// stack for a frame is unusable).  Mirrors the inline kills in the frame path.
+static void signal_force_kill(int sig, const char* why, uint64_t rsp, uint64_t fb) {
+    extern void kprintf(const char*, ...);
+    kprintf("[signal] %s kill: comm=\"%s\" sig=%d kf_rsp=%p frame=%p\n",
+            why, g_current->comm, sig, (void*)rsp, (void*)fb);
+    atomic_or(&g_current->sigstate.pending, 1u << (uint32_t)(SIGKILL - 1));
+    g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
+}
+
+// SA_SIGINFO delivery: build a Linux-style rt_sigframe { pretcode, ucontext,
+// siginfo } on the user stack from the interrupted context *src, populate the
+// ucontext gregs + si_addr from the fault, and produce the handler-entry
+// redirect in *redir (rdi=sig, rsi=&info, rdx=&uc).  sys_sigreturn restores
+// FROM uc.uc_mcontext (honouring handler edits to gregs[REG_RIP] -- the JVM
+// resume-past-fault mechanism).  Source-neutral: *src is filled from either a
+// syscall kframe or an exception trap frame, so both delivery paths share this
+// one builder and cannot drift.  Returns 0 on success, -1 if it force-killed
+// the task (unusable user stack); the caller then takes the terminate path.
+static int build_rt_frame(int sig, k_sigaction_t* ka,
+                          const sig_uctx_t* src, sig_redirect_t* redir) {
+    uint64_t user_rsp = src->rsp;
+
+    // frame_base ≡ 8 (mod 16): 16-align the floor below the red zone, then -8,
+    // so at handler entry rsp%16==8 (SysV) AND the embedded fpstate at
+    // frame_base+312 is 16-aligned for fxsave/fxrstor.
+    uint64_t frame_base =
+        ((user_rsp - 128 - sizeof(k_rt_sigframe_t)) & ~(uint64_t)0xF) - 8;
+
+    if (!_access_ok(frame_base - 8, sizeof(k_rt_sigframe_t) + 8)) {
+        signal_force_kill(sig, "rt RANGE", user_rsp, frame_base); return -1;
+    }
+    if (ka->sa_handler == 0 || ka->sa_handler >= USER_ADDR_CEIL ||
+        ka->sa_restorer == 0 || ka->sa_restorer >= USER_ADDR_CEIL) {
+        signal_force_kill(sig, "rt HANDLER", user_rsp, frame_base); return -1;
+    }
+    {
+        extern vma_t* mm_vma_find(mm_t*, virt_addr_t);
+        mm_t* mm = g_current->mm_shared->mm;
+        rcu_read_lock();
+        int covered = mm && mm_vma_find(mm, frame_base - 8) &&
+                      mm_vma_find(mm, frame_base + sizeof(k_rt_sigframe_t) - 1);
+        rcu_read_unlock();
+        if (!covered) { signal_force_kill(sig, "rt VMA", user_rsp, frame_base); return -1; }
+    }
+
+    k_rt_sigframe_t* rf = (k_rt_sigframe_t*)frame_base;
+    uint64_t fault = g_current->sigstate.fault_addr;
+
+    // siginfo
+    rf->info.si_signo  = sig;
+    rf->info.si_errno  = 0;
+    rf->info.si_code   = 0;               // SI_KERNEL-ish; refine per-signal later
+    rf->info.si_pid    = 0;
+    rf->info.si_uid    = 0;
+    rf->info.si_status = 0;
+    rf->info.si_addr   = (sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE ||
+                          sig == SIGILL || sig == SIGTRAP)
+                         ? (void*)fault : (void*)0;
+    rf->info.si_value  = 0;
+
+    // ucontext
+    rf->uc.uc_flags = 0;
+    rf->uc.uc_link  = 0;
+    rf->uc.uc_stack.ss_sp = 0; rf->uc.uc_stack.ss_flags = 2 /*SS_DISABLE*/;
+    rf->uc.uc_stack.ss_size = 0;
+    long long* g = rf->uc.uc_mcontext.gregs;
+    g[KREG_RIP] = (long long)src->rip;
+    g[KREG_RSP] = (long long)user_rsp;
+    g[KREG_EFL] = (long long)src->rflags;
+    g[KREG_RBP] = (long long)src->rbp;  g[KREG_RBX] = (long long)src->rbx;
+    g[KREG_R12] = (long long)src->r12;  g[KREG_R13] = (long long)src->r13;
+    g[KREG_R14] = (long long)src->r14;  g[KREG_R15] = (long long)src->r15;
+    g[KREG_RDI] = (long long)src->rdi;  g[KREG_RSI] = (long long)src->rsi;
+    g[KREG_RDX] = (long long)src->rdx;  g[KREG_R10] = (long long)src->r10;
+    g[KREG_R8]  = (long long)src->r8;   g[KREG_R9]  = (long long)src->r9;
+    g[KREG_RAX] = (long long)src->rax;
+    // rcx/r11 are captured from an exception trap frame; from a syscall kframe
+    // they are clobbered by `syscall` and the filler leaves them zero.
+    g[KREG_RCX] = (long long)src->rcx; g[KREG_R11] = (long long)src->r11;
+    g[KREG_CR2] = (long long)fault;
+    g[KREG_CSGSFS] = 0; g[KREG_ERR] = 0; g[KREG_TRAPNO] = 0; g[KREG_OLDMASK] = 0;
+    rf->uc.uc_mcontext.fpregs = (void*)&rf->uc.__fpregs_mem;
+    __asm__ volatile("fxsave %0" : "=m"(rf->uc.__fpregs_mem));  // 16-aligned by construction
+    rf->uc.uc_sigmask = g_current->sigstate.blocked;
+
+    rf->pretcode = ka->sa_restorer;      // handler's return address -> restorer -> sigreturn
+
+    g_current->sigstate.sigframe_rsp  = frame_base;
+    g_current->sigstate.siginfo_frame = 1;
+
+    atomic_or(&g_current->sigstate.blocked, 1u << (uint32_t)(sig - 1));
+    atomic_or(&g_current->sigstate.blocked, ka->sa_mask);
+
+    redir->rip    = ka->sa_handler;
+    redir->rsp    = frame_base;              // points at pretcode
+    redir->rflags = 0x202;
+    redir->rdi    = (uint64_t)(uint32_t)sig;
+    redir->rsi    = (uint64_t)&rf->info;
+    redir->rdx    = (uint64_t)&rf->uc;
+    return 0;
+}
+
+// Non-SA_SIGINFO delivery: the proven simple sigframe_t.  Same source/redirect
+// contract as build_rt_frame.  rsi/rdx are echoed unchanged into *redir -- the
+// 1-arg handler only takes the signum in rdi, and the interrupted rsi/rdx are
+// saved in the frame and restored on sigreturn, so the redirect must not
+// disturb them (applying redir->rsi/rdx to the source frame is then a no-op).
+static int build_simple_frame(int sig, k_sigaction_t* ka,
+                              const sig_uctx_t* src, sig_redirect_t* redir) {
+    g_current->sigstate.siginfo_frame = 0;
+    uint64_t user_rsp = src->rsp;
 
     // Skip the 128-byte red zone, then place the sigframe below it,
     // 16-byte aligned as required for stack-passed arguments.
     uint64_t frame_base = (user_rsp - 128 - sizeof(sigframe_t))
                             & ~(uint64_t)0xF;
 
-    // Validate: the whole [frame_base-8, user_rsp) window must live in
-    // the user half.  If user_rsp is garbage (e.g. a buggy handler
-    // clobbered it before raising another signal), writing the sigframe
-    // would clobber kernel memory.  Kill the task with SIGSEGV instead.
+    // Validate: the whole [frame_base-8, user_rsp) window must live in the user
+    // half.  If user_rsp is garbage (e.g. a buggy handler clobbered it before
+    // raising another signal), writing the sigframe would clobber kernel
+    // memory.  force_kill queues SIGKILL + SIG_DFL and we return -1; the caller
+    // takes the terminate path.
     if (!_access_ok(frame_base - 8, sizeof(sigframe_t) + 8)) {
-        // Force-queue SIGKILL for the next delivery cycle.  We can't
-        // kill the task inline from here — the terminate block below
-        // is the only safe place (drops fds, reparents children,
-        // zombifies), and it wants a fall-through, not a nested call.
-        // Leaving the signal pending-with-no-handler means the next
-        // signal_deliver_pending takes the SIG_DFL-terminate path.
-        extern void kprintf(const char*, ...);
-        kprintf("[signal] setup_frame RANGE kill: comm=\"%s\" sig=%d "
-                "kf_rsp=%p frame=%p\n",
-                g_current->comm, sig, (void*)user_rsp, (void*)frame_base);
-        atomic_or(&g_current->sigstate.pending,
-                  1u << (uint32_t)(SIGKILL - 1));
-        g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
-        return;
+        signal_force_kill(sig, "setup_frame RANGE", user_rsp, frame_base); return -1;
     }
 
-    /* Handler / restorer validation.
-     *
-     * Both must be canonical user pointers (< USER_ADDR_CEIL = 2^47).
-     * Additionally, sa_handler must be non-zero — a zero handler means
-     * "SIG_DFL" by POSIX convention, and the caller guards against that
-     * before reaching here, but if the guard is ever bypassed we must
-     * NEVER write RIP=0 into g_syscall_user_rip (§195).
-     *
-     * sa_restorer MUST also be non-zero and valid: when the handler
-     * returns it `ret`s to the restorer, which calls sigreturn(2) to
-     * unwind.  A zero sa_restorer means the handler's `ret` pops 0 off
-     * the user stack → user #PF at RIP=0 (observed: Ctrl+C / SIGINT
-     * against dwl, comm=dwl, CR2=0, RIP=0, RCX inside libc syscall6).
-     *
-     * A syscall that registers a signal handler without a working
-     * restorer is a userland bug, but the kernel must not crash over
-     * it — force SIGKILL and take the SIG_DFL terminate path instead.
-     */
+    /* Handler / restorer validation.  Both must be canonical user pointers
+     * (< USER_ADDR_CEIL = 2^47), and both non-zero: a zero handler means
+     * SIG_DFL (guarded earlier) and would iretq to RIP=0; a zero restorer
+     * means the handler's `ret` pops 0 off the user stack → user #PF at RIP=0
+     * (observed: Ctrl+C / SIGINT against dwl, CR2=0, RIP=0).  A handler
+     * registered without a working restorer is a userland bug, but the kernel
+     * must not crash over it — force SIGKILL and take the terminate path. */
     if (ka->sa_handler == 0 || ka->sa_handler >= USER_ADDR_CEIL ||
         ka->sa_restorer == 0 || ka->sa_restorer >= USER_ADDR_CEIL) {
-        // Force-queue SIGKILL for the next delivery cycle.  We can't
-        // kill the task inline from here — the terminate block below
-        // is the only safe place (drops fds, reparents children,
-        // zombifies), and it wants a fall-through, not a nested call.
-        // Leaving the signal pending-with-no-handler means the next
-        // signal_deliver_pending takes the SIG_DFL-terminate path.
-        extern void kprintf(const char*, ...);
-        kprintf("[signal] setup_frame HANDLER kill: comm=\"%s\" sig=%d "
-                "handler=%p restorer=%p\n",
-                g_current->comm, sig,
-                (void*)ka->sa_handler, (void*)ka->sa_restorer);
-        atomic_or(&g_current->sigstate.pending,
-                  1u << (uint32_t)(SIGKILL - 1));
-        g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
-        return;
+        signal_force_kill(sig, "setup_frame HANDLER", user_rsp, frame_base); return -1;
     }
 
     // Defense in depth: the canonical-range check above cannot tell a
-    // VALID-but-unmapped address from a mapped one — and a kernel-mode
-    // write to a user address with NO covering VMA is an unrecoverable
-    // #PF (panic), not a demand-page.  Require the whole frame window
-    // to be VMA-covered; demand paging handles not-yet-present pages.
+    // VALID-but-unmapped address from a mapped one — and a kernel-mode write to
+    // a user address with NO covering VMA is an unrecoverable #PF (panic), not
+    // a demand-page.  Require the whole frame window to be VMA-covered; demand
+    // paging handles not-yet-present pages.  mm_vma_find is an RCU reader walk
+    // and REQUIRES rcu_read_lock for the walk's duration.
     {
         extern vma_t* mm_vma_find(mm_t*, virt_addr_t);
         mm_t* mm = g_current->mm_shared->mm;
-        // mm_vma_find is an RCU reader walk (rcu_dereference of vma->next) and
-        // its contract REQUIRES rcu_read_lock for the duration of the walk, else
-        // a concurrent sibling munmap's async vma_free_rcu can free a node
-        // mid-walk -> a freed-vma read (garbage start/end/next).  Every vmm.c
-        // caller wraps it; this was the lone exception.  Snapshot the coverage
-        // boolean under the lock (the returned pointer is only NULL-tested, never
-        // dereferenced after), then handle the kill outside.
         rcu_read_lock();
         int covered = mm && mm_vma_find(mm, frame_base - 8) &&
                       mm_vma_find(mm, frame_base + sizeof(sigframe_t) - 1);
         rcu_read_unlock();
         if (!covered) {
-            extern void kprintf(const char*, ...);
-            kprintf("[signal] setup_frame VMA kill: comm=\"%s\" sig=%d "
-                    "kf_rsp=%p frame=%p\n",
-                    g_current->comm, sig, (void*)user_rsp, (void*)frame_base);
-            atomic_or(&g_current->sigstate.pending,
-                      1u << (uint32_t)(SIGKILL - 1));
-            g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
-            return;
+            signal_force_kill(sig, "setup_frame VMA", user_rsp, frame_base); return -1;
         }
     }
 
     sigframe_t* frame = (sigframe_t*)frame_base;
 
-    frame->rip    = kf->rip;
+    frame->rip    = src->rip;
     frame->rsp    = user_rsp;
-    frame->rflags = kf->rflags;
-    frame->rbp    = kf->rbp;
-    frame->rbx    = kf->rbx;
-    frame->r12    = kf->r12;
-    frame->r13    = kf->r13;
-    frame->r14    = kf->r14;
-    frame->r15    = kf->r15;
-    // Save the caller-saved arg registers BEFORE kf->rdi is overwritten with
-    // the signum below — the handler will clobber all of these.
-    frame->rdi    = kf->rdi;
-    frame->rsi    = kf->rsi;
-    frame->rdx    = kf->rdx;
-    frame->r10    = kf->r10;
-    frame->r8     = kf->r8;
-    frame->r9     = kf->r9;
-    frame->rax    = saved_rax;
+    frame->rflags = src->rflags;
+    frame->rbp    = src->rbp;
+    frame->rbx    = src->rbx;
+    frame->r12    = src->r12;
+    frame->r13    = src->r13;
+    frame->r14    = src->r14;
+    frame->r15    = src->r15;
+    // Caller-saved arg registers — the handler will clobber them; saved here so
+    // sigreturn can restore the interrupted code's exact register state.
+    frame->rdi    = src->rdi;
+    frame->rsi    = src->rsi;
+    frame->rdx    = src->rdx;
+    frame->r10    = src->r10;
+    frame->r8     = src->r8;
+    frame->r9     = src->r9;
+    frame->rax    = src->rax;
     frame->blocked = g_current->sigstate.blocked;
     frame->_pad   = 0;
 
-    // Save the interrupted FPU/SSE state.  g_current is running and the
-    // kernel is -mno-sse, so its FPU registers still hold the user's live
-    // state; the handler about to run will clobber them.  fxrstor in
-    // sys_sigreturn puts them back so the interrupted code resumes with an
-    // intact x87/XMM state.  Target is 16-byte aligned (frame_base & ~0xF,
-    // fpu aligned(16)); the frame window is already VMA-validated above.
+    // Save the interrupted FPU/SSE state.  g_current is running and the kernel
+    // is -mno-sse, so its FPU registers still hold the user's live state; the
+    // handler about to run will clobber them.  fxrstor in sys_sigreturn puts
+    // them back.  Target is 16-byte aligned (frame_base & ~0xF, fpu aligned(16)).
     __asm__ volatile("fxsave %0" : "=m"(frame->fpu));
 
-    // Remember where the frame is for sys_sigreturn.
     g_current->sigstate.sigframe_rsp = frame_base;
 
-    // Block the signal itself + sa_mask during handler execution.  Atomic so
-    // a cross-CPU signal_send (SIGKILL unblock) can't lose these via a torn RMW.
+    // Block the signal itself + sa_mask during handler execution.  Atomic so a
+    // cross-CPU signal_send (SIGKILL unblock) can't lose these via a torn RMW.
     atomic_or(&g_current->sigstate.blocked, 1u << (uint32_t)(sig - 1));
     atomic_or(&g_current->sigstate.blocked, ka->sa_mask);
 
@@ -356,14 +412,119 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka, uint64_t saved_rax) {
     uint64_t new_rsp = frame_base - 8;
     *(uint64_t*)new_rsp = ka->sa_restorer;
 
-    // Redirect the syscall return to the handler by mutating the saved
-    // user context in place — the exit path's normal pop sequence
-    // consumes these slots, so no per-CPU flag and no special asm
-    // branch are involved.  rdi is the handler's signum argument.
-    kf->rip    = ka->sa_handler;
-    kf->rsp    = new_rsp;
-    kf->rflags = 0x202;  // IF=1, reserved
-    kf->rdi    = (uint64_t)(uint32_t)sig;
+    redir->rip    = ka->sa_handler;
+    redir->rsp    = new_rsp;
+    redir->rflags = 0x202;  // IF=1, reserved
+    redir->rdi    = (uint64_t)(uint32_t)sig;
+    redir->rsi    = src->rsi;   // unchanged: 1-arg handler
+    redir->rdx    = src->rdx;   // unchanged
+    return 0;
+}
+
+// Dispatch: SA_SIGINFO handlers get the rt_sigframe (siginfo + ucontext);
+// everything else keeps the proven simple frame.  Source-neutral.
+static int signal_build_frame(int sig, k_sigaction_t* ka,
+                              const sig_uctx_t* src, sig_redirect_t* redir) {
+    if (ka->sa_flags & SA_SIGINFO) return build_rt_frame(sig, ka, src, redir);
+    return build_simple_frame(sig, ka, src, redir);
+}
+
+// Syscall-return delivery: the source is the task's SYSCALL_KFRAME (which
+// survives mid-syscall CPU migration), and the handler-entry redirect is
+// applied back INTO it — the exit path's normal sysret/iret pop sequence then
+// enters the handler.  Only call this when we are on the current task's own
+// syscall-return path (may_setup_frame==1 in signal_deliver_pending).
+static void signal_setup_frame(int sig, k_sigaction_t* ka, uint64_t saved_rax) {
+    syscall_kframe_t* kf = SYSCALL_KFRAME(g_current);
+
+    sig_uctx_t src;
+    src.rip = kf->rip; src.rsp = kf->rsp; src.rflags = kf->rflags;
+    src.rbp = kf->rbp; src.rbx = kf->rbx;
+    src.r12 = kf->r12; src.r13 = kf->r13; src.r14 = kf->r14; src.r15 = kf->r15;
+    src.rdi = kf->rdi; src.rsi = kf->rsi; src.rdx = kf->rdx; src.r10 = kf->r10;
+    src.r8  = kf->r8;  src.r9  = kf->r9;
+    src.rax = saved_rax;
+    // rcx/r11 are clobbered by `syscall` and not captured in the kframe.
+    src.rcx = 0; src.r11 = 0;
+
+    sig_redirect_t redir;
+    if (signal_build_frame(sig, ka, &src, &redir) != 0) return;  // force-killed
+
+    // Mutate the saved user context in place — the exit path consumes these.
+    kf->rip    = redir.rip;
+    kf->rsp    = redir.rsp;
+    kf->rflags = redir.rflags;
+    kf->rdi    = redir.rdi;
+    kf->rsi    = redir.rsi;   // no-op for the simple frame (== saved rsi)
+    kf->rdx    = redir.rdx;
+}
+
+// ── signal_deliver_fault ──────────────────────────────────────────────────
+// Deliver a signal raised by a synchronous CPU exception (page fault, #DE, #UD,
+// #GP, ...) whose faulting context is in the exception trap frame reachable via
+// `f`.  Unlike the syscall path, we cannot just re-queue and return: iretq would
+// re-execute the faulting instruction and fault again forever.  So either we
+// redirect into a catchable user handler NOW, or we force the default action
+// (terminate).
+// True iff a `sig` raised by a synchronous fault would be delivered to a user
+// handler (installed, catchable, unblocked, non-kthread) rather than terminating
+// the task.  Exported so the #PF path can skip its PF-KILL diagnostic banner for
+// a deliverable fault (a JVM null-checks on NULL constantly — it is not a kill).
+int signal_fault_deliverable(struct task_t* t, int sig) {
+    if (!t || sig < 1 || sig >= NSIG) return 0;
+    if (((task_t*)t)->flags & TASK_FLAG_KTHREAD) return 0;
+    const sigstate_t* ss = &((task_t*)t)->sigstate;
+    uint64_t h = ss->handlers[sig].sa_handler;
+    if (h == (uint64_t)SIG_DFL || h == (uint64_t)SIG_IGN) return 0;
+    if (ss->blocked & (1u << (uint32_t)(sig - 1))) return 0;
+    return 1;
+}
+
+void signal_deliver_fault(int sig, interrupt_frame_t* f) {
+    if (!g_current || sig < 1 || sig >= NSIG) return;
+    sigstate_t* ss = &g_current->sigstate;
+    k_sigaction_t* ka = &ss->handlers[sig];
+    uint32_t bit = 1u << (uint32_t)(sig - 1);
+
+    // Not deliverable (SIG_DFL / SIG_IGN / blocked / kthread): a synchronous
+    // fault cannot be ignored or deferred.  Force the default action and
+    // terminate — this mirrors Linux's force_sig() semantics (a blocked/ignored
+    // synchronous fault is reset to SIG_DFL and delivered).
+    if (!signal_fault_deliverable((struct task_t*)g_current, sig)) {
+        atomic_and(&ss->blocked, ~bit);
+        ka->sa_handler = (uint64_t)SIG_DFL;
+        signal_send(g_current, sig);
+        signal_deliver_pending(0, 0);   // takes the SIG_DFL terminate path
+        return;
+    }
+
+    // Catchable user handler installed and unblocked: build the signal frame
+    // from the exception trap frame and redirect it so the handler runs on the
+    // isr_common_entry POP_GPRS + iretq return.
+    trap_frame_t* tf = TRAP_FROM_IFRAME(f);
+    sig_uctx_t src;
+    src.rax = tf->rax; src.rbx = tf->rbx; src.rcx = tf->rcx; src.rdx = tf->rdx;
+    src.rsi = tf->rsi; src.rdi = tf->rdi; src.rbp = tf->rbp;
+    src.r8  = tf->r8;  src.r9  = tf->r9;  src.r10 = tf->r10; src.r11 = tf->r11;
+    src.r12 = tf->r12; src.r13 = tf->r13; src.r14 = tf->r14; src.r15 = tf->r15;
+    src.rip = f->ip;   src.rsp = f->sp;   src.rflags = f->flags;
+
+    sig_redirect_t redir;
+    if (signal_build_frame(sig, ka, &src, &redir) != 0) {
+        // Unusable user stack -> force-killed inside the builder; terminate now.
+        signal_deliver_pending(0, 0);
+        return;
+    }
+
+    // Load the handler-entry context into the trap frame.  POP_GPRS restores the
+    // (now redirected) rdi/rsi/rdx; iretq returns to the handler at redir.rip
+    // with the signal frame on the user stack at redir.rsp.
+    f->ip    = redir.rip;
+    f->sp    = redir.rsp;
+    f->flags = redir.rflags;
+    tf->rdi  = redir.rdi;
+    tf->rsi  = redir.rsi;
+    tf->rdx  = redir.rdx;
 }
 
 // ── signal_deliver_pending ────────────────────────────────────────────────

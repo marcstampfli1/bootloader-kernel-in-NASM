@@ -106,26 +106,31 @@ Avian -> OpenJDK.**
 Missing-stuff checklist (verified):
 - [x] libc `<ucontext.h>` -- glibc-layout `ucontext_t`/`mcontext_t`/`gregs[REG_*]`
       (done: userland/libc/include/ucontext.h).
-- [ ] Kernel: `SA_SIGINFO` delivery -- evolve `signal_setup_frame`
-      (kernel/proc/signal.c) toward a Linux-style rt_sigframe:
-        1. On the user stack lay out `{ siginfo_t info; ucontext_t uc; }` below
-           the red zone (16-aligned), plus the restorer return address.
-        2. Populate `info` (si_signo, si_code, and si_addr = fault CR2 for
-           SIGSEGV/SIGBUS) and `uc.uc_mcontext.gregs[]` from the interrupted
-           context (map the existing sigframe register set into gregs order),
-           and copy the FXSAVE area into uc's fpregs.
-        3. Set `kf->rdi=sig`, `kf->rsi=&info`, `kf->rdx=&uc` (SA_SIGINFO ABI);
-           for a non-SIGINFO handler rsi/rdx are harmless.
-        4. `sys_sigreturn` restores rip/rsp/rflags/GPRs/fpu **from uc.uc_mcontext**
-           (NOT a separate saved frame) so a handler's edit to gregs[REG_RIP]
-           (JVM resume-past-fault) takes effect.  Keep all the existing frame
-           validation (range/handler/VMA checks).
-        5. Selftest: install a SIGSEGV SA_SIGINFO handler, deref NULL, in the
-           handler read si_addr==0 and advance gregs[REG_RIP] past the faulting
-           instruction; verify execution resumes (proves the JVM mechanism).
+- [x] Kernel: `SA_SIGINFO` delivery -- **DONE + verified** (sigtest PASS, both
+      paths).  The rt_sigframe `{ pretcode, ucontext, siginfo }` is built by a
+      single source-neutral builder (`build_rt_frame`/`build_simple_frame` in
+      kernel/proc/signal.c) that reads a `sig_uctx_t` and emits a
+      `sig_redirect_t`, fed from EITHER a syscall kframe (syscall-return
+      delivery) OR an exception trap frame.  `sys_sigreturn` restores from
+      `uc.uc_mcontext.gregs[]` so a handler's `gregs[REG_RIP]` edit takes effect.
+      Crucially, synchronous faults now deliver to handlers too:
+        - `isr_common_entry` (isr_stubs.asm) passes the C handler a pointer to
+          the REAL on-stack `trap_frame_t` (idt.h), not a copy, so edits to
+          ip/sp/flags + GPRs take effect on POP_GPRS + iretq.
+        - `signal_deliver_fault(sig, iframe)` (signal.c) redirects the trap frame
+          into a catchable, unblocked handler, else forces SIG_DFL + terminates
+          (Linux force_sig semantics).  Wired into every synchronous exception
+          (#PF via vmm.c, #DE/#UD/#GP/... via idt.c).  The #PF path suppresses
+          its PF-KILL banner for a deliverable fault (`signal_fault_deliverable`).
+        - `sys_sigaction` now permits catching SIGSEGV/SIGBUS/SIGFPE/SIGILL/
+          SIGTRAP (only SIGKILL/SIGSTOP uncatchable, POSIX).
+      Regression test: userland/apps/sigtest (build `SIGTEST=1`) exercises both
+      the syscall-return path (raise SIGUSR1) and the fault path (NULL deref,
+      si_addr==0, gregs[REG_RIP] redirect resumes at recovery()).
 - [ ] `pthread_kill` + a kernel per-thread signal syscall (tkill/tgkill-style)
       -- Avian GC signals a specific thread.
 - [ ] `sigaltstack` (libc + kernel) -- SIGSEGV on an alt stack for stack-overflow.
+      libc `stack_t` + SS_ONSTACK/SS_DISABLE already added (ucontext.h).
 
 Then Phase 1: add a `scripts/port-avian.sh` that cross-builds Avian via its
 posix layer as `platform=linux` with `cxx/cc/ranlib` overridden to the makaos

@@ -401,6 +401,18 @@ static void init_kthread(void) {
     if (login)  sched_add(login);
     if (svcmgr) sched_add(svcmgr);
 
+#ifdef MAKAOS_SIGTEST
+    // JVM signal-layer verification (build with SIGTEST=1 + CONSOLE_SERIAL=1):
+    // runs /bin/sigtest, which installs a SA_SIGINFO SIGSEGV handler, faults on
+    // NULL, checks si_addr, and redirects gregs[REG_RIP] to a recovery point.
+    {
+        static const char* sig_argv[]  = { "/bin/sigtest", NULL };
+        static const int    sig_stdio[3] = { -1, -1, -1 };  // inherit tty0 (serial-mirrored)
+        task_t* st = elf_exec_kernel("/bin/sigtest", pid_alloc(), sig_argv, envp, sig_stdio);
+        if (st) sched_add(st);
+    }
+#endif
+
     // Regression-test harness: uncomment to stress AHCI concurrent pread.
     // Kept in-tree so future changes to the submit path can be validated.
     // stress_pread_launch();

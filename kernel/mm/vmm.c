@@ -730,14 +730,6 @@ static void ser_str(const char* s) {
     for (; *s; s++) { while (!(inb(0x3F8+5) & 0x20)) {} outb(0x3F8, (uint8_t)*s); }
 }
 
-static void kill_current(void) {
-    extern void signal_send(struct task_t* t, int sig);
-    extern void signal_deliver_pending(int, uint64_t);
-    if (g_current) signal_send(g_current, 11); // SIGSEGV = 11
-    signal_deliver_pending(0, 0);
-    for (;;) __asm__ volatile("cli; hlt");
-}
-
 void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
     virt_addr_t fault_addr;
     __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
@@ -748,6 +740,11 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
     uint8_t is_reserved = (ec >> 3) & 1;
     uint8_t is_ifetch   = (ec >> 4) & 1;
     (void)f;
+
+    // Record the fault address so a resulting SIGSEGV/SIGBUS delivers it as
+    // siginfo.si_addr (JVM null-checks read it).  Harmless if the fault resolves
+    // via demand-paging/CoW -- it is only consumed when a signal is delivered.
+    if (is_user && g_current) g_current->sigstate.fault_addr = fault_addr;
 
     // Reserved-bit violation: always unrecoverable.
     if (is_reserved) goto kernel_panic;
@@ -1086,6 +1083,14 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
 
     kill:
     {
+        // Fast path: a catchable, unblocked SIGSEGV handler is installed (e.g. a
+        // JVM null-check / safepoint).  Deliver silently by redirecting the trap
+        // frame into the handler and iretq — do NOT print the PF-KILL banner
+        // below (this is not a kill, and such faults can be extremely frequent).
+        if (signal_fault_deliverable((struct task_t*)g_current, SIGSEGV)) {
+            signal_deliver_fault(SIGSEGV, f);
+            return;
+        }
         // Hold the serial lock for the whole banner — otherwise other
         // CPUs' klog_emit writes (sys:DEBUG, drm:DEBUG, …) byte-
         // interleave into the PF-KILL block and the dump becomes
@@ -1244,8 +1249,12 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         }
         ser_str("===== END PF-KILL =====\n\n");
         serial_unlock_irqrestore(__pfkill_rf);
-        kill_current();
-        return;
+        // Genuine crash: no catchable handler installed -> terminate.
+        // signal_deliver_fault takes the force-default terminate path (logs the
+        // [signal] terminate line, reaps fds/children, zombifies) and does not
+        // return.  The trailing halt is belt-and-suspenders.
+        signal_deliver_fault(SIGSEGV, f);
+        for (;;) __asm__ volatile("cli; hlt");
     }
     }
 

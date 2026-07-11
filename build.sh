@@ -101,6 +101,11 @@ if [ "${CONSOLE_SERIAL:-0}" = "1" ]; then
   KERNEL_CFLAGS+=( -DMAKAOS_CONSOLE_SERIAL )
   echo "[build] console->serial mirror ENABLED (-DMAKAOS_CONSOLE_SERIAL)"
 fi
+# SIGTEST=1 runs /bin/sigtest at boot (JVM SA_SIGINFO signal-layer verification).
+if [ "${SIGTEST:-0}" = "1" ]; then
+  KERNEL_CFLAGS+=( -DMAKAOS_SIGTEST )
+  echo "[build] boot sigtest ENABLED (-DMAKAOS_SIGTEST)"
+fi
 
 # ── User compile flags ─────────────────────────────────────────────────────
 # -fPIE (position-independent) so every userland object -- libc especially --
@@ -345,6 +350,14 @@ USER_LINK="$USERLAND_DIR/link.ld"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_hello.o" \
    -o "$BUILD_DIR/user_hello.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_hello.elf" "$BUILD_DIR/user_hello.bin"
+
+# sigtest — verifies SA_SIGINFO delivery + ucontext RIP-redirect (JVM signal
+# layer).  Test-only: compiled + installed + boot-spawned only under SIGTEST=1.
+if [ "${SIGTEST:-0}" = "1" ]; then
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/sigtest/sigtest.c" -o "$BUILD_DIR/user_sigtest.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_sigtest.o" \
+   -o "$BUILD_DIR/user_sigtest.elf"
+fi
 
 # virgltest -- drives the virtio-gpu 3D render-node uAPI (/dev/dri/renderD128)
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/virgltest/virgltest.c" -o "$BUILD_DIR/user_virgltest.o"
@@ -1032,6 +1045,9 @@ if [ -f "$BUILD_DIR/user_home.elf" ]; then
 fi
 if [ -f "$BUILD_DIR/user_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_hello.elf" bin/hello
+fi
+if [ "${SIGTEST:-0}" = "1" ] && [ -f "$BUILD_DIR/user_sigtest.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sigtest.elf" bin/sigtest
 fi
 if [ -f "$BUILD_DIR/user_virgltest.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_virgltest.elf" bin/virgltest
