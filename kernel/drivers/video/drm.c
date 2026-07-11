@@ -2235,7 +2235,9 @@ static void drm_ensure_edid(void) {
 // fixed, so we only need to hand back a valid id (+ store the bytes so a later
 // GETPROPBLOB round-trips) -- the commit ignores MODE_ID/ACTIVE.
 typedef struct drm_dyn_blob {
-    uint32_t id; uint32_t len; void* data; struct drm_dyn_blob* next;
+    uint32_t id; uint32_t len; void* data;
+    void* owner;   // creating vfs_file_t (DRM fd); reaped at drm_close, Linux-style
+    struct drm_dyn_blob* next;
 } drm_dyn_blob_t;
 static drm_dyn_blob_t* s_dyn_blobs     = NULL;
 static spinlock_t      s_dyn_blob_lock = SPINLOCK_INIT;
@@ -2265,7 +2267,7 @@ static int drm_resolve_blob(uint32_t blob_id, const void** out, uint32_t* len) {
     }
 }
 
-static int drm_ioctl_create_blob(uint64_t arg) {
+static int drm_ioctl_create_blob(vfs_file_t* f, uint64_t arg) {
     struct __attribute__((packed)) {
         uint64_t data; uint32_t length; uint32_t blob_id;
     } a;
@@ -2276,13 +2278,22 @@ static int drm_ioctl_create_blob(uint64_t arg) {
     if (copy_from_user(buf, (void*)a.data, a.length) != 0) { kfree(buf); return -EFAULT; }
     drm_dyn_blob_t* bl = (drm_dyn_blob_t*)kmalloc(sizeof(*bl));
     if (!bl) { kfree(buf); return -ENOMEM; }
-    bl->len = a.length; bl->data = buf;
+    bl->len = a.length; bl->data = buf; bl->owner = f;
     spin_lock(&s_dyn_blob_lock);
     bl->id = s_next_dyn_blob++;
     bl->next = s_dyn_blobs; s_dyn_blobs = bl;
     spin_unlock(&s_dyn_blob_lock);
     a.blob_id = bl->id;
-    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) {
+        // The client never learned the id, so it can never DESTROY_BLOB it --
+        // unlink + free now instead of leaking it in the global list forever.
+        spin_lock(&s_dyn_blob_lock);
+        drm_dyn_blob_t** pp = &s_dyn_blobs;
+        while (*pp) { if (*pp == bl) { *pp = bl->next; break; } pp = &(*pp)->next; }
+        spin_unlock(&s_dyn_blob_lock);
+        kfree(bl->data); kfree(bl);
+        return -EFAULT;
+    }
     return 0;
 }
 
@@ -3584,7 +3595,7 @@ static int64_t drm_ioctl_impl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     case DRM_IOCTL_MODE_SETPROPERTY:       return drm_ioctl_mode_setproperty(arg);
     case DRM_IOCTL_MODE_OBJ_SETPROPERTY:   return drm_ioctl_mode_obj_setproperty(arg);
     case DRM_IOCTL_MODE_GETPROPBLOB:       return drm_ioctl_mode_getpropblob(arg);
-    case DRM_IOCTL_MODE_CREATEPROPBLOB:    return drm_ioctl_create_blob(arg);
+    case DRM_IOCTL_MODE_CREATEPROPBLOB:    return drm_ioctl_create_blob(self, arg);
     case DRM_IOCTL_MODE_DESTROYPROPBLOB:   return drm_ioctl_destroy_blob(arg);
     case DRM_IOCTL_MODE_GETFB:             return drm_ioctl_mode_getfb(self, arg);
     case DRM_IOCTL_MODE_CLOSEFB:           return drm_ioctl_mode_closefb(self, arg);
@@ -3666,6 +3677,24 @@ static void drm_close(vfs_file_t* self) {
         kfree(c);
         self->ctx = NULL;
     }
+    // Reap any property blobs this client created but never DESTROY_BLOB'd.
+    // Blobs live in a process-global list but are owned by their creating fd
+    // (Linux drm_file semantics); without this a compositor that exits without
+    // destroying its mode/gamma blobs leaks them for the system's lifetime.
+    // Runs before kfree(self) since `self` is the ownership key.
+    spin_lock(&s_dyn_blob_lock);
+    {
+        drm_dyn_blob_t** pp = &s_dyn_blobs;
+        while (*pp) {
+            if ((*pp)->owner == self) {
+                drm_dyn_blob_t* dead = *pp; *pp = dead->next;
+                kfree(dead->data); kfree(dead);
+            } else {
+                pp = &(*pp)->next;
+            }
+        }
+    }
+    spin_unlock(&s_dyn_blob_lock);
     kfree(self);
 
     // Last open DRM fd gone — hand the display back to the text
