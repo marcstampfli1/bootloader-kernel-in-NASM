@@ -127,10 +127,22 @@ Missing-stuff checklist (verified):
       Regression test: userland/apps/sigtest (build `SIGTEST=1`) exercises both
       the syscall-return path (raise SIGUSR1) and the fault path (NULL deref,
       si_addr==0, gregs[REG_RIP] redirect resumes at recovery()).
-- [ ] `pthread_kill` + a kernel per-thread signal syscall (tkill/tgkill-style)
-      -- Avian GC signals a specific thread.
-- [ ] `sigaltstack` (libc + kernel) -- SIGSEGV on an alt stack for stack-overflow.
-      libc `stack_t` + SS_ONSTACK/SS_DISABLE already added (ucontext.h).
+- [x] `pthread_kill` -- **DONE** (commits 27afb67 + e2c82c7). Thread-directed via
+      kill(tid) (pid == tid; no separate tgkill syscall needed). This EXPOSED and
+      fixed a real POSIX bug: signal dispositions were per-task, so a pthread got
+      a zeroed handler table; moved them into a refcounted shared `sighand_t`
+      (per-process, like task_mm_t/task_files_t). A JVM installs handlers in one
+      thread that all mutator threads must honour.
+- [x] `sigaltstack` + `SA_ONSTACK` -- **DONE** (commit 43c410c). Per-thread alt
+      stack via sys_sigaltstack; both frame builders route through
+      sig_stack_base() so a SA_ONSTACK handler (JVM StackOverflowError) runs on
+      the alt stack for BOTH syscall-return and synchronous-fault delivery. fork
+      inherits, execve disables. libc sigaltstack()/stack_t/SS_* in <signal.h>.
+      sigtest Path 4 asserts the handler's rsp is inside the alt stack.
+
+The signal layer (SA_SIGINFO/ucontext + pthread_kill/shared-dispositions +
+sigaltstack) is COMPLETE and verified by userland/apps/sigtest (4 paths, all pass
+under a `SIGTEST=1` boot). Next is Phase 1 (Avian first-light).
 
 Then Phase 1: add a `scripts/port-avian.sh` that cross-builds Avian via its
 posix layer as `platform=linux` with `cxx/cc/ranlib` overridden to the makaos
