@@ -355,7 +355,10 @@ USER_LINK="$USERLAND_DIR/link.ld"
 # layer).  Test-only: compiled + installed + boot-spawned only under SIGTEST=1.
 if [ "${SIGTEST:-0}" = "1" ]; then
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/sigtest/sigtest.c" -o "$BUILD_DIR/user_sigtest.o"
+# Link the fresh in-tree pthread objects (they carry the new pthread_kill +
+# sched_yield); the linker pulls the rest from the toolchain libc archive.
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_sigtest.o" \
+   "$BUILD_DIR/user_pthread.o" "$BUILD_DIR/user_pthread_tramp.o" \
    -o "$BUILD_DIR/user_sigtest.elf"
 fi
 

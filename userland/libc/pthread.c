@@ -389,6 +389,29 @@ int pthread_cancel(pthread_t t) {
     return (int)__syscall_ret(syscall2(SYS_KILL, (uint64_t)tid, 9 /* SIGKILL */));
 }
 
+// pthread_kill — deliver signal `sig` to the specific thread `t`.  Like
+// pthread_cancel, this targets the thread's kernel tid: kill(pid>0) is
+// thread-directed in MakaOS (pid == tid), so no separate tgkill syscall is
+// needed.  A JVM's stop-the-world GC uses this to signal a specific mutator
+// thread and read/edit its ucontext in the SA_SIGINFO handler (see the kernel
+// signal-delivery layer).  POSIX: returns 0 or a positive errno (NOT -1/errno),
+// and sig==0 performs existence checking only (no signal sent).
+//
+// Note: an async signal to a purely CPU-bound target thread is delivered on
+// that thread's next kernel entry/exit (syscall return or preemption re-entry),
+// not instantly mid-userland-loop -- the standard MakaOS async-signal timing.
+int pthread_kill(pthread_t t, int sig) {
+    struct __pthread* d = (struct __pthread*)t;
+    if (!d) return ESRCH;
+    if (sig < 0 || sig > 31) return EINVAL;          // valid signals are 1..31
+    int tid = __atomic_load_n(&d->tid, __ATOMIC_ACQUIRE);
+    if (tid <= 0) return ESRCH;
+    if (sig == 0)                                    // existence check only
+        return __atomic_load_n(&d->done, __ATOMIC_ACQUIRE) ? ESRCH : 0;
+    long r = (long)syscall2(SYS_KILL, (uint64_t)tid, (uint64_t)(unsigned)sig);
+    return r < 0 ? (int)-r : 0;                      // POSIX: positive errno
+}
+
 // ── Mutex ────────────────────────────────────────────────────────────
 
 int pthread_mutex_init(pthread_mutex_t* m, const pthread_mutexattr_t* a) {

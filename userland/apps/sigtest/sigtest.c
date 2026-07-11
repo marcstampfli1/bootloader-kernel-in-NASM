@@ -16,6 +16,10 @@
 #include <ucontext.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
+
+extern int gettid(void);
 
 static void out(const char* s) { write(1, s, (size_t)__builtin_strlen(s)); }
 
@@ -29,6 +33,26 @@ static void usr1_handler(int sig, siginfo_t* info, void* ctx) {
     g_usr1_ran   = 1;
     // Return normally: the kernel must restore the pre-signal context so raise()
     // resumes and returns to main.
+}
+
+// ── Path 3: thread-directed delivery (pthread_kill of a helper thread) ────
+static volatile int g_usr2_ran    = 0;
+static volatile int g_usr2_tid    = 0;
+static volatile int g_helper_tid  = 0;
+static volatile int g_helper_stop = 0;
+
+static void usr2_handler(int sig, siginfo_t* info, void* ctx) {
+    (void)sig; (void)info; (void)ctx;
+    g_usr2_tid = gettid();   // the thread the handler actually ran in
+    g_usr2_ran = 1;
+}
+
+static void* helper_thread(void* arg) {
+    (void)arg;
+    g_helper_tid = gettid();
+    // Spin making syscalls so an async signal can be delivered on syscall-return.
+    while (!g_helper_stop) sched_yield();
+    return 0;
 }
 
 // ── Path 2: synchronous-fault delivery (SIGSEGV on NULL) ──────────────────
@@ -67,6 +91,32 @@ int main(void) {
     }
     // Reaching here proves sigreturn restored the interrupted context intact.
     out("[sigtest] OK: syscall-path SA_SIGINFO delivered + resumed\n");
+
+    // ── Path 3: thread-directed delivery via pthread_kill ─────────────────
+    __builtin_memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = usr2_handler;
+    sa.sa_flags     = SA_SIGINFO;
+    if (sigaction(SIGUSR2, &sa, 0) != 0) { out("[sigtest] FAIL: sigaction(SIGUSR2)\n"); return 1; }
+
+    pthread_t helper;
+    if (pthread_create(&helper, 0, helper_thread, 0) != 0) {
+        out("[sigtest] FAIL: pthread_create\n"); return 1;
+    }
+    // Wait until the helper is running (has recorded its tid).
+    for (int i = 0; i < 2000000 && g_helper_tid == 0; i++) sched_yield();
+    if (g_helper_tid == 0) { out("[sigtest] FAIL: helper did not start\n"); return 1; }
+
+    out("[sigtest] pthread_kill(helper, SIGUSR2)...\n");
+    int pk = pthread_kill(helper, SIGUSR2);
+    if (pk != 0) { out("[sigtest] FAIL: pthread_kill returned nonzero\n"); return 1; }
+
+    // Wait for the handler to run (it runs in the helper thread on its next yield).
+    for (int i = 0; i < 5000000 && !g_usr2_ran; i++) sched_yield();
+    g_helper_stop = 1;
+    pthread_join(helper, 0);
+    if (!g_usr2_ran)            { out("[sigtest] FAIL: SIGUSR2 not delivered to helper\n"); return 1; }
+    if (g_usr2_tid != g_helper_tid) { out("[sigtest] FAIL: SIGUSR2 ran in the wrong thread\n"); return 1; }
+    out("[sigtest] OK: pthread_kill delivered to the target thread\n");
 
     // ── Path 2: synchronous fault via the trap-frame path ─────────────────
     __builtin_memset(&sa, 0, sizeof(sa));

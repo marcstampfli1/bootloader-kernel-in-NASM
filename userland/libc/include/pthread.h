@@ -117,6 +117,7 @@ void pthread_exit(void* retval) __attribute__((__noreturn__));
 pthread_t pthread_self(void);
 int  pthread_equal(pthread_t a, pthread_t b);
 int  pthread_cancel(pthread_t tid);
+int  pthread_kill(pthread_t tid, int sig);   // thread-directed signal (0 = existence check)
 
 // ── Mutex ────────────────────────────────────────────────────────────
 int pthread_mutex_init(pthread_mutex_t* m, const pthread_mutexattr_t* a);
