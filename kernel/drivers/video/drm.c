@@ -593,6 +593,12 @@ static void res3d_free(drm_res3d_t* r) {
     if (r->phys)
         for (uint32_t i = 0; i < r->bytes / 4096u; i++)
             pmm_ref_dec(r->phys + (phys_addr_t)i * 4096u);
+    // Release the per-task memory charge taken at create time.  Borrowed clones
+    // reference the exporter's backing and were never charged, so skip them.
+    // Without this the DRM_PER_TASK_LIMIT counter only grows -- a GL client that
+    // churns textures/streaming buffers eventually hits 256 MiB, RESOURCE_CREATE
+    // starts returning -ENOMEM, and Mesa dereferences the NULL result and crashes.
+    if (!r->borrowed) drm_uncharge(g_current, r->bytes);
     __builtin_memset(r, 0, sizeof(*r));   // handle=0 marks the slot free
 }
 
