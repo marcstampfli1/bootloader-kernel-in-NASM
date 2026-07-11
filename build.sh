@@ -987,6 +987,12 @@ if [ -f "$BUILD_DIR/quake-id1/pak0.pak" ]; then
   debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/quake-id1/pak0.pak root/id1/pak0.pak" > /dev/null 2>&1 || true
   ext2_setperm "$BUILD_DIR/ext2.img" /root/id1/pak0.pak 0100644 0 0
   echo "[build] installed Quake shareware pak0.pak at /root/id1 (DarkPlaces data)"
+  # Optional loose autoexec.cfg (diagnostic cvars etc.) if present.
+  if [ -f "$BUILD_DIR/quake-id1/autoexec.cfg" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "rm /root/id1/autoexec.cfg" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/quake-id1/autoexec.cfg root/id1/autoexec.cfg" > /dev/null 2>&1 || true
+    ext2_setperm "$BUILD_DIR/ext2.img" /root/id1/autoexec.cfg 0100644 0 0
+  fi
 fi
 
 echo "[+] /etc/passwd and /etc/shadow installed"
