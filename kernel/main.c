@@ -512,6 +512,12 @@ static void init_kthread(void) {
     extern void mm_vma_trim_selftest(void);
     mm_vma_trim_selftest();
 
+    // shmem_create_dma: fully-resident, pinned, best-effort-large-block backing
+    // for GPU scatter-gather (SCALABILITY_DEBT #14).  Verify every page is
+    // populated + pmm_pin'd and that teardown unpins cleanly (no leaked pin).
+    extern void shmem_dma_selftest(void);
+    shmem_dma_selftest();
+
     // rename(2) must reject moving a directory into its own subtree (mv /a /a/b)
     // -- it would detach the subtree into an unreachable cycle.
     extern void rename_under_selftest(void);

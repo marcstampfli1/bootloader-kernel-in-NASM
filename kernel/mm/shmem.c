@@ -1,6 +1,7 @@
 #include "shmem.h"
 #include "pmm.h"
 #include "kheap.h"
+#include "kprintf.h"   // kprintf (shmem_dma_selftest diagnostics)
 #include "kstr.h"    // str_eq (shared string utils; was local s_streq)
 #include "errno.h"
 #include "cred.h"
@@ -83,8 +84,51 @@ shmem_t* shmem_create(uint32_t npages, uint32_t uid, uint32_t gid, uint16_t mode
     shm->uid       = uid;
     shm->gid       = gid;
     shm->mode      = mode;
+    shm->pinned    = 0;
     shm->name[0]   = '\0';
 
+    return shm;
+}
+
+// ── shmem_create_dma ─────────────────────────────────────────────────────
+// Fully-resident, pinned backing for device DMA (GPU scatter-gather).  Unlike
+// the demand-paged path (shmem_get_page, order-0 on first touch), this eager-
+// allocates the whole object up front as best-effort LARGE buddy blocks so the
+// backing is a handful of big runs, not thousands of scattered pages -- shorter
+// device sg list, huge-page-capable mapping -- while still never REQUIRING a
+// large contiguous block (it degrades to order-0 under fragmentation).  Every
+// page is pmm_pin'd for the object's lifetime; shmem_free_rcu unpins them.
+shmem_t* shmem_create_dma(uint32_t npages) {
+    if (npages == 0) return NULL;
+    shmem_t* shm = shmem_create(npages, 0, 0, 0600);
+    if (!shm) return NULL;
+    shm->pinned = 1;
+
+    uint32_t i = 0;
+    while (i < npages) {
+        uint32_t remaining = npages - i;
+        // Largest order whose block fits the remaining pages, capped so we never
+        // demand a huge contiguous span.
+        uint8_t order = 0;
+        while (order < SHMEM_DMA_MAX_ORDER &&
+               ((uint32_t)1 << (order + 1)) <= remaining)
+            order++;
+        phys_addr_t p;
+        for (;;) {
+            p = pmm_buddy_alloc(order);
+            if (p != PMM_INVALID_ADDR) break;
+            if (order == 0) { shmem_unref(shm); return NULL; }  // true OOM
+            order--;   // fragmentation: fall back to a smaller block
+        }
+        uint32_t blk = (uint32_t)1 << order;
+        __builtin_memset((void*)(p + HHDM_OFFSET), 0, (size_t)blk * PAGE_SIZE);
+        for (uint32_t j = 0; j < blk; j++) {
+            phys_addr_t f = p + (phys_addr_t)j * PAGE_SIZE;   // object owns rc=1
+            shm->pages[i + j] = f;
+            pmm_pin(f);                                        // DMA-safe, swap-immune
+        }
+        i += blk;
+    }
     return shm;
 }
 
@@ -114,13 +158,19 @@ int shmem_tryget(shmem_t* shm) {
 static void shmem_free_rcu(void* data) {
     shmem_t* shm = (shmem_t*)data;
     for (uint32_t i = 0; i < shm->npages; i++) {
-        if (shm->pages[i])
+        if (shm->pages[i]) {
+            // DMA-pinned backing (shmem_create_dma): drop the pin taken at
+            // create BEFORE the ref, so this ref_dec can actually free the
+            // frame.  The device has already detached (the GPU resource is
+            // unref'd before shmem_unref), so the DMA guard is no longer needed.
+            if (shm->pinned) pmm_unpin(shm->pages[i]);
             // Drop the OBJECT's ref.  Frames still mapped by a surviving
             // PTE (a process that hasn't munmapped yet) stay alive until
             // that PTE is torn down — they are NOT recycled out from
             // under a live mapping.  Same per-frame refcount every other
             // RAM page uses.
             pmm_ref_dec(shm->pages[i]);
+        }
     }
     kfree(shm->pages);
     kfree(shm);
@@ -220,6 +270,7 @@ int shmem_resize(shmem_t* shm, uint32_t new_npages) {
         // new thread's stack while foot kept writing to it.
         for (uint32_t i = new_npages; i < shm->npages; i++) {
             if (shm->pages[i]) {
+                if (shm->pinned) pmm_unpin(shm->pages[i]);   // release the DMA pin first
                 pmm_ref_dec(shm->pages[i]);
                 shm->pages[i] = 0;
             }
@@ -423,3 +474,25 @@ vfs_file_t* shmem_fd_create(shmem_t* shm) {
     shmem_ref(shm); // fd owns a reference
     return f;
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Verify shmem_create_dma: every page is populated and pmm_pin'd, the backing
+// clusters into a few large runs (not N scattered pages), and teardown unpins
+// cleanly (a missing unpin would print "[pmm] BUG ... PINNED frame" and leak).
+void shmem_dma_selftest(void) {
+    const uint32_t N = 700;   // 2.7 MiB: spans an order-9 block + smaller fallbacks
+    shmem_t* shm = shmem_create_dma(N);
+    if (!shm) { kprintf("[shmem-dma] FAIL: create_dma returned NULL\n"); return; }
+    uint32_t unpop = 0, unpinned = 0, runs = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        if (!shm->pages[i]) { unpop++; continue; }
+        if (pmm_pin_get(shm->pages[i]) == 0) unpinned++;
+        if (i == 0 || shm->pages[i] != shm->pages[i - 1] + 4096u) runs++;
+    }
+    kprintf("[shmem-dma] populate/pin: %s (N=%u, unpopulated=%u, unpinned=%u, %u runs)\n",
+            (unpop == 0 && unpinned == 0) ? "PASS" : "FAIL", N, unpop, unpinned, runs);
+    shmem_unref(shm);          // deferred RCU free: must unpin every page
+    synchronize_rcu();         // force the free to run now so a leak/BUG shows in-line
+    kprintf("[shmem-dma] freed (PASS if no '[pmm] BUG ... PINNED frame' printed above)\n");
+}
+#endif
