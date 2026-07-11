@@ -975,13 +975,13 @@ static int vgpu_submit_3d(uint32_t ctx_id, const uint32_t* cmd, uint32_t ndwords
 // resources); cleans up the context + resource + page afterwards.
 #define VIRGL_TEST_CTX   0xF000u
 #define VIRGL_TEST_RES   0xF001u
-#define VIRGL_TEST_W     16u
-#define VIRGL_TEST_H     16u
+#define VIRGL_TEST_W     128u
+#define VIRGL_TEST_H     128u
 
 static void virtio_gpu_virgl_selftest(void) {
     const uint32_t npix  = VIRGL_TEST_W * VIRGL_TEST_H;
-    const uint32_t bytes = npix * 4u;                     // BGRA8
-    phys_addr_t bp = pmm_buddy_alloc(0);
+    const uint32_t bytes = npix * 4u;                     // BGRA8 (128x128 = 64 KiB)
+    phys_addr_t bp = pmm_buddy_alloc(4);                  // 16 pages = 64 KiB
     if (!PMM_ALLOC_OK(bp)) { kprintf("[virtio-gpu] virgl selftest: no mem\n"); return; }
     volatile uint32_t* back = (volatile uint32_t*)((uintptr_t)bp + HHDM_OFFSET);
 
@@ -1048,10 +1048,54 @@ static void virtio_gpu_virgl_selftest(void) {
     for (uint32_t i = 0; i < npix; i++) if (back[i] != 0x00C0FFEEu) bad2++;
     kprintf("[virtio-gpu] virgl IN-STREAM tex upload: %s (submit=%d, %u/%u wrong, first=%x)\n",
             bad2 ? "FAIL" : "PASS", istx_ok, bad2, npix, back[0]);
+
+    // ── Phase 1d: COPY_TRANSFER3D from a STAGING buffer (op=45) ────────────
+    // This is the path Mesa/DarkPlaces actually uses for most textures: write
+    // pixels into a VIRGL_BIND_STAGING buffer, then COPY_TRANSFER3D staging ->
+    // texture on the host.  If THIS is broken every world texture is black on
+    // the host even though the guest data + all commands look correct.
+    {
+        const uint32_t STAGE_RES = 0xF004u;
+        phys_addr_t sp = pmm_buddy_alloc(4);   // 64 KiB, holds 128x128 BGRA
+        if (PMM_ALLOC_OK(sp)) {
+            volatile uint32_t* stage = (volatile uint32_t*)((uintptr_t)sp + HHDM_OFFSET);
+            for (uint32_t i = 0; i < npix; i++) stage[i] = 0x00BADA55u ^ i;
+            __asm__ volatile("mfence" ::: "memory");
+            int ct_ok = vgpu_resource_create_3d(STAGE_RES, 0 /*PIPE_BUFFER*/, 64 /*R8*/,
+                                                0x80000u /*VIRGL_BIND_STAGING*/,
+                                                npix * 4u, 1, 1, 1, 0, 0)
+                     && virtio_gpu_resource_attach_backing_single(STAGE_RES, sp, bytes)
+                     && vgpu_ctx_attach_resource(VIRGL_TEST_CTX, STAGE_RES);
+            uint32_t cc[16], cn = 0;
+            cc[cn++] = VIRGL_CMD0(45u, 0u, 14u);   // VIRGL_CCMD_COPY_TRANSFER3D
+            cc[cn++] = VIRGL_TEST_RES;             // dst handle
+            cc[cn++] = 0;                          // level
+            cc[cn++] = 0;                          // usage
+            cc[cn++] = 0;                          // stride
+            cc[cn++] = 0;                          // layer_stride
+            cc[cn++] = 0; cc[cn++] = 0; cc[cn++] = 0;                 // box x,y,z
+            cc[cn++] = VIRGL_TEST_W; cc[cn++] = VIRGL_TEST_H; cc[cn++] = 1;  // w,h,d
+            cc[cn++] = STAGE_RES;                  // src handle
+            cc[cn++] = 0;                          // src offset
+            cc[cn++] = 1;                          // flags: SYNCHRONIZED
+            int cs_ok = vgpu_submit_3d(VIRGL_TEST_CTX, cc, cn);
+            for (uint32_t i = 0; i < npix; i++) back[i] = 0xDEADBEEFu;   // wipe
+            __asm__ volatile("mfence" ::: "memory");
+            vgpu_transfer_3d(VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D, VIRGL_TEST_CTX,
+                             VIRGL_TEST_RES, 0, 0, 0, VIRGL_TEST_W, VIRGL_TEST_H, 1, 0, 0, 0, 0);
+            __asm__ volatile("mfence" ::: "memory");
+            uint32_t bad3 = 0;
+            for (uint32_t i = 0; i < npix; i++) if (back[i] != (0x00BADA55u ^ i)) bad3++;
+            kprintf("[virtio-gpu] virgl COPY_TRANSFER3D(op45): %s (setup=%d submit=%d, %u/%u wrong, first=%x)\n",
+                    bad3 ? "FAIL" : "PASS", ct_ok, cs_ok, bad3, npix, back[0]);
+            virtio_gpu_resource_unref(STAGE_RES);
+            pmm_buddy_free(sp, 4);
+        }
+    }
 out:
     virtio_gpu_resource_unref(VIRGL_TEST_RES);   // harmless if never created
     vgpu_ctx_destroy(VIRGL_TEST_CTX);
-    pmm_buddy_free(bp, 0);
+    pmm_buddy_free(bp, 4);
 }
 
 // ── virgl self-test (Phase 1b: the GPU actually renders) ─────────────────────
