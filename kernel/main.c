@@ -514,9 +514,15 @@ static void init_kthread(void) {
 
     // shmem_create_dma: fully-resident, pinned, best-effort-large-block backing
     // for GPU scatter-gather (SCALABILITY_DEBT #14).  Verify every page is
-    // populated + pmm_pin'd and that teardown unpins cleanly (no leaked pin).
+    // populated + pmm_pin'd and that teardown unpins cleanly (no leaked pin),
+    // and that a >64 MiB backing allocates (no contiguity cap).
     extern void shmem_dma_selftest(void);
     shmem_dma_selftest();
+
+    // DRM pinned-memory budget: a >64 MiB charge succeeds (per-resource cap
+    // removed), a runaway is cleanly rejected with -ENOMEM, counters restored.
+    extern void drm_budget_selftest(void);
+    drm_budget_selftest();
 
     // rename(2) must reject moving a directory into its own subtree (mv /a /a/b)
     // -- it would detach the subtree into an unreachable cycle.

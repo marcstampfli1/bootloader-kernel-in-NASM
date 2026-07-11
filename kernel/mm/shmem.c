@@ -494,5 +494,20 @@ void shmem_dma_selftest(void) {
     shmem_unref(shm);          // deferred RCU free: must unpin every page
     synchronize_rcu();         // force the free to run now so a leak/BUG shows in-line
     kprintf("[shmem-dma] freed (PASS if no '[pmm] BUG ... PINNED frame' printed above)\n");
+
+    // A backing bigger than the OLD 64 MiB per-resource contiguity cap must
+    // allocate via scatter-gather (no large contiguous block required).
+    const uint32_t BIG = 20000;   // ~78 MiB, > 16384 pages (64 MiB)
+    shmem_t* big = shmem_create_dma(BIG);
+    if (!big) { kprintf("[shmem-dma] >64MiB: FAIL (create_dma(%u pages) returned NULL)\n", BIG); return; }
+    uint32_t bunpop = 0, bruns = 0;
+    for (uint32_t i = 0; i < BIG; i++) {
+        if (!big->pages[i]) { bunpop++; continue; }
+        if (i == 0 || big->pages[i] != big->pages[i - 1] + 4096u) bruns++;
+    }
+    kprintf("[shmem-dma] >64MiB: %s (%u pages = ~%u MiB, unpopulated=%u, %u runs)\n",
+            bunpop == 0 ? "PASS" : "FAIL", BIG, (BIG * 4u) / 1024u, bunpop, bruns);
+    shmem_unref(big);
+    synchronize_rcu();
 }
 #endif

@@ -497,7 +497,44 @@ metadata writes for the lock-hold latency to matter yet.
 
 ---
 
-## 14. virtio-gpu resource backing is physically contiguous (single mem_entry)
+## 14. virtio-gpu resource backing is physically contiguous (single mem_entry) -- RESOLVED (2026-07-11)
+
+**RESOLVED.** DRM/virgl resource backing is now scatter-gather, not contiguous.
+Every dumb, res3d, fb, PRIME clone and cursor backs its pages with a
+`shmem_create_dma` object -- scattered (best-effort large blocks, degrading to
+order-0, never requiring a contiguous span), pinned (DMA-safe + swap-immune),
+fully resident -- and attaches to the device as a multi-entry mem_entry list
+(`virtio_gpu_resource_attach_backing_sg`, chained-descriptor transport for any
+run count).  Landed in: `shmem_create_dma` (d2a0467), the DRM conversion
+(aba707a), and the cap/budget rework (this entry).  What changed vs the debt:
+
+- **Fragmentation cliff: gone.** No resource needs a high-order contiguous block;
+  a large buffer allocates as scattered pages even when RAM is fragmented.
+- **Power-of-2 waste: gone.** `bytes_alloc` is now exact page-rounded, not
+  rounded up to the next power-of-2 buddy order.
+- **64 MiB per-resource cap: REMOVED.** It was purely a contiguity guard-rail (a
+  buddy alloc that big fails under fragmentation); with scatter-gather there is no
+  contiguous block to fail.  The only upper bound now is the backing store's
+  capacity (`SHMEM_MAX_PAGES`, which also keeps `bytes` within uint32); the
+  pinned-memory budget is the real guard.
+- **Per-task 256 MiB magic cap: REPLACED** with two RAM-derived ceilings in
+  `drm_charge` -- GLOBAL <= 3/4 of physical RAM (system-wide, keeps GPU memory
+  from starving the kernel) and PER-TASK <= 1/2 of RAM (fairness), both floored so
+  a small VM still runs a real GL workload, both enforced BEFORE any page is
+  pinned so exceeding either is a clean `-ENOMEM`, never a crash.
+- **STILL PLANNED (not a blocker):** a privileged raise-the-limit knob
+  (sysctl/boot-param or ioctl) + per-client override, so a trusted compositor /
+  GPU app that legitimately needs more can be granted it while the gate stays for
+  untrusted clients (design captured in memory `project_makaos_gpu_pin_budget`).
+  Also optional: 2 MiB huge-page userspace mmap for large runs (the allocator
+  already clusters into 2 MiB-capable blocks; the mmap path currently installs
+  4 KiB PTEs, zero-fault).
+
+Verified headless (SELFTESTS=1): `shmem-dma` populate/pin + >64 MiB allocate,
+`drm-budget` (>64 MiB charge OK + runaway reject + counters restored), the
+virtio-gpu SG multi-entry round-trip, and the drm-mock vtable battery all PASS.
+
+The original debt writeup, for history:
 
 - **What**: every virgl/DRM resource (textures, render targets, window/scanout
   backing, vertex/staging buffers) is allocated with `pmm_buddy_alloc(order)` --

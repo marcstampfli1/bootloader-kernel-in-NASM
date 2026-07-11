@@ -100,37 +100,63 @@ static drm_scanout_state_t drm_scanout_snapshot(uint32_t sc) {
     return s;
 }
 
-// ── Memory accounting ────────────────────────────────────────────────
-// Every DRM buffer charges its backing allocation to the owning task's
-// drm_bytes_charged counter.  Hard cap enforced on create; a future OOM
-// path (kernel/mm/oom.c) will consult this to pick kill victims.
+// ── Pinned-memory budget ─────────────────────────────────────────────
+// DRM backings are pmm_pinned scatter-gather shmem objects (shmem_create_dma):
+// unswappable, unreclaimable RAM the GPU DMAs into.  The budget's ONE job is to
+// stop a client -- by accident or malice -- from pinning so much that the kernel
+// and other subsystems starve.  It is NOT a hardware or contiguity limit (there
+// is no contiguous block to fail anymore); it is a fairness + DoS guard.
 //
-// WHY a cap at all: DRM backings are physically-CONTIGUOUS buddy blocks
-// (see docs/SCALABILITY_DEBT.md #14).  Without a ceiling one client could
-// demand enormous high-order contiguous allocations and either exhaust or
-// badly fragment physical RAM -- a DoS/fairness hazard, not a hardware
-// requirement.  The bound largely dissolves once scatter-gather backing
-// lands (scattered pages don't fragment the buddy allocator).
+// Two RAM-derived ceilings, both enforced BEFORE any page is pinned so that
+// exceeding either is a clean -ENOMEM, never a crash (the caller unwinds and
+// returns the error up to Mesa):
+//   - GLOBAL: total DRM-pinned bytes across ALL tasks <= 3/4 of physical RAM,
+//     so GPU memory can never consume the whole machine (>= 1/4 stays for the
+//     kernel, page cache, and everything else).
+//   - PER-TASK: one task <= 1/2 of physical RAM, the fairness share so a single
+//     client cannot monopolise the global budget.
+// Both scale with the machine (1 GiB VM -> workstation) instead of a magic
+// constant, with floors so a small VM still runs a real GL workload (a 4K BGRA
+// framebuffer alone is ~33 MiB, a textured scene's working set hundreds of MiB).
 //
-// The ceiling is PROPORTIONAL to physical RAM (half of it, 512 MiB floor)
-// rather than a fixed magic number, so it scales from a 1 GiB VM to a
-// 64 GiB workstation instead of starving a real GL workload -- a single
-// 4K BGRA framebuffer is already ~33 MiB, a textured scene's working set
-// is easily hundreds of MiB.  Half-of-RAM still stops one task from
-// consuming the whole machine.
+// PLANNED (see docs/SCALABILITY_DEBT.md + memory project_makaos_gpu_pin_budget):
+// a privileged raise-the-limit knob (sysctl/boot-param or ioctl) + per-client
+// override, so a trusted compositor / GPU app that legitimately needs more can
+// be granted it, while the gate stays for untrusted clients.
+static uint64_t g_drm_pinned_total = 0;   // sum of every task's drm_bytes_charged
+
+static uint64_t drm_ram_bytes(void) { return pmm_total_frames_get() * 4096ull; }
+
+static uint64_t drm_global_pin_limit(void) {
+    uint64_t g = drm_ram_bytes() * 3ull / 4ull;          // 75% of RAM, system-wide
+    return g > (768ull << 20) ? g : (768ull << 20);      // floor 768 MiB
+}
 static uint64_t drm_per_task_limit(void) {
-    uint64_t half = (pmm_total_frames_get() * 4096ull) / 2ull;
-    return half > (512ull << 20) ? half : (512ull << 20);
+    uint64_t half = drm_ram_bytes() / 2ull;              // fair share: <= 1/2 RAM
+    return half > (512ull << 20) ? half : (512ull << 20);// floor 512 MiB
 }
 
 static int drm_charge(task_t* t, uint64_t bytes) {
     if (!t) return 0;
-    uint64_t limit = drm_per_task_limit();
+    // Global cap first (system protection).
+    uint64_t glim = drm_global_pin_limit();
+    uint64_t g = __atomic_load_n(&g_drm_pinned_total, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (g + bytes > glim) return -ENOMEM;
+        if (__atomic_compare_exchange_n(&g_drm_pinned_total, &g, g + bytes,
+                                        0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;
+    }
+    // Per-task cap (fairness).  On reject, undo the global charge we just took.
+    uint64_t tlim = drm_per_task_limit();
     uint64_t cur = __atomic_load_n(&t->drm_bytes_charged, __ATOMIC_ACQUIRE);
     for (;;) {
-        if (cur + bytes > limit) return -ENOMEM;
+        if (cur + bytes > tlim) {
+            __atomic_fetch_sub(&g_drm_pinned_total, bytes, __ATOMIC_ACQ_REL);
+            return -ENOMEM;
+        }
         if (__atomic_compare_exchange_n(&t->drm_bytes_charged, &cur, cur + bytes,
-                                          0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                                        0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             return 0;
     }
 }
@@ -138,7 +164,34 @@ static int drm_charge(task_t* t, uint64_t bytes) {
 static void drm_uncharge(task_t* t, uint64_t bytes) {
     if (!t) return;
     __atomic_fetch_sub(&t->drm_bytes_charged, bytes, __ATOMIC_ACQ_REL);
+    __atomic_fetch_sub(&g_drm_pinned_total, bytes, __ATOMIC_ACQ_REL);
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Verify the pinned-memory budget: a single buffer bigger than the OLD 64 MiB
+// per-resource cap charges fine (the cap is gone), a runaway that would exceed
+// the per-task fair share is REJECTED cleanly with -ENOMEM (never a crash), and
+// the counters are restored exactly on uncharge (no drift).  Runs at boot before
+// any DRM client exists, so the global counter starts at 0.
+void drm_budget_selftest(void) {
+    task_t* t = g_current;
+    if (!t) { kprintf("[drm-budget] SKIP (no current task)\n"); return; }
+    uint64_t tlim  = drm_per_task_limit();
+    uint64_t saved = __atomic_load_n(&t->drm_bytes_charged, __ATOMIC_ACQUIRE);
+    uint64_t g0    = __atomic_load_n(&g_drm_pinned_total, __ATOMIC_ACQUIRE);
+    int r1 = drm_charge(t, 128ull << 20);   // 128 MiB: > the old 64 MiB cap
+    int r2 = drm_charge(t, tlim);           // pushes over the per-task fair share
+    if (r1 == 0) drm_uncharge(t, 128ull << 20);
+    uint64_t after = __atomic_load_n(&t->drm_bytes_charged, __ATOMIC_ACQUIRE);
+    uint64_t g1    = __atomic_load_n(&g_drm_pinned_total, __ATOMIC_ACQUIRE);
+    kprintf("[drm-budget] %s (>64MiB charge=%d, runaway reject=%d, restored=%d, "
+            "per_task=%luMiB glob=%luMiB)\n",
+            (r1 == 0 && r2 == -ENOMEM && after == saved && g1 == g0) ? "PASS" : "FAIL",
+            r1, r2, (after == saved && g1 == g0),
+            (unsigned long)(tlim >> 20),
+            (unsigned long)(drm_global_pin_limit() >> 20));
+}
+#endif
 
 // ── Linux DRM ioctl numbers (subset) ─────────────────────────────────
 // Encoded via _IOC in Linux; we hardcode the exact request values
@@ -3203,8 +3256,8 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
     if (!virtio_gpu_3d_available()) return -ENODEV;
     // A PIPE_BUFFER (target 0) uses `width` as a byte size, so the 16384
     // texture-dimension limit does not apply to it -- Mesa's virgl creates
-    // multi-MB vertex/constant buffers.  The size cap below is the real memory
-    // guard for every resource type.
+    // multi-MB vertex/constant buffers.  The pinned-memory budget (drm_charge)
+    // is the real memory guard for every resource type.
     if (a.width == 0) return -EINVAL;
     if (a.target != 0 && (a.height == 0 || a.width > 16384 || a.height > 16384))
         return -EINVAL;
@@ -3214,8 +3267,15 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
 
     uint32_t stride = a.stride ? a.stride : a.width * 4u;   // assume 4bpp if unset
     uint64_t size64 = a.size ? a.size : (uint64_t)stride * a.height;
-    if (size64 == 0 || size64 > (64u << 20)) return -EINVAL;
+    if (size64 == 0) return -EINVAL;
     uint64_t pages = (size64 + 4095) / 4096;
+    // The old 64 MiB per-resource cap was a CONTIGUITY guard-rail (a high-order
+    // buddy alloc that big fails under fragmentation).  Scatter-gather backing
+    // has no contiguous block to fail, so the cap is gone.  The only upper bound
+    // now is the backing store's capacity (SHMEM_MAX_PAGES), which also keeps
+    // `bytes` within uint32 (overflow-safe); the pinned-memory budget is the
+    // real guard and returns a clean -ENOMEM when exceeded.
+    if (pages > SHMEM_MAX_PAGES) return -ENOMEM;
     uint32_t bytes = (uint32_t)(pages * 4096u);   // page-rounded (no power-of-2 waste)
 
     rc = drm_charge(g_current, bytes);
