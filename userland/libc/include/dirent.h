@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_DIRENT_H
 #define _MAKAOS_DIRENT_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 #define DT_UNKNOWN 0
@@ -36,5 +40,9 @@ int    scandir(const char* path, struct dirent*** namelist,
                 int (*compar)(const struct dirent**, const struct dirent**));
 int    alphasort(const struct dirent** a, const struct dirent** b);
 int    versionsort(const struct dirent** a, const struct dirent** b);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

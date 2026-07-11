@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_FCNTL_H
 #define _MAKAOS_FCNTL_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 // open() flags
@@ -72,5 +76,9 @@ int fcntl(int fd, int cmd, ...);
 #define AT_REMOVEDIR         0x200
 #define AT_SYMLINK_FOLLOW    0x400
 #define AT_EACCESS           0x200
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

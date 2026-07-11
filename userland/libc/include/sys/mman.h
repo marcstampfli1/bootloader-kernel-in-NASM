@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SYS_MMAN_H
 #define _MAKAOS_SYS_MMAN_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 #define PROT_NONE  0
@@ -47,5 +51,9 @@ int shm_unlink(const char* name);
 #define MFD_NOEXEC_SEAL   0x0008u
 #define MFD_EXEC          0x0010u
 int memfd_create(const char* name, unsigned int flags);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

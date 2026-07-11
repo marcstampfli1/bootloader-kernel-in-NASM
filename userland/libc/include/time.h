@@ -67,6 +67,8 @@ time_t     mktime(struct tm* tm);
 size_t     strftime(char* s, size_t max, const char* fmt, const struct tm* tm);
 char*      ctime(const time_t* t);
 char*      asctime(const struct tm* tm);
+char*      ctime_r(const time_t* t, char* buf);          // buf >= 26 bytes
+char*      asctime_r(const struct tm* tm, char* buf);    // buf >= 26 bytes
 double     difftime(time_t a, time_t b);
 
 #ifdef __cplusplus

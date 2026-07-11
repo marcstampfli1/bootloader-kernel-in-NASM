@@ -680,6 +680,21 @@ char* asctime(const struct tm* tm) {
 char* ctime(const time_t* t) {
     return asctime(localtime(t));
 }
+// Thread-safe variants: format into the caller's buffer (POSIX requires it to be
+// at least 26 bytes -- the fixed "Www Mmm dd hh:mm:ss yyyy\n\0" layout).
+char* asctime_r(const struct tm* tm, char* buf) {
+    char* s = asctime(tm);
+    if (!s || !buf) return 0;
+    __builtin_memcpy(buf, s, 26);   // fixed 26-byte layout incl. NUL
+    return buf;
+}
+char* ctime_r(const time_t* t, char* buf) {
+    extern struct tm* localtime_r(const time_t*, struct tm*);
+    struct tm tmp;
+    struct tm* lt = localtime_r(t, &tmp);
+    if (!lt) return 0;
+    return asctime_r(lt, buf);
+}
 
 // difftime — both time_t values are seconds; the difference is exact.
 double difftime(time_t end, time_t start) {

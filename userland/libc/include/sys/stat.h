@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SYS_STAT_H
 #define _MAKAOS_SYS_STAT_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <time.h>
 
@@ -73,5 +77,9 @@ int mkdir(const char* path, mode_t mode);
 int chmod(const char* path, mode_t mode);
 int fchmod(int fd, mode_t mode);
 mode_t umask(mode_t mask);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

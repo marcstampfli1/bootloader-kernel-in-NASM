@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SYS_SOCKET_H
 #define _MAKAOS_SYS_SOCKET_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 // Address families
@@ -140,5 +144,9 @@ int     getsockname(int fd, struct sockaddr* addr, socklen_t* len);
 int     getpeername(int fd, struct sockaddr* addr, socklen_t* len);
 ssize_t sendmsg(int fd, const struct msghdr* msg, int flags);
 ssize_t recvmsg(int fd, struct msghdr* msg, int flags);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SIGNAL_H
 #define _MAKAOS_SIGNAL_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 // Signal numbers — match kernel.
@@ -140,5 +144,9 @@ int sigwait(const sigset_t* set, int* sig);
 // Per-thread signal mask.  MakaOS has a single process-wide mask,
 // so this aliases sigprocmask.  Also declared in <pthread.h>.
 int pthread_sigmask(int how, const sigset_t* set, sigset_t* old);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
