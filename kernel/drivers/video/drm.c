@@ -100,17 +100,34 @@ static drm_scanout_state_t drm_scanout_snapshot(uint32_t sc) {
 }
 
 // ── Memory accounting ────────────────────────────────────────────────
-// Every DRM dumb buffer charges its backing allocation to the owning
-// task's drm_bytes_charged counter.  Hard cap enforced on create;
-// OOM path (kernel/mm/oom.c, future) will consult this to pick
-// kill victims.
-#define DRM_PER_TASK_LIMIT  (256ull * 1024 * 1024)  // 256 MiB
+// Every DRM buffer charges its backing allocation to the owning task's
+// drm_bytes_charged counter.  Hard cap enforced on create; a future OOM
+// path (kernel/mm/oom.c) will consult this to pick kill victims.
+//
+// WHY a cap at all: DRM backings are physically-CONTIGUOUS buddy blocks
+// (see docs/SCALABILITY_DEBT.md #14).  Without a ceiling one client could
+// demand enormous high-order contiguous allocations and either exhaust or
+// badly fragment physical RAM -- a DoS/fairness hazard, not a hardware
+// requirement.  The bound largely dissolves once scatter-gather backing
+// lands (scattered pages don't fragment the buddy allocator).
+//
+// The ceiling is PROPORTIONAL to physical RAM (half of it, 512 MiB floor)
+// rather than a fixed magic number, so it scales from a 1 GiB VM to a
+// 64 GiB workstation instead of starving a real GL workload -- a single
+// 4K BGRA framebuffer is already ~33 MiB, a textured scene's working set
+// is easily hundreds of MiB.  Half-of-RAM still stops one task from
+// consuming the whole machine.
+static uint64_t drm_per_task_limit(void) {
+    uint64_t half = (pmm_total_frames_get() * 4096ull) / 2ull;
+    return half > (512ull << 20) ? half : (512ull << 20);
+}
 
 static int drm_charge(task_t* t, uint64_t bytes) {
     if (!t) return 0;
+    uint64_t limit = drm_per_task_limit();
     uint64_t cur = __atomic_load_n(&t->drm_bytes_charged, __ATOMIC_ACQUIRE);
     for (;;) {
-        if (cur + bytes > DRM_PER_TASK_LIMIT) return -ENOMEM;
+        if (cur + bytes > limit) return -ENOMEM;
         if (__atomic_compare_exchange_n(&t->drm_bytes_charged, &cur, cur + bytes,
                                           0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             return 0;
@@ -595,9 +612,10 @@ static void res3d_free(drm_res3d_t* r) {
             pmm_ref_dec(r->phys + (phys_addr_t)i * 4096u);
     // Release the per-task memory charge taken at create time.  Borrowed clones
     // reference the exporter's backing and were never charged, so skip them.
-    // Without this the DRM_PER_TASK_LIMIT counter only grows -- a GL client that
-    // churns textures/streaming buffers eventually hits 256 MiB, RESOURCE_CREATE
-    // starts returning -ENOMEM, and Mesa dereferences the NULL result and crashes.
+    // Without this the per-task charge (drm_per_task_limit) only grows -- a GL
+    // client that churns textures/streaming buffers eventually hits the ceiling,
+    // RESOURCE_CREATE starts returning -ENOMEM, and Mesa dereferences the NULL
+    // result and crashes.
     if (!r->borrowed) drm_uncharge(g_current, r->bytes);
     __builtin_memset(r, 0, sizeof(*r));   // handle=0 marks the slot free
 }
