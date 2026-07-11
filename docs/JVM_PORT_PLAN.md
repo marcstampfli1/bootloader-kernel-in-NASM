@@ -144,7 +144,30 @@ The signal layer (SA_SIGINFO/ucontext + pthread_kill/shared-dispositions +
 sigaltstack) is COMPLETE and verified by userland/apps/sigtest (4 paths, all pass
 under a `SIGTEST=1` boot). Next is Phase 1 (Avian first-light).
 
-Then Phase 1: add a `scripts/port-avian.sh` that cross-builds Avian via its
-posix layer as `platform=linux` with `cxx/cc/ranlib` overridden to the makaos
-toolchain + `--sysroot`, host `javac` for the classpath/bootimage, and iterate
-on remaining missing libc symbols.
+## Phase 1 status (2026-07-12): Avian cross-built and RUNNING on MakaOS
+
+`scripts/port-avian.sh` cross-builds Avian (interpreter) to a static MakaOS
+x86-64 `avian` (7.4MB) + classpath.jar; `AVIANTEST=1 bash build.sh` installs and
+boot-spawns it. The JVM cross-compiles and runs end to end on MakaOS: it loads
+and links classes from the embedded classpath, runs the bytecode interpreter, and
+executes class static initializers (reaches `String.<clinit>`). Getting Hello
+World to print is blocked on `NoClassDefFoundError: java/lang/String$1` during
+`String.<clinit>`.
+
+Ruled out for the String$1 failure: file I/O (a read()-vs-mmap swap fails
+identically), zip parsing (a host reproduction of Avian's exact central-directory
+walk reaches all 622 entries including String$1), hashing (the two hash overloads
+are byte-identical), embedded-jar integrity (byte-complete, 966263 B), and
+missing dependencies (java/util/Comparator etc. present). Remaining: a
+MakaOS-runtime issue in Avian's `JarIndex`/classloader (src/finder.cpp) or class
+name resolution -- needs VM instrumentation (debug prints in
+`JarIndex::open`/`findNode`, rebuild + boot) to pinpoint.
+
+Boot the AVIANTEST image at **-m 1024M**; MakaOS hangs very early at 2048M (a
+separate RAM-size bug worth a look).
+
+Build gotchas encoded in port-avian.sh / already fixed: `java-version=8` (Avian's
+old `javac 1.x` version parse breaks on a modern JDK), `rdynamic=-Wl,--export-dynamic`
+(the makaos gcc rejects bare `-rdynamic`), libc `extern "C"` header guards +
+netinet/ip.h + ctime_r (commit 6d1c9fe -- Avian is the first big C++ port), and
+two tiny Avian source patches (posix.cpp limits.h, java-lang.cpp sysctl).
