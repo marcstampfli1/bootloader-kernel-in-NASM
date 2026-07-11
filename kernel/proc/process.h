@@ -152,10 +152,18 @@ typedef struct __attribute__((aligned(16))) task_t {
     // atomic-or).  See kernel/io/signalfd.c.
     void*         signalfd_head;
 
-    // Total DRM dumb-buffer bytes charged to this task.  Incremented
-    // on CREATE_DUMB, decremented on DESTROY_DUMB or drm_close.  Hard
-    // cap enforced in drm.c; future OOM kill reads this to prioritise.
+    // Total DRM pinned-backing bytes charged to this task.  Incremented
+    // on CREATE_DUMB / resource_create, decremented on destroy or drm_close.
+    // Bounded by the pinned-memory budget in drm.c; future OOM kill reads
+    // this to prioritise.
     uint64_t      drm_bytes_charged;
+
+    // Per-task pinned-memory ceiling OVERRIDE (0 = use the RAM-derived
+    // default).  A privileged client raises its own ceiling via
+    // DRM_IOCTL_MAKA_PIN_LIMIT so a trusted compositor / GPU app that
+    // legitimately needs more than the fair share can be granted it, while
+    // the default gate stays for untrusted clients.
+    uint64_t      drm_pin_limit;
 
     // DRM context priority (#5 of design-hardening).  Higher numbers
     // submit commits with higher priority than lower numbers.  Default

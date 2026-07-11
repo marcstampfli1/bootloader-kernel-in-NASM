@@ -26,6 +26,7 @@
 #include "vmm.h"
 #include "shmem.h"     // shmem_create_dma: pinned scatter-gather resource backing
 #include "process.h"
+#include "cred.h"       // cred_is_root (privileged pin-limit grant)
 #include "smp.h"
 #include "sched.h"      // g_current
 #include "seqlock.h"
@@ -123,17 +124,27 @@ static drm_scanout_state_t drm_scanout_snapshot(uint32_t sc) {
 // a privileged raise-the-limit knob (sysctl/boot-param or ioctl) + per-client
 // override, so a trusted compositor / GPU app that legitimately needs more can
 // be granted it, while the gate stays for untrusted clients.
-static uint64_t g_drm_pinned_total = 0;   // sum of every task's drm_bytes_charged
+static uint64_t g_drm_pinned_total = 0;      // sum of every task's drm_bytes_charged
+static uint64_t g_drm_global_override = 0;   // 0 = RAM-derived default; else raised ceiling
 
 static uint64_t drm_ram_bytes(void) { return pmm_total_frames_get() * 4096ull; }
 
+// System-wide ceiling: a privileged override if set, else 3/4 of physical RAM.
 static uint64_t drm_global_pin_limit(void) {
+    uint64_t o = __atomic_load_n(&g_drm_global_override, __ATOMIC_ACQUIRE);
+    if (o) return o;
     uint64_t g = drm_ram_bytes() * 3ull / 4ull;          // 75% of RAM, system-wide
     return g > (768ull << 20) ? g : (768ull << 20);      // floor 768 MiB
 }
-static uint64_t drm_per_task_limit(void) {
+// RAM-derived per-task fair share (the default when a task has no override).
+static uint64_t drm_default_per_task_limit(void) {
     uint64_t half = drm_ram_bytes() / 2ull;              // fair share: <= 1/2 RAM
     return half > (512ull << 20) ? half : (512ull << 20);// floor 512 MiB
+}
+// Effective per-task ceiling: the task's granted override if set, else default.
+static uint64_t drm_task_pin_limit(task_t* t) {
+    uint64_t o = t ? __atomic_load_n(&t->drm_pin_limit, __ATOMIC_ACQUIRE) : 0;
+    return o ? o : drm_default_per_task_limit();
 }
 
 static int drm_charge(task_t* t, uint64_t bytes) {
@@ -147,8 +158,9 @@ static int drm_charge(task_t* t, uint64_t bytes) {
                                         0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             break;
     }
-    // Per-task cap (fairness).  On reject, undo the global charge we just took.
-    uint64_t tlim = drm_per_task_limit();
+    // Per-task cap (fairness, honouring any grant).  On reject, undo the global
+    // charge we just took.
+    uint64_t tlim = drm_task_pin_limit(t);
     uint64_t cur = __atomic_load_n(&t->drm_bytes_charged, __ATOMIC_ACQUIRE);
     for (;;) {
         if (cur + bytes > tlim) {
@@ -176,19 +188,31 @@ static void drm_uncharge(task_t* t, uint64_t bytes) {
 void drm_budget_selftest(void) {
     task_t* t = g_current;
     if (!t) { kprintf("[drm-budget] SKIP (no current task)\n"); return; }
-    uint64_t tlim  = drm_per_task_limit();
+    uint64_t dlim  = drm_default_per_task_limit();
     uint64_t saved = __atomic_load_n(&t->drm_bytes_charged, __ATOMIC_ACQUIRE);
     uint64_t g0    = __atomic_load_n(&g_drm_pinned_total, __ATOMIC_ACQUIRE);
-    int r1 = drm_charge(t, 128ull << 20);   // 128 MiB: > the old 64 MiB cap
-    int r2 = drm_charge(t, tlim);           // pushes over the per-task fair share
+    uint64_t ovsav = __atomic_load_n(&t->drm_pin_limit, __ATOMIC_ACQUIRE);
+
+    // 1. >64 MiB buffer charges (per-resource cap gone); a runaway over the
+    //    fair share is cleanly rejected.
+    int r1 = drm_charge(t, 128ull << 20);
+    int r2 = drm_charge(t, dlim);            // pushes over the default per-task cap
     if (r1 == 0) drm_uncharge(t, 128ull << 20);
+
+    // 2. GRANT: raise this task's ceiling, then a charge that exceeds the DEFAULT
+    //    fair share but fits the grant now succeeds -- the privileged override.
+    __atomic_store_n(&t->drm_pin_limit, dlim + (256ull << 20), __ATOMIC_RELEASE);
+    int r3 = drm_charge(t, dlim + (64ull << 20));   // > default, <= grant + global
+    if (r3 == 0) drm_uncharge(t, dlim + (64ull << 20));
+    __atomic_store_n(&t->drm_pin_limit, ovsav, __ATOMIC_RELEASE);   // restore
+
     uint64_t after = __atomic_load_n(&t->drm_bytes_charged, __ATOMIC_ACQUIRE);
     uint64_t g1    = __atomic_load_n(&g_drm_pinned_total, __ATOMIC_ACQUIRE);
-    kprintf("[drm-budget] %s (>64MiB charge=%d, runaway reject=%d, restored=%d, "
-            "per_task=%luMiB glob=%luMiB)\n",
-            (r1 == 0 && r2 == -ENOMEM && after == saved && g1 == g0) ? "PASS" : "FAIL",
-            r1, r2, (after == saved && g1 == g0),
-            (unsigned long)(tlim >> 20),
+    kprintf("[drm-budget] %s (>64MiB=%d, runaway reject=%d, grant-raise=%d, restored=%d, "
+            "def_task=%luMiB glob=%luMiB)\n",
+            (r1==0 && r2==-ENOMEM && r3==0 && after==saved && g1==g0) ? "PASS" : "FAIL",
+            r1, r2, r3, (after==saved && g1==g0),
+            (unsigned long)(dlim >> 20),
             (unsigned long)(drm_global_pin_limit() >> 20));
 }
 #endif
@@ -262,6 +286,19 @@ void drm_budget_selftest(void) {
 #define DRM_IOCTL_VIRTGPU_WAIT              0xC0086448  // drm_virtgpu_3d_wait (8)
 #define DRM_IOCTL_VIRTGPU_GET_CAPS          0xC0186449  // drm_virtgpu_get_caps (24)
 #define DRM_IOCTL_VIRTGPU_CONTEXT_INIT      0xC010644B  // drm_virtgpu_context_init (16)
+
+// MakaOS-private: raise/query the pinned-memory budget (see drm_charge).  A
+// privileged (root) client raises its OWN per-task ceiling and/or the global
+// ceiling so a trusted compositor / GPU app can be granted more than the fair
+// share; any client may QUERY (per_task=global=0).  _IOWR('d', 0x70, 40).
+#define DRM_IOCTL_MAKA_PIN_LIMIT            0xC0286470u
+typedef struct {
+    uint64_t per_task;      // in:  requested per-task ceiling in bytes (0 = leave / query)
+    uint64_t global;        // in:  requested global ceiling in bytes  (0 = leave / query)
+    uint64_t flags;         // in:  reserved, must be 0
+    uint64_t out_per_task;  // out: effective per-task ceiling after the call
+    uint64_t out_global;    // out: effective global ceiling after the call
+} drm_maka_pin_limit_t;
 
 // ── DRM capability IDs ──────────────────────────────────────────────
 #define DRM_CAP_DUMB_BUFFER          0x1
@@ -3469,6 +3506,28 @@ static const char* drm_ioctl_name(uint64_t req) {
     return "?";
 }
 
+// Raise (privileged) or query the pinned-memory budget.  Raising either ceiling
+// requires root (euid 0); a pure query (per_task=global=0) is open to any client
+// so it can discover its effective limits.  Even a raised ceiling is still
+// clamped by the global cap in drm_charge, and exceeding it is a clean -ENOMEM.
+static int drm_ioctl_maka_pin_limit(vfs_file_t* f, uint64_t arg) {
+    (void)f;
+    drm_maka_pin_limit_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (a.flags != 0) return -EINVAL;
+    if (a.per_task || a.global) {                       // a SET is privileged
+        if (!cred_is_root(&g_current->cred)) return -EPERM;
+        if (a.per_task)
+            __atomic_store_n(&g_current->drm_pin_limit, a.per_task, __ATOMIC_RELEASE);
+        if (a.global)
+            __atomic_store_n(&g_drm_global_override, a.global, __ATOMIC_RELEASE);
+    }
+    a.out_per_task = drm_task_pin_limit(g_current);
+    a.out_global   = drm_global_pin_limit();
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
 // ── ioctl dispatch ──────────────────────────────────────────────────
 static int64_t drm_ioctl_impl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     switch (req) {
@@ -3523,6 +3582,7 @@ static int64_t drm_ioctl_impl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     case DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST:   return drm_ioctl_virtgpu_transfer(self, arg, 1);
     case DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: return drm_ioctl_virtgpu_transfer(self, arg, 0);
     case DRM_IOCTL_VIRTGPU_WAIT:          return drm_ioctl_virtgpu_wait(self, arg);
+    case DRM_IOCTL_MAKA_PIN_LIMIT:        return drm_ioctl_maka_pin_limit(self, arg);
     default:
         pr_warn("drm", "unknown ioctl req=0x%08x arg=0x%lx → ENOTTY",
                 (uint32_t)req, arg);
