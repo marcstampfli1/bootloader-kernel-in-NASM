@@ -657,18 +657,28 @@ typedef struct res_rc { uint32_t res_id, count; struct res_rc* next; } res_rc_t;
 static res_rc_t*  s_res_rc[RES_RC_BUCKETS];
 static spinlock_t s_res_rc_lock = SPINLOCK_INIT;
 
-static void res_host_ref(uint32_t res_id) {
-    if (!res_id) return;
+// Take a reference on a host resource.  Returns 0 on success, -ENOMEM if the
+// tracking node had to be allocated and could not be.  The caller MUST fail the
+// operation on -ENOMEM: silently dropping the ref left the resource referenced
+// but untracked, so a later res_host_unref hit the "untracked -> destroy" branch
+// and destroyed it while a second holder still used it (premature destroy +
+// double unref).  Node allocation only happens on the FIRST ref of a res_id
+// (the owning resource_create); every later ref finds the existing node and
+// only increments, so it cannot fail.
+static int res_host_ref(uint32_t res_id) {
+    if (!res_id) return 0;
     uint32_t b = res_id % RES_RC_BUCKETS;
     spin_lock(&s_res_rc_lock);
     res_rc_t* e = s_res_rc[b];
     for (; e; e = e->next) if (e->res_id == res_id) break;
     if (!e) {
         e = (res_rc_t*)kmalloc(sizeof(*e));
-        if (e) { e->res_id = res_id; e->count = 0; e->next = s_res_rc[b]; s_res_rc[b] = e; }
+        if (!e) { spin_unlock(&s_res_rc_lock); return -ENOMEM; }
+        e->res_id = res_id; e->count = 0; e->next = s_res_rc[b]; s_res_rc[b] = e;
     }
-    if (e) e->count++;
+    e->count++;
     spin_unlock(&s_res_rc_lock);
+    return 0;
 }
 
 // Decrement; unref the host resource (and free the tracking node) only at zero.
@@ -1071,8 +1081,10 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
     fb->is_3d       = is_3d;
     // 3D: the fb scans out a borrowed host resource; take a host-resource ref so
     // it survives the exporting client rotating/freeing its swapchain while this
-    // fb is still displayed (dropped in drm_fb_free).
-    if (is_3d) res_host_ref(fb_res_id);
+    // fb is still displayed (dropped in drm_fb_free).  fb_res_id is the res3d's
+    // already-tracked resource, so this ref only increments (cannot fail); the
+    // check is defensive.  The fb is not yet linked, so kfree unwinds cleanly.
+    if (is_3d && res_host_ref(fb_res_id) != 0) { kfree(fb); return -ENOMEM; }
     // The fb holds its OWN ref on the shared scatter-gather backing (dumb AND
     // 3D), so it survives close_all_bo_handles() closing the source GEM handle
     // and can never dangle if the source frees first (object-level refcount).
@@ -1965,7 +1977,9 @@ static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
     // Own a reference to the host resource too (not just the pages): the dma-buf
     // keeps the virgl resource alive even after the exporter closes its handle,
     // so a scanout/import that still needs it does not hit a destroyed resource.
-    if (src_res_id) res_host_ref(src_res_id);
+    // src_res_id is a res3d's already-tracked resource, so this only increments
+    // (cannot fail); the check is defensive.  Nothing shared yet -> kfree unwinds.
+    if (src_res_id && res_host_ref(src_res_id) != 0) { kfree(db); kfree(pf); return -ENOMEM; }
     // Own a ref on the shared scatter-gather backing: the dma-buf keeps the
     // memory alive even after the exporter destroys its handle.
     shmem_ref(src_backing);
@@ -2047,8 +2061,10 @@ static int drm_ioctl_prime_fd_to_handle(vfs_file_t* drm_f, uint64_t arg) {
         r->res_id = db->res_id; r->width = db->width; r->height = db->height;
         r->format = db->format; r->bytes = db->bytes; r->backing = db->backing;
         r->borrowed = 1;
-        res_host_ref(r->res_id);   // borrowed clone holds its own resource ref...
-        shmem_ref(db->backing);    // ...and its own scatter-gather backing ref
+        // db->res_id is already tracked (the exporter refs it), so this only
+        // increments (cannot fail); the check is defensive.  No refs taken yet.
+        if (res_host_ref(r->res_id) != 0) { __builtin_memset(r, 0, sizeof(*r)); return -ENOMEM; }
+        shmem_ref(db->backing);    // clone's own scatter-gather backing ref
         a.handle = h;
         if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) {
             res3d_free(r);   // borrowed: ref_decs pages, does NOT unref host res
@@ -3341,8 +3357,19 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
     if (!r) { virtio_gpu_resource_unref(res_id); shmem_unref(shm);
               drm_uncharge(g_current, bytes); return -ENOMEM; }
     r->res_id = res_id; r->width = a.width; r->height = a.height;
-    res_host_ref(res_id);   // owner holds the first reference on the host resource
     r->format = a.format; r->bytes = bytes; r->backing = shm;
+    // Owner holds the FIRST reference on the host resource (creates the tracking
+    // node).  If that node can't be allocated, a res3d must never exist
+    // untracked -- a later PRIME clone would create the node missing this ref
+    // and the owner's free would then destroy the resource under the clone.
+    // Fail cleanly.
+    if (res_host_ref(res_id) != 0) {
+        __builtin_memset(r, 0, sizeof(*r));   // release the slot (handle=0)
+        virtio_gpu_resource_unref(res_id);
+        shmem_unref(shm);
+        drm_uncharge(g_current, bytes);
+        return -ENOMEM;
+    }
 
     a.bo_handle = h; a.res_handle = res_id; a.size = (uint32_t)size64; a.stride = stride;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
