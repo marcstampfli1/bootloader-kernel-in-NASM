@@ -179,6 +179,7 @@ typedef struct __attribute__((packed)) {
 static int s_ok = 0;
 static int s_virgl = 0;   // 1 if VIRTIO_GPU_F_VIRGL negotiated (host has 3D)
 static void virtio_gpu_virgl_selftest(void);        // Phase 1a: 3D data path
+static void virtio_gpu_sg_backing_selftest(void);   // Phase 1e: SG multi-entry backing
 static void virtio_gpu_virgl_clear_selftest(void);  // Phase 1b: GPU render (clear)
 
 // ── GPU fence -- Phase 2b (docs/VIRGL_BRINGUP.md) ───────────────────────────
@@ -662,6 +663,7 @@ int virtio_gpu_init(void) {
     kprintf("[virtio-gpu] initialised (%u scanouts)\n", s_num_scanouts);
     if (s_virgl) {
         virtio_gpu_virgl_selftest();        // Phase 1a: 3D resource data path
+        virtio_gpu_sg_backing_selftest();   // Phase 1e: scatter-gather backing
         virtio_gpu_virgl_clear_selftest();  // Phase 1b: GPU renders (clear)
     }
     // Phase 2b diagnostic: after the boot-time control commands, report how many
@@ -761,24 +763,121 @@ int virtio_gpu_resource_unref(uint32_t res_id) {
     return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
 }
 
+// Like vgpu_send_ctrl, but splices a caller-provided device-READABLE data
+// segment (data_phys, data_len) between the request header and the response.
+// The virtqueue concatenates the header and data descriptors into one logical
+// device-read buffer, so header||data reproduces a single wire command whose
+// tail (e.g. an ATTACH_BACKING mem_entry array) can be arbitrarily large -- it
+// is NOT bounded by the 64 KiB request window an inlined request would face.
+static int vgpu_send_ctrl_data(const void* req, uint32_t req_len,
+                               phys_addr_t data_phys, uint32_t data_len,
+                               void* resp, uint32_t resp_len) {
+    if (!s_cmd_virt) return 0;
+    if (req_len  > CMD_RESP_OFF)                  return 0;
+    if (resp_len > (CMD_BUF_SIZE - CMD_RESP_OFF)) return 0;
+
+    spin_lock(&s_ctrl_lock);
+    __builtin_memcpy(s_cmd_virt + CMD_REQ_OFF, req, req_len);
+    __builtin_memset(s_cmd_virt + CMD_RESP_OFF, 0, resp_len);
+
+    // Build a 3-descriptor chain: header (device-read) + data (device-read) +
+    // response (device-write).  Allocated from the free list, same as the
+    // 2-descriptor vgpu_send_ctrl path.
+    virtq_t* vq = &s_ctrl_vq;
+    uint16_t d0 = vq->free_head;
+    if (d0 == 0xFFFFu) { spin_unlock(&s_ctrl_lock); return 0; }
+    uint16_t d1 = vq->desc[d0].next;
+    if (d1 == 0xFFFFu) { spin_unlock(&s_ctrl_lock); return 0; }
+    uint16_t d2 = vq->desc[d1].next;
+    if (d2 == 0xFFFFu) { spin_unlock(&s_ctrl_lock); return 0; }
+    vq->free_head = vq->desc[d2].next;
+
+    vq->desc[d0].addr  = (uint64_t)(s_cmd_phys + CMD_REQ_OFF);
+    vq->desc[d0].len   = req_len;
+    vq->desc[d0].flags = VIRTQ_DESC_F_NEXT;
+    vq->desc[d0].next  = d1;
+
+    vq->desc[d1].addr  = (uint64_t)data_phys;
+    vq->desc[d1].len   = data_len;
+    vq->desc[d1].flags = VIRTQ_DESC_F_NEXT;
+    vq->desc[d1].next  = d2;
+
+    vq->desc[d2].addr  = (uint64_t)(s_cmd_phys + CMD_RESP_OFF);
+    vq->desc[d2].len   = resp_len;
+    vq->desc[d2].flags = VIRTQ_DESC_F_WRITE;
+    vq->desc[d2].next  = 0;
+
+    uint16_t slot = vq->avail_idx % VIRTQ_SIZE;
+    vq->avail->ring[slot] = d0;
+    __asm__ volatile("mfence" ::: "memory");
+    vq->avail_idx++;
+    vq->avail->idx = vq->avail_idx;
+    __atomic_add_fetch(&s_gpu_fence_submit, 1, __ATOMIC_ACQ_REL);
+    __asm__ volatile("mfence" ::: "memory");
+
+    *(volatile uint16_t*)(s_notify + vq->notify_off * s_notify_mult) = VQ_CONTROLQ;
+    __asm__ volatile("mfence" ::: "memory");
+
+    for (int i = 0; i < 10000000; i++) {
+        uint16_t used_idx = vq->used->idx;
+        __asm__ volatile("lfence" ::: "memory");
+        if (used_idx != vq->last_used_idx) {
+            vq->last_used_idx = used_idx;
+            __builtin_memcpy(resp, s_cmd_virt + CMD_RESP_OFF, resp_len);
+            // Return all three descriptors to the free list.
+            vq->desc[d2].next = vq->free_head;
+            vq->desc[d1].next = d2;
+            vq->desc[d0].next = d1;
+            vq->free_head = d0;
+            __atomic_add_fetch(&s_gpu_fence_done, 1, __ATOMIC_ACQ_REL);
+            if (g_virtio_gpu_irq != 0xFFu) irq_notify(g_virtio_gpu_irq);
+            spin_unlock(&s_ctrl_lock);
+            return 1;
+        }
+    }
+    pr_warn("virtio-gpu", "ctrl(data) timeout reqtype=0x%x datalen=%u status=0x%x",
+            ((virtio_gpu_ctrl_hdr_t*)s_cmd_virt)->type, data_len,
+            (unsigned)s_common->device_status);
+    spin_unlock(&s_ctrl_lock);
+    return 0;
+}
+
+int virtio_gpu_resource_attach_backing_sg(uint32_t res_id,
+                                          const vgpu_sg_run_t* runs,
+                                          uint32_t nruns) {
+    if (!runs || nruns == 0) return 0;
+    // Build the mem_entry array in a transient device-readable buffer -- one
+    // entry per contiguous run.  The caller coalesces adjacent pages, so nruns
+    // is small for unfragmented memory and, worst case, equals the page count.
+    // kmalloc'd memory is HHDM-linear, so its physical address is virt-HHDM and
+    // the buffer is physically contiguous (single descriptor).
+    uint32_t nbytes = nruns * (uint32_t)sizeof(vgpu_mem_entry_t);
+    vgpu_mem_entry_t* ents = (vgpu_mem_entry_t*)kmalloc(nbytes);
+    if (!ents) return 0;
+    for (uint32_t i = 0; i < nruns; i++) {
+        ents[i].addr    = (uint64_t)runs[i].addr;
+        ents[i].length  = runs[i].npages * 4096u;
+        ents[i].padding = 0;
+    }
+    __asm__ volatile("mfence" ::: "memory");   // publish entries before the device reads them
+
+    vgpu_attach_backing_t hdr = {0};
+    hdr.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    hdr.resource_id = res_id;
+    hdr.nr_entries  = nruns;
+    phys_addr_t ents_phys = (phys_addr_t)((uintptr_t)ents - HHDM_OFFSET);
+    virtio_gpu_ctrl_hdr_t resp = {0};
+    int ok = vgpu_send_ctrl_data(&hdr, sizeof(hdr), ents_phys, nbytes,
+                                 &resp, sizeof(resp));
+    kfree(ents);
+    return ok && resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+}
+
 int virtio_gpu_resource_attach_backing_single(uint32_t res_id,
                                                phys_addr_t phys, uint32_t len) {
-    // Single mem_entry — attach one physically contiguous range.  The
-    // common case for our driver-allocated buffers.  For more complex
-    // SG lists (user-mapped dumb buffers later), walk the PTE tree and
-    // emit one entry per run.
-    struct {
-        vgpu_attach_backing_t hdr;
-        vgpu_mem_entry_t      entries[1];
-    } __attribute__((packed)) req = {0};
-    req.hdr.hdr.type     = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
-    req.hdr.resource_id  = res_id;
-    req.hdr.nr_entries   = 1;
-    req.entries[0].addr   = (uint64_t)phys;
-    req.entries[0].length = len;
-    virtio_gpu_ctrl_hdr_t resp = {0};
-    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
-    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+    // One contiguous range is just a one-run scatter-gather list.
+    vgpu_sg_run_t run = { .addr = phys, .npages = (len + 4095u) / 4096u };
+    return virtio_gpu_resource_attach_backing_sg(res_id, &run, 1);
 }
 
 // ── 3D (virgl) command layer -- Phase 1 (docs/VIRGL_BRINGUP.md) ──────────────
@@ -973,6 +1072,80 @@ static int vgpu_submit_3d(uint32_t ctx_id, const uint32_t* cmd, uint32_t ndwords
 // and verify every pixel round-trips.  Runs once at init when VIRGL negotiated.
 // Fixed handles (a real id allocator is a Phase 2 concern once userland creates
 // resources); cleans up the context + resource + page afterwards.
+// ── Scatter-gather backing self-test (Phase 1e) ──────────────────────────────
+// Proves the multi-entry ATTACH_BACKING path: back a 3D texture with pages that
+// are DELIBERATELY scattered (two separate buddy blocks, nruns=2 -> a chained
+// request descriptor, two device mem_entries), upload guest pixels, wipe the
+// guest side, read them back, and confirm every pixel survived the round-trip
+// across the scattered backing.  A FAIL here means the device did not honour the
+// SG list; a PASS means scattered backing is safe to use for real resources.
+#define VIRGL_SG_CTX   0xF010u
+#define VIRGL_SG_RES   0xF011u
+#define VIRGL_SG_W     64u
+#define VIRGL_SG_H     64u
+
+static void virtio_gpu_sg_backing_selftest(void) {
+    const uint32_t npix   = VIRGL_SG_W * VIRGL_SG_H;   // 4096 px
+    const uint32_t bytes  = npix * 4u;                 // 16 KiB = 4 pages
+    // Two runs of 2 pages each (8 KiB), allocated separately so they are almost
+    // certainly NOT physically adjacent -- exactly the fragmented case.
+    const uint32_t run_pages = 2u;
+    const uint32_t px_per_run = run_pages * 4096u / 4u;  // 2048 px per 8 KiB run
+    phys_addr_t p0 = pmm_buddy_alloc(1);
+    phys_addr_t p1 = pmm_buddy_alloc(1);
+    if (!PMM_ALLOC_OK(p0) || !PMM_ALLOC_OK(p1)) {
+        kprintf("[virtio-gpu] SG backing selftest: no mem\n");
+        if (PMM_ALLOC_OK(p0)) pmm_buddy_free(p0, 1);
+        if (PMM_ALLOC_OK(p1)) pmm_buddy_free(p1, 1);
+        return;
+    }
+    volatile uint32_t* b0 = (volatile uint32_t*)((uintptr_t)p0 + HHDM_OFFSET);
+    volatile uint32_t* b1 = (volatile uint32_t*)((uintptr_t)p1 + HHDM_OFFSET);
+    // Pixel i lives in run 0 (i < px_per_run) or run 1.  Unique value per pixel.
+    for (uint32_t i = 0; i < npix; i++) {
+        uint32_t v = 0xFF000000u | i;
+        if (i < px_per_run) b0[i] = v; else b1[i - px_per_run] = v;
+    }
+    __asm__ volatile("mfence" ::: "memory");
+
+    vgpu_sg_run_t runs[2] = { { p0, run_pages }, { p1, run_pages } };
+    (void)bytes;
+    int ok = vgpu_ctx_create(VIRGL_SG_CTX, 0)
+          && vgpu_resource_create_3d(VIRGL_SG_RES, PIPE_TEXTURE_2D,
+                                     VIRGL_FORMAT_B8G8R8A8_UNORM,
+                                     VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW,
+                                     VIRGL_SG_W, VIRGL_SG_H, 1, 1, 0, 0)
+          && virtio_gpu_resource_attach_backing_sg(VIRGL_SG_RES, runs, 2)
+          && vgpu_ctx_attach_resource(VIRGL_SG_CTX, VIRGL_SG_RES);
+    if (!ok) { kprintf("[virtio-gpu] SG backing selftest: setup FAILED\n"); goto out; }
+
+    if (!vgpu_transfer_3d(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D, VIRGL_SG_CTX,
+                          VIRGL_SG_RES, 0, 0, 0, VIRGL_SG_W, VIRGL_SG_H, 1, 0, 0, 0, 0)) {
+        kprintf("[virtio-gpu] SG backing selftest: TO_HOST FAILED\n"); goto out;
+    }
+    for (uint32_t i = 0; i < px_per_run; i++) { b0[i] = 0xDEADBEEFu; b1[i] = 0xDEADBEEFu; }
+    __asm__ volatile("mfence" ::: "memory");
+    if (!vgpu_transfer_3d(VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D, VIRGL_SG_CTX,
+                          VIRGL_SG_RES, 0, 0, 0, VIRGL_SG_W, VIRGL_SG_H, 1, 0, 0, 0, 0)) {
+        kprintf("[virtio-gpu] SG backing selftest: FROM_HOST FAILED\n"); goto out;
+    }
+    __asm__ volatile("mfence" ::: "memory");
+
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < npix; i++) {
+        uint32_t want = 0xFF000000u | i;
+        uint32_t got  = (i < px_per_run) ? b0[i] : b1[i - px_per_run];
+        if (got != want) bad++;
+    }
+    kprintf("[virtio-gpu] SG backing selftest: %s (2 runs, %ux%u, %u/%u px wrong)\n",
+            bad ? "FAIL" : "PASS", VIRGL_SG_W, VIRGL_SG_H, bad, npix);
+out:
+    virtio_gpu_resource_unref(VIRGL_SG_RES);
+    vgpu_ctx_destroy(VIRGL_SG_CTX);
+    pmm_buddy_free(p0, 1);
+    pmm_buddy_free(p1, 1);
+}
+
 #define VIRGL_TEST_CTX   0xF000u
 #define VIRGL_TEST_RES   0xF001u
 #define VIRGL_TEST_W     128u

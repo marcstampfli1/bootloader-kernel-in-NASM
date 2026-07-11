@@ -45,6 +45,23 @@ int virtio_gpu_present_test(void);
 int virtio_gpu_resource_create_2d(uint32_t res_id, uint32_t format,
                                    uint32_t w, uint32_t h);
 int virtio_gpu_resource_unref(uint32_t res_id);
+
+// One physically-contiguous run of backing pages.  A resource's backing is a
+// vector of these -- scattered across the buddy allocator, described to the
+// device as a scatter-gather mem_entry list -- so no resource ever needs one
+// large physically-contiguous block (see docs/SCALABILITY_DEBT.md #14).
+typedef struct {
+    phys_addr_t addr;    // start physical address of the run
+    uint32_t    npages;  // number of 4 KiB pages in the run
+} vgpu_sg_run_t;
+
+// Attach a scatter-gather backing (one device mem_entry per run) to a resource.
+// Handles any run count via a chained request descriptor, so the entry list is
+// not bounded by the control-command bounce window.  Returns 1 on success.
+int virtio_gpu_resource_attach_backing_sg(uint32_t res_id,
+                                          const vgpu_sg_run_t* runs,
+                                          uint32_t nruns);
+// Thin wrapper: attach a single contiguous range (== _sg with one run).
 int virtio_gpu_resource_attach_backing_single(uint32_t res_id,
                                                phys_addr_t phys, uint32_t len);
 int virtio_gpu_set_scanout(uint32_t scanout_id, uint32_t res_id,

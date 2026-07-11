@@ -503,10 +503,19 @@ metadata writes for the lock-hold latency to matter yet.
   backing, vertex/staging buffers) is allocated with `pmm_buddy_alloc(order)` --
   a physically contiguous, power-of-2 block -- and attached to the device as a
   single `nr_entries=1` mem_entry via `virtio_gpu_resource_attach_backing_single`.
+  The two memory ceilings the driver enforces are BOTH consequences of this one
+  decision, not independent policy:
+    - the **64 MiB per-resource cap** (`size64 > (64u << 20)` in
+      `drm_ioctl_virtgpu_resource_create`), and
+    - the **per-task charge ceiling** (`drm_per_task_limit()` in `drm_charge`,
+      now `max(512 MiB, RAM/2)` -- was a fixed 256 MiB magic number).
+  Neither ceiling reflects a device or hardware limit; each exists only to keep a
+  client from asking the buddy allocator for a contiguous block large enough to
+  exhaust or fragment physical RAM.
 - **Where**: `kernel/drivers/video/drm.c` (`drm_ioctl_create_dumb`,
-  `drm_ioctl_virtgpu_resource_create`), `kernel/drivers/video/virtio_gpu.c`
-  (`virtio_gpu_resource_attach_backing_single`). Same pattern for the 64 MiB
-  per-resource size cap in `drm_ioctl_virtgpu_resource_create`.
+  `drm_ioctl_virtgpu_resource_create`, `drm_charge`/`drm_per_task_limit`),
+  `kernel/drivers/video/virtio_gpu.c`
+  (`virtio_gpu_resource_attach_backing_single`).
 - **Scale failure**:
   - **Fragmentation cliff.** A 1080p BGRA window is ~8 MiB = order-11 = 2048
     contiguous pages. Fine at boot; after hours of churn high-order buddy blocks
@@ -516,9 +525,15 @@ metadata writes for the lock-hold latency to matter yet.
   - **Power-of-2 internal waste.** A 5 MiB texture rounds up to an 8 MiB block:
     up to ~2x waste on every non-power-of-2 resource, and windows are rarely a
     clean power of two.
-  - The **64 MiB per-resource cap** is a symptom of the same thing -- a bound
-    needed because high-order contiguous allocs are dangerous, not because the
-    resource requires it.
+  - **Both memory caps are symptoms of the contiguity, not real limits.** The
+    64 MiB per-resource cap and the per-task ceiling exist because high-order
+    contiguous allocs are dangerous (fragmentation, ENOMEM-with-free-RAM), not
+    because any resource or task needs them. A leak in the per-task charge is
+    what crashed DarkPlaces in ~13 s (fixed in 34ad96b); making the ceiling
+    RAM-proportional instead of a fixed 256 MiB reduces the blast radius, but
+    the caps only truly *dissolve* under scatter-gather: scattered pages don't
+    fragment the buddy allocator, so there is nothing to guard against and both
+    numbers can go away.
   - Neither the guest nor the device requires physical contiguity: virtio-gpu's
     RESOURCE_ATTACH_BACKING is *built* for scatter-gather (an array of
     nr_entries {addr,length} mem_entries). Using one entry manufactures a
@@ -529,8 +544,10 @@ metadata writes for the lock-hold latency to matter yet.
 - **Target**: allocate per-page (or a few large blocks), describe the backing to
   the device as a multi-entry scatter list (nr_entries > 1), map it
   virtually-contiguous into the userspace VMA and into a kernel window. Removes
-  the fragmentation cliff, the power-of-2 waste, and the artificial size cap in
-  one move. Mirrors Linux GEM/GBM sg-list backing.
+  the fragmentation cliff, the power-of-2 waste, AND both artificial memory caps
+  (per-resource 64 MiB and per-task) in one move -- once backing is scattered
+  there is no contiguity to protect, so the ceilings can be dropped or raised to
+  a pure fairness policy. Mirrors Linux GEM/GBM sg-list backing.
 - **Blocking order**: needs (1) `virtio_gpu_resource_attach_backing` variant that
   emits an nr_entries>1 mem_entry array from a page list; (2) an mmap resolver
   (`drm_resolve_dumb_mmap`) that installs PTEs for a page list rather than one
