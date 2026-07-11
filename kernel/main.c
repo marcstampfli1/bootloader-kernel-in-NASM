@@ -413,6 +413,19 @@ static void init_kthread(void) {
     }
 #endif
 
+#ifdef MAKAOS_AVIANTEST
+    // Avian JVM first-light (build with AVIANTEST=1 + CONSOLE_SERIAL=1): run the
+    // cross-built Avian VM to execute /avian/Hello.class, proving a full JVM runs
+    // on MakaOS end to end (relies on the SA_SIGINFO/ucontext/pthread signal layer).
+    {
+        static const char* avian_argv[]  = {
+            "/bin/avian", "-cp", "/avian/classpath.jar:/avian", "Hello", NULL };
+        static const int    avian_stdio[3] = { -1, -1, -1 };  // inherit tty0 (serial-mirrored)
+        task_t* av = elf_exec_kernel("/bin/avian", pid_alloc(), avian_argv, envp, avian_stdio);
+        if (av) sched_add(av);
+    }
+#endif
+
     // Regression-test harness: uncomment to stress AHCI concurrent pread.
     // Kept in-tree so future changes to the submit path can be validated.
     // stress_pread_launch();

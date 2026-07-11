@@ -106,6 +106,11 @@ if [ "${SIGTEST:-0}" = "1" ]; then
   KERNEL_CFLAGS+=( -DMAKAOS_SIGTEST )
   echo "[build] boot sigtest ENABLED (-DMAKAOS_SIGTEST)"
 fi
+# AVIANTEST=1 runs the Avian JVM at boot to execute Hello.class (first-light).
+if [ "${AVIANTEST:-0}" = "1" ]; then
+  KERNEL_CFLAGS+=( -DMAKAOS_AVIANTEST )
+  echo "[build] boot Avian first-light ENABLED (-DMAKAOS_AVIANTEST)"
+fi
 
 # ── User compile flags ─────────────────────────────────────────────────────
 # -fPIE (position-independent) so every userland object -- libc especially --
@@ -1051,6 +1056,15 @@ if [ -f "$BUILD_DIR/user_hello.elf" ]; then
 fi
 if [ "${SIGTEST:-0}" = "1" ] && [ -f "$BUILD_DIR/user_sigtest.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sigtest.elf" bin/sigtest
+fi
+# Avian JVM first-light (AVIANTEST=1): install the cross-built avian VM +
+# classpath.jar + Hello.class, spawned at boot by main.c (behind MAKAOS_AVIANTEST).
+if [ "${AVIANTEST:-0}" = "1" ] && [ -f "$BUILD_DIR/avian-app/avian" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/avian-app/avian" bin/avian
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /avian" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/avian-app/classpath.jar avian/classpath.jar" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/avian-app/Hello.class avian/Hello.class" > /dev/null 2>&1 || true
+    echo "[build] Avian JVM installed: /bin/avian + /avian/{classpath.jar,Hello.class}"
 fi
 if [ -f "$BUILD_DIR/user_virgltest.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_virgltest.elf" bin/virgltest
