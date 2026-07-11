@@ -538,12 +538,58 @@ static drm_res3d_t* find_res3d(drm_client_t* c, uint32_t handle) {
 // block free here would pull them out from under a live dma-buf.  The buddy
 // allocator stamps rc=1 at alloc, so ref_dec frees only when the last holder
 // (this bo + every dma-buf/import) has let go.
+// ── Host-resource refcount (keyed by res_id, cross-client) ──────────────────
+// A virgl resource can be referenced by its creating res3d (owner) AND by
+// borrowed PRIME-imported clones in OTHER DRM clients -- wlroots renders in one
+// fd and scans out in another, importing the render buffer for scanout.  The old
+// "only the owner unrefs" rule destroyed the host resource when the renderer
+// rotated its swapchain, while the scanout client's clone was still displaying
+// it -> SET_SCANOUT INVALID_RESOURCE_ID -> black screen.  Refcount instead: the
+// host resource lives until the LAST holder (owner or any clone) drops it.
+// Chained hash keyed by res_id (sparse, monotonic, unbounded -> not an array).
+typedef struct res_rc { uint32_t res_id, count; struct res_rc* next; } res_rc_t;
+#define RES_RC_BUCKETS 256
+static res_rc_t*  s_res_rc[RES_RC_BUCKETS];
+static spinlock_t s_res_rc_lock = SPINLOCK_INIT;
+
+static void res_host_ref(uint32_t res_id) {
+    if (!res_id) return;
+    uint32_t b = res_id % RES_RC_BUCKETS;
+    spin_lock(&s_res_rc_lock);
+    res_rc_t* e = s_res_rc[b];
+    for (; e; e = e->next) if (e->res_id == res_id) break;
+    if (!e) {
+        e = (res_rc_t*)kmalloc(sizeof(*e));
+        if (e) { e->res_id = res_id; e->count = 0; e->next = s_res_rc[b]; s_res_rc[b] = e; }
+    }
+    if (e) e->count++;
+    spin_unlock(&s_res_rc_lock);
+}
+
+// Decrement; unref the host resource (and free the tracking node) only at zero.
+// An untracked res_id falls back to a direct unref (old behaviour, never worse).
+static void res_host_unref(uint32_t res_id) {
+    if (!res_id) return;
+    uint32_t b = res_id % RES_RC_BUCKETS;
+    int destroy = 0;
+    spin_lock(&s_res_rc_lock);
+    res_rc_t** pp = &s_res_rc[b];
+    for (; *pp; pp = &(*pp)->next) if ((*pp)->res_id == res_id) break;
+    res_rc_t* e = *pp;
+    if (e && e->count > 0) {
+        if (--e->count == 0) { destroy = 1; *pp = e->next; kfree(e); }
+    } else {
+        destroy = 1;
+    }
+    spin_unlock(&s_res_rc_lock);
+    if (destroy) virtio_gpu_resource_unref(res_id);
+}
+
 static void res3d_free(drm_res3d_t* r) {
     if (!r || r->handle == 0) return;
-    // A borrowed (PRIME-imported) clone references a host resource owned by the
-    // exporting res3d -- only the owner unrefs it, or the host destroys a live
-    // resource out from under the exporter.
-    if (r->res_id && !r->borrowed) virtio_gpu_resource_unref(r->res_id);
+    // Refcounted: the owner AND every borrowed clone hold a reference; the host
+    // resource is destroyed only when the last one is freed (see res_host_ref).
+    if (r->res_id) res_host_unref(r->res_id);
     if (r->phys)
         for (uint32_t i = 0; i < r->bytes / 4096u; i++)
             pmm_ref_dec(r->phys + (phys_addr_t)i * 4096u);
@@ -862,7 +908,6 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
         }
         is_3d = 0;
     }
-
     drm_fb_t* fb = (drm_fb_t*)kmalloc(sizeof(*fb));
     if (!fb) {
         if (!is_3d && b2) b2->resource_destroy(fb_res_id);
@@ -879,6 +924,10 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
     fb->bytes_alloc = src_bytes;
     fb->order       = src_order;
     fb->is_3d       = is_3d;
+    // 3D: the fb scans out a borrowed host resource; take a host-resource ref so
+    // it survives the exporting client rotating/freeing its swapchain while this
+    // fb is still displayed (dropped in drm_fb_free).
+    if (is_3d) res_host_ref(fb_res_id);
     // Dumb: take independent page refs so the fb survives close_all_bo_handles().
     // 3D: the res3d owns the pages + resource (borrowed) -- no extra refs here.
     if (!is_3d)
@@ -909,7 +958,7 @@ static void drm_fb_free(drm_fb_t* fb) {
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
     // A 3D-backed fb borrows the res3d's resource + pages; the res3d (via its
     // GEM handle / res3d_free) owns their lifetime, so release nothing here.
-    if (fb->is_3d) { kfree(fb); return; }
+    if (fb->is_3d) { res_host_unref(fb->vgpu_res_id); kfree(fb); return; }
     int active = 0;
     for (uint32_t i = 0; i < DRM_MAX_SCANOUTS; i++)
         if (s_scanouts[i].resource_id == fb->vgpu_res_id) { active = 1; break; }
@@ -1701,6 +1750,10 @@ typedef struct {
 static void drm_prime_close(vfs_file_t* self) {
     drm_dmabuf_t* db = (drm_dmabuf_t*)self->ctx;
     if (db) {
+        // The exported dma-buf holds a reference on the host resource (taken in
+        // handle_to_fd) so it survives the exporter closing its GEM handle while
+        // the buffer is shared -- drop it here.  (See res_host_ref.)
+        if (db->res_id) res_host_unref(db->res_id);
         for (uint32_t i = 0; i < db->bytes / 4096u; i++)
             pmm_ref_dec(db->phys + (phys_addr_t)i * 4096u);
         kfree(db);
@@ -1764,6 +1817,10 @@ static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
     db->phys = phys; db->bytes = bytes; db->order = order;
     db->width = w; db->height = h; db->format = fmt;
     db->res_id = src_res_id;
+    // Own a reference to the host resource too (not just the pages): the dma-buf
+    // keeps the virgl resource alive even after the exporter closes its handle,
+    // so a scanout/import that still needs it does not hit a destroyed resource.
+    if (src_res_id) res_host_ref(src_res_id);
     // Own a reference to every backing page: the dma-buf keeps the memory alive
     // even after the exporter destroys its handle.
     for (uint32_t i = 0; i < bytes / 4096u; i++)
@@ -1841,6 +1898,7 @@ static int drm_ioctl_prime_fd_to_handle(vfs_file_t* drm_f, uint64_t arg) {
         r->res_id = db->res_id; r->width = db->width; r->height = db->height;
         r->format = db->format; r->bytes = db->bytes; r->phys = db->phys;
         r->order = db->order; r->borrowed = 1;
+        res_host_ref(r->res_id);   // borrowed clone holds its own reference too
         for (uint32_t i = 0; i < db->bytes / 4096u; i++)
             pmm_ref_inc(db->phys + (phys_addr_t)i * 4096u);
         a.handle = h;
@@ -2722,7 +2780,7 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
         // dumb cursor uses.  64x64 ARGB, so the download/upload is ~16 KiB.
         if (c->virgl_ctx_id && r->res_id)
             virtio_gpu_3d_transfer(0 /*from host*/, c->virgl_ctx_id, r->res_id,
-                                   0, 0, a.width, a.height, 0, 0);
+                                   0, 0, 0, a.width, a.height, 1, 0, 0, 0, 0);
         uint64_t cur_bytes;
         if (!drm_cursor_bytes(a.width, a.height, (uint64_t)r->bytes, &cur_bytes))
             return -EINVAL;
@@ -2860,7 +2918,7 @@ static int drm_atomic_apply_cursor(vfs_file_t* f, uint32_t idx, uint32_t fb_id,
     // GL cursor pixels are host-side; download them into the fb's guest backing.
     if (fb->is_3d && c->virgl_ctx_id && fb->vgpu_res_id)
         virtio_gpu_3d_transfer(0 /*from host*/, c->virgl_ctx_id, fb->vgpu_res_id,
-                               0, 0, w, h, 0, 0);
+                               0, 0, 0, w, h, 1, 0, 0, 0, 0);
 
     uint64_t cur_bytes;
     if (!drm_cursor_bytes(w, h, (uint64_t)fb->bytes_alloc, &cur_bytes)) return -EINVAL;
@@ -3138,6 +3196,7 @@ static int drm_ioctl_virtgpu_resource_create(vfs_file_t* f, uint64_t arg) {
     if (!r) { virtio_gpu_resource_unref(res_id); pmm_buddy_free(phys, order);
               drm_uncharge(g_current, bytes); return -ENOMEM; }
     r->res_id = res_id; r->width = a.width; r->height = a.height;
+    res_host_ref(res_id);   // owner holds the first reference on the host resource
     r->format = a.format; r->bytes = bytes; r->phys = phys; r->order = order;
 
     a.bo_handle = h; a.res_handle = res_id; a.size = (uint32_t)size64; a.stride = stride;
@@ -3212,6 +3271,9 @@ static int drm_ioctl_virtgpu_execbuffer(vfs_file_t* f, uint64_t arg) {
                 if (virtio_gpu_3d_ctx_attach_resource(c->virgl_ctx_id,
                                                       r->res_id) == 0)
                     r->ctx_attached = 1;
+                else
+                    pr_warn("drm", "execbuf: ctx_attach ctx=%u res=%u FAILED (bo_handle=%u)",
+                            c->virgl_ctx_id, r->res_id, handles[i]);
             }
         }
         kfree(handles);
@@ -3238,7 +3300,9 @@ static int drm_ioctl_virtgpu_transfer(vfs_file_t* f, uint64_t arg, int to_host) 
     drm_res3d_t* r = find_res3d(c, a.bo_handle);
     if (!r) return -ENOENT;
     return virtio_gpu_3d_transfer(to_host, c->virgl_ctx_id, r->res_id,
-                                  a.box.x, a.box.y, a.box.w, a.box.h, a.offset, a.level);
+                                  a.box.x, a.box.y, a.box.z,
+                                  a.box.w, a.box.h, a.box.d,
+                                  a.offset, a.level, a.stride, a.layer_stride);
 }
 
 static int drm_ioctl_virtgpu_wait(vfs_file_t* f, uint64_t arg) {

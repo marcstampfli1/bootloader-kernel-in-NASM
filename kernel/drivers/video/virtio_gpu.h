@@ -74,8 +74,10 @@ int virtio_gpu_3d_resource_create(uint32_t res_id, uint32_t target, uint32_t for
 int virtio_gpu_3d_ctx_attach_resource(uint32_t ctx_id, uint32_t res_id);
 // TRANSFER_TO/FROM_HOST_3D of box [x,y..x+w,y+h] at `offset` in the backing.
 int virtio_gpu_3d_transfer(int to_host, uint32_t ctx_id, uint32_t res_id,
-                            uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                            uint64_t offset, uint32_t level);
+                            uint32_t x, uint32_t y, uint32_t z,
+                            uint32_t w, uint32_t h, uint32_t d,
+                            uint64_t offset, uint32_t level,
+                            uint32_t stride, uint32_t layer_stride);
 int virtio_gpu_3d_submit(uint32_t ctx_id, const void* cmds, uint32_t size);
 // GPU fence (Phase 2b): fence_barrier() snapshots all-submitted-so-far;
 // fence_wait(target) blocks until that many commands have retired (immediate on

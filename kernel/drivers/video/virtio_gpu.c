@@ -893,6 +893,10 @@ static int vgpu_resource_create_3d(uint32_t res_id, uint32_t target, uint32_t fo
     req.nr_samples  = nr_samples;
     virtio_gpu_ctrl_hdr_t resp = {0};
     if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
+    if (resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+        pr_warn("virtio-gpu",
+                "RESOURCE_CREATE_3D res=%u tgt=%u fmt=%u bind=0x%x %ux%ux%u arr=%u ll=%u ns=%u -> host resp 0x%x",
+                res_id, target, format, bind, w, h, depth, array_size, last_level, nr_samples, resp.type);
     return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
 }
 
@@ -901,19 +905,24 @@ static int vgpu_resource_create_3d(uint32_t res_id, uint32_t target, uint32_t fo
 // resource at mip `level`.  stride/layer_stride 0 => tightly packed (host
 // computes them).
 static int vgpu_transfer_3d(uint32_t cmd, uint32_t ctx_id, uint32_t res_id,
-                            uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                            uint64_t offset, uint32_t level) {
+                            uint32_t x, uint32_t y, uint32_t z,
+                            uint32_t w, uint32_t h, uint32_t d,
+                            uint64_t offset, uint32_t level,
+                            uint32_t stride, uint32_t layer_stride) {
     vgpu_transfer_host_3d_t req = {0};
-    req.hdr.type    = cmd;
-    req.hdr.ctx_id  = ctx_id;
-    req.box.x       = x;
-    req.box.y       = y;
-    req.box.w       = w;
-    req.box.h       = h;
-    req.box.d       = 1;
-    req.offset      = offset;
-    req.level       = level;
-    req.resource_id = res_id;
+    req.hdr.type     = cmd;
+    req.hdr.ctx_id   = ctx_id;
+    req.box.x        = x;
+    req.box.y        = y;
+    req.box.z        = z;              // 3D depth slice / array layer / cube face
+    req.box.w        = w;
+    req.box.h        = h;
+    req.box.d        = d ? d : 1;      // guard 0 -> at least one slice
+    req.offset       = offset;
+    req.level        = level;
+    req.stride       = stride;         // guest row pitch; 0 => host derives box.w*bpp
+    req.layer_stride = layer_stride;   // guest layer pitch; 0 => host derives
+    req.resource_id  = res_id;
     virtio_gpu_ctrl_hdr_t resp = {0};
     if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
     return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
@@ -988,13 +997,13 @@ static void virtio_gpu_virgl_selftest(void) {
     if (!ok) { kprintf("[virtio-gpu] virgl selftest: setup FAILED\n"); goto out; }
 
     if (!vgpu_transfer_3d(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D, VIRGL_TEST_CTX,
-                          VIRGL_TEST_RES, 0, 0, VIRGL_TEST_W, VIRGL_TEST_H, 0, 0)) {
+                          VIRGL_TEST_RES, 0, 0, 0, VIRGL_TEST_W, VIRGL_TEST_H, 1, 0, 0, 0, 0)) {
         kprintf("[virtio-gpu] virgl selftest: TO_HOST_3D FAILED\n"); goto out;
     }
     for (uint32_t i = 0; i < npix; i++) back[i] = 0xDEADBEEFu;       // wipe
     __asm__ volatile("mfence" ::: "memory");
     if (!vgpu_transfer_3d(VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D, VIRGL_TEST_CTX,
-                          VIRGL_TEST_RES, 0, 0, VIRGL_TEST_W, VIRGL_TEST_H, 0, 0)) {
+                          VIRGL_TEST_RES, 0, 0, 0, VIRGL_TEST_W, VIRGL_TEST_H, 1, 0, 0, 0, 0)) {
         kprintf("[virtio-gpu] virgl selftest: FROM_HOST_3D FAILED\n"); goto out;
     }
     __asm__ volatile("mfence" ::: "memory");
@@ -1007,6 +1016,38 @@ static void virtio_gpu_virgl_selftest(void) {
     else
         kprintf("[virtio-gpu] virgl selftest: FAIL (%u/%u px wrong, first=%x)\n",
                 bad, npix, back[0]);
+
+    // ── Phase 1c: IN-STREAM texture upload (op=43 TRANSFER3D) ──────────────
+    // The control-command TRANSFER above proves the host texture storage works.
+    // But DarkPlaces uploads textures via the IN-STREAM virgl command
+    // TRANSFER3D (op 43) inside SUBMIT_3D, NOT the control command.  Test that
+    // exact path: write a fresh pattern, upload it via an in-stream TRANSFER3D,
+    // wipe the backing, then read it back with the (proven) control TRANSFER_FROM
+    // and verify.  A FAIL here means in-stream texture upload is the black-
+    // texture bug; PASS means the upload works and the fault is elsewhere.
+    for (uint32_t i = 0; i < npix; i++) back[i] = 0x00C0FFEEu;
+    __asm__ volatile("mfence" ::: "memory");
+    uint32_t tx[14], tn = 0;
+    tx[tn++] = VIRGL_CMD0(43u, 0u, 13u);   // VIRGL_CCMD_TRANSFER3D, 13 payload dwords
+    tx[tn++] = VIRGL_TEST_RES;             // res_handle
+    tx[tn++] = 0;                          // level
+    tx[tn++] = 0;                          // usage
+    tx[tn++] = 0;                          // stride (0 => host derives from box.w)
+    tx[tn++] = 0;                          // layer_stride
+    tx[tn++] = 0; tx[tn++] = 0; tx[tn++] = 0;                 // box x,y,z
+    tx[tn++] = VIRGL_TEST_W; tx[tn++] = VIRGL_TEST_H; tx[tn++] = 1;  // box w,h,d
+    tx[tn++] = 0;                          // data_offset into the resource backing
+    tx[tn++] = 1;                          // direction: 1 = TO_HOST (upload)
+    int istx_ok = vgpu_submit_3d(VIRGL_TEST_CTX, tx, tn);
+    for (uint32_t i = 0; i < npix; i++) back[i] = 0xDEADBEEFu;   // wipe guest side
+    __asm__ volatile("mfence" ::: "memory");
+    vgpu_transfer_3d(VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D, VIRGL_TEST_CTX,
+                     VIRGL_TEST_RES, 0, 0, 0, VIRGL_TEST_W, VIRGL_TEST_H, 1, 0, 0, 0, 0);
+    __asm__ volatile("mfence" ::: "memory");
+    uint32_t bad2 = 0;
+    for (uint32_t i = 0; i < npix; i++) if (back[i] != 0x00C0FFEEu) bad2++;
+    kprintf("[virtio-gpu] virgl IN-STREAM tex upload: %s (submit=%d, %u/%u wrong, first=%x)\n",
+            bad2 ? "FAIL" : "PASS", istx_ok, bad2, npix, back[0]);
 out:
     virtio_gpu_resource_unref(VIRGL_TEST_RES);   // harmless if never created
     vgpu_ctx_destroy(VIRGL_TEST_CTX);
@@ -1066,7 +1107,7 @@ static void virtio_gpu_virgl_clear_selftest(void) {
         kprintf("[virtio-gpu] virgl clear: SUBMIT_3D FAILED\n"); goto out;
     }
     if (!vgpu_transfer_3d(VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D, VIRGL_CLEAR_CTX,
-                          VIRGL_CLEAR_RES, 0, 0, VIRGL_CLEAR_W, VIRGL_CLEAR_H, 0, 0)) {
+                          VIRGL_CLEAR_RES, 0, 0, 0, VIRGL_CLEAR_W, VIRGL_CLEAR_H, 1, 0, 0, 0, 0)) {
         kprintf("[virtio-gpu] virgl clear: FROM_HOST_3D FAILED\n"); goto out;
     }
     __asm__ volatile("mfence" ::: "memory");
@@ -1153,11 +1194,14 @@ int virtio_gpu_3d_ctx_attach_resource(uint32_t ctx_id, uint32_t res_id) {
     return vgpu_ctx_attach_resource(ctx_id, res_id) ? 0 : -EIO;
 }
 int virtio_gpu_3d_transfer(int to_host, uint32_t ctx_id, uint32_t res_id,
-                            uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                            uint64_t offset, uint32_t level) {
+                            uint32_t x, uint32_t y, uint32_t z,
+                            uint32_t w, uint32_t h, uint32_t d,
+                            uint64_t offset, uint32_t level,
+                            uint32_t stride, uint32_t layer_stride) {
     uint32_t cmd = to_host ? VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D
                            : VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
-    return vgpu_transfer_3d(cmd, ctx_id, res_id, x, y, w, h, offset, level) ? 0 : -EIO;
+    return vgpu_transfer_3d(cmd, ctx_id, res_id, x, y, z, w, h, d,
+                            offset, level, stride, layer_stride) ? 0 : -EIO;
 }
 int virtio_gpu_3d_submit(uint32_t ctx_id, const void* cmds, uint32_t size) {
     if (!s_virgl) return -ENODEV;
