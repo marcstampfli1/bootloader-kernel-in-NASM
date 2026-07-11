@@ -55,6 +55,20 @@ static void* helper_thread(void* arg) {
     return 0;
 }
 
+// ── Path 4: alternate signal stack (sigaltstack + SA_ONSTACK) ─────────────
+static char           g_altstack[16384] __attribute__((aligned(16)));
+static volatile int   g_alt_ran = 0;
+static volatile int   g_alt_on  = 0;   // handler's rsp was inside g_altstack?
+
+static void alt_handler(int sig, siginfo_t* info, void* ctx) {
+    (void)sig; (void)info; (void)ctx;
+    char probe;                          // a local => approximates the handler rsp
+    uintptr_t sp = (uintptr_t)&probe;
+    g_alt_on = (sp >= (uintptr_t)g_altstack &&
+                sp <  (uintptr_t)g_altstack + sizeof(g_altstack));
+    g_alt_ran = 1;
+}
+
 // ── Path 2: synchronous-fault delivery (SIGSEGV on NULL) ──────────────────
 static volatile int   g_si_addr_ok = 0;
 
@@ -117,6 +131,25 @@ int main(void) {
     if (!g_usr2_ran)            { out("[sigtest] FAIL: SIGUSR2 not delivered to helper\n"); return 1; }
     if (g_usr2_tid != g_helper_tid) { out("[sigtest] FAIL: SIGUSR2 ran in the wrong thread\n"); return 1; }
     out("[sigtest] OK: pthread_kill delivered to the target thread\n");
+
+    // ── Path 4: SA_ONSTACK handler runs on the alternate signal stack ─────
+    {
+        stack_t ss;
+        ss.ss_sp    = g_altstack;
+        ss.ss_size  = sizeof(g_altstack);
+        ss.ss_flags = 0;
+        if (sigaltstack(&ss, 0) != 0) { out("[sigtest] FAIL: sigaltstack\n"); return 1; }
+    }
+    __builtin_memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = alt_handler;
+    sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+    if (sigaction(SIGUSR1, &sa, 0) != 0) { out("[sigtest] FAIL: sigaction(alt)\n"); return 1; }
+
+    out("[sigtest] raising SIGUSR1 with SA_ONSTACK...\n");
+    raise(SIGUSR1);
+    if (!g_alt_ran) { out("[sigtest] FAIL: alt handler did not run\n"); return 1; }
+    if (!g_alt_on)  { out("[sigtest] FAIL: handler did NOT run on the alt stack\n"); return 1; }
+    out("[sigtest] OK: SA_ONSTACK handler ran on the alternate signal stack\n");
 
     // ── Path 2: synchronous fault via the trap-frame path ─────────────────
     __builtin_memset(&sa, 0, sizeof(sa));

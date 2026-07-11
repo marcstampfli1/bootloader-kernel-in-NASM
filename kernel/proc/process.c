@@ -798,6 +798,11 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     // to SIG_DFL (see sys_exec).
     t->sigstate.blocked = parent->sigstate.blocked;
     t->sigstate.sigframe_rsp = 0;
+    // fork() inherits the parent's alternate signal stack (POSIX); exec() later
+    // disables it.  The alt-stack memory is COW-copied with the address space,
+    // so the same address stays valid in the child.
+    t->sigstate.altstack_sp   = parent->sigstate.altstack_sp;
+    t->sigstate.altstack_size = parent->sigstate.altstack_size;
     t->sighand = sighand_copy(parent->sighand);
     if (!t->sighand) {   // OOM: unwind the child's files + mm + task_t
         task_files_release(files); task_mm_release(tmm); kfree(t); return NULL;

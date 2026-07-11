@@ -60,6 +60,7 @@
 #define SA_NOCLDSTOP 0x00000001
 #define SA_NOCLDWAIT 0x00000002
 #define SA_SIGINFO   0x00000004
+#define SA_ONSTACK   0x08000000
 #define SA_RESTART   0x10000000
 #define SA_NODEFER   0x40000000
 #define SA_RESETHAND 0x80000000
@@ -93,10 +94,28 @@ struct siginfo {
     int    si_value;
 };
 
+// Alternate signal stack (sigaltstack).  Shared definition with <ucontext.h>
+// via the same guard so including both is safe.
+#ifndef _STACK_T_DEFINED
+#define _STACK_T_DEFINED
+typedef struct {
+    void*         ss_sp;
+    int           ss_flags;
+    unsigned long ss_size;
+} stack_t;
+#define SS_ONSTACK 1
+#define SS_DISABLE 2
+#endif
+#ifndef MINSIGSTKSZ
+#define MINSIGSTKSZ 2048
+#define SIGSTKSZ    8192
+#endif
+
 int kill(pid_t pid, int sig);
 int raise(int sig);
 void (*signal(int sig, void (*handler)(int)))(int);
 int sigaction(int sig, const struct sigaction* act, struct sigaction* old);
+int sigaltstack(const stack_t* ss, stack_t* old_ss);
 int sigprocmask(int how, const sigset_t* set, sigset_t* old);
 int sigpending(sigset_t* set);
 int sigsuspend(const sigset_t* mask);

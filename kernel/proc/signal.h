@@ -40,7 +40,12 @@
 
 // ── sigaction flags ───────────────────────────────────────────────────────
 #define SA_SIGINFO   0x00000004  // 3-arg handler: (int, siginfo_t*, ucontext_t*)
+#define SA_ONSTACK   0x08000000  // run the handler on the alternate signal stack
 #define SA_RESTORER  0x04000000  // sa_restorer field is valid
+
+// ── sigaltstack ss_flags ──────────────────────────────────────────────────
+#define SS_ONSTACK   1   // thread is currently executing on the alt stack
+#define SS_DISABLE   2   // alt stack is disabled
 
 // ── Per-signal kernel action ──────────────────────────────────────────────
 // sa_handler: 0 = SIG_DFL, 1 = SIG_IGN, else user function pointer.
@@ -169,6 +174,13 @@ typedef struct {
     uint8_t           siginfo_frame;     // 1 = last delivery built an rt_sigframe
                                          // (SA_SIGINFO); sys_sigreturn restores from
                                          // its ucontext instead of the sigframe_t
+    // Alternate signal stack (per-thread, POSIX sigaltstack).  A handler
+    // installed with SA_ONSTACK runs on [altstack_sp, altstack_sp+altstack_size)
+    // instead of the interrupted stack -- essential for catching SIGSEGV from a
+    // stack overflow, when the normal stack is unusable (the JVM relies on this
+    // for StackOverflowError).  altstack_sp == NULL means no alt stack (disabled).
+    void*             altstack_sp;
+    unsigned long     altstack_size;
 } sigstate_t;
 
 // ── Per-PROCESS signal dispositions (shared across a thread group) ─────────

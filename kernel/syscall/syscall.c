@@ -1197,6 +1197,10 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     }
     // Unblock all signals (POSIX: exec resets the signal mask).
     g_current->sigstate.blocked = 0;
+    // Disable the alternate signal stack (POSIX: execve removes it; its memory
+    // belonged to the torn-down image anyway).
+    g_current->sigstate.altstack_sp   = NULL;
+    g_current->sigstate.altstack_size = 0;
 
     // Drop the pre-exec TLS pointer — those addresses belong to the
     // torn-down image.  The new image's crt0 installs fresh TLS via
@@ -2514,6 +2518,50 @@ static uint64_t sys_sigreturn(void) {
     // original return value rather than sigreturn's own (this becomes rax
     // on the sigreturn syscall's exit path).
     return frame.rax;
+}
+
+// ── sys_sigaltstack ────────────────────────────────────────────────────────
+// sigaltstack(new_ss, old_ss): set and/or query the per-thread alternate signal
+// stack.  A handler installed with SA_ONSTACK runs on this stack instead of the
+// interrupted one -- required to catch SIGSEGV from a stack overflow, when the
+// normal stack is unusable (the JVM relies on this for StackOverflowError).
+#define SIG_MINSTKSZ 2048UL   // POSIX MINSIGSTKSZ floor for a usable alt stack
+static uint64_t sys_sigaltstack(uint64_t new_ptr, uint64_t old_ptr) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    sigstate_t* ss = &g_current->sigstate;
+    // Are we currently executing on the alt stack?  (caller's user rsp within it)
+    uint64_t caller_rsp = SYSCALL_KFRAME(g_current)->rsp;
+    uint64_t asp = (uint64_t)ss->altstack_sp, asz = ss->altstack_size;
+    int on_stack = asp && (caller_rsp >= asp && caller_rsp < asp + asz);
+
+    if (old_ptr) {
+        k_stack_t old;
+        old.ss_sp    = ss->altstack_sp;
+        old.ss_size  = ss->altstack_size;
+        old.ss_flags = asp ? (on_stack ? SS_ONSTACK : 0) : SS_DISABLE;
+        if (copy_to_user((void*)old_ptr, &old, sizeof(old)) != 0)
+            return (uint64_t)-EFAULT;
+    }
+    if (new_ptr) {
+        // POSIX: the alt stack cannot be changed or disabled while a handler is
+        // currently running on it.
+        if (on_stack) return (uint64_t)-EPERM;
+        k_stack_t ns;
+        if (copy_from_user(&ns, (const void*)new_ptr, sizeof(ns)) != 0)
+            return (uint64_t)-EFAULT;
+        if (ns.ss_flags & SS_DISABLE) {
+            ss->altstack_sp   = NULL;
+            ss->altstack_size = 0;
+        } else {
+            if (ns.ss_flags & ~(SS_ONSTACK | SS_DISABLE)) return (uint64_t)-EINVAL;
+            if (ns.ss_size < SIG_MINSTKSZ)                return (uint64_t)-ENOMEM;
+            uint64_t nsp = (uint64_t)ns.ss_sp;
+            if (!nsp || !_access_ok(nsp, ns.ss_size))     return (uint64_t)-EFAULT;
+            ss->altstack_sp   = ns.ss_sp;
+            ss->altstack_size = ns.ss_size;
+        }
+    }
+    return 0;
 }
 
 // ── sys_mmap ──────────────────────────────────────────────────────────────
@@ -5903,6 +5951,9 @@ __attribute__((force_align_arg_pointer))
 static uint64_t w_sys_sigreturn(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)a; (void)b; (void)c; (void)d; return sys_sigreturn();
 }
+static uint64_t w_sys_sigaltstack(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_sigaltstack(a, b);
+}
 static uint64_t w_sys_mmap(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     return sys_mmap(a, b, c, d, g_syscall_arg5, g_syscall_arg6);
 }
@@ -6807,6 +6858,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_SIGACTION]           = w_sys_sigaction,
     [SYS_SIGPROCMASK]         = w_sys_sigprocmask,
     [SYS_SIGRETURN]           = w_sys_sigreturn,
+    [SYS_SIGALTSTACK]         = w_sys_sigaltstack,
     [SYS_MMAP]                = w_sys_mmap,
     [SYS_MUNMAP]              = w_sys_munmap,
     [SYS_NANOSLEEP]           = w_sys_nanosleep,

@@ -252,6 +252,24 @@ static void signal_force_kill(int sig, const char* why, uint64_t rsp, uint64_t f
     g_current->sighand->handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
 }
 
+// Choose the stack to place a signal frame on.  If the handler asked for
+// SA_ONSTACK and a per-thread alternate stack is set AND we are NOT already
+// executing on it, deliver on the TOP of the alt stack (it grows down) -- this
+// is how a SIGSEGV from a stack overflow is caught, since the interrupted stack
+// is then unusable.  Otherwise deliver on the interrupted rsp.  The SAVED
+// context (gregs[REG_RSP] / sigframe.rsp) always keeps the interrupted rsp, so
+// sigreturn resumes on the original stack.
+static uint64_t sig_stack_base(const k_sigaction_t* ka, uint64_t interrupted_rsp) {
+    if (ka->sa_flags & SA_ONSTACK) {
+        const sigstate_t* ss = &g_current->sigstate;
+        uint64_t sp = (uint64_t)ss->altstack_sp;
+        uint64_t sz = ss->altstack_size;
+        if (sp && sz && !(interrupted_rsp >= sp && interrupted_rsp < sp + sz))
+            return sp + sz;   // top of the alt stack
+    }
+    return interrupted_rsp;
+}
+
 // SA_SIGINFO delivery: build a Linux-style rt_sigframe { pretcode, ucontext,
 // siginfo } on the user stack from the interrupted context *src, populate the
 // ucontext gregs + si_addr from the fault, and produce the handler-entry
@@ -264,12 +282,15 @@ static void signal_force_kill(int sig, const char* why, uint64_t rsp, uint64_t f
 static int build_rt_frame(int sig, k_sigaction_t* ka,
                           const sig_uctx_t* src, sig_redirect_t* redir) {
     uint64_t user_rsp = src->rsp;
+    // Place the frame on the alt stack when SA_ONSTACK is set; the saved
+    // gregs[KREG_RSP] below stays user_rsp so sigreturn resumes the old stack.
+    uint64_t stack_base = sig_stack_base(ka, user_rsp);
 
     // frame_base ≡ 8 (mod 16): 16-align the floor below the red zone, then -8,
     // so at handler entry rsp%16==8 (SysV) AND the embedded fpstate at
     // frame_base+312 is 16-aligned for fxsave/fxrstor.
     uint64_t frame_base =
-        ((user_rsp - 128 - sizeof(k_rt_sigframe_t)) & ~(uint64_t)0xF) - 8;
+        ((stack_base - 128 - sizeof(k_rt_sigframe_t)) & ~(uint64_t)0xF) - 8;
 
     if (!_access_ok(frame_base - 8, sizeof(k_rt_sigframe_t) + 8)) {
         signal_force_kill(sig, "rt RANGE", user_rsp, frame_base); return -1;
@@ -354,10 +375,12 @@ static int build_simple_frame(int sig, k_sigaction_t* ka,
                               const sig_uctx_t* src, sig_redirect_t* redir) {
     g_current->sigstate.siginfo_frame = 0;
     uint64_t user_rsp = src->rsp;
+    // Alt stack when SA_ONSTACK; saved frame->rsp below stays user_rsp.
+    uint64_t stack_base = sig_stack_base(ka, user_rsp);
 
     // Skip the 128-byte red zone, then place the sigframe below it,
     // 16-byte aligned as required for stack-passed arguments.
-    uint64_t frame_base = (user_rsp - 128 - sizeof(sigframe_t))
+    uint64_t frame_base = (stack_base - 128 - sizeof(sigframe_t))
                             & ~(uint64_t)0xF;
 
     // Validate: the whole [frame_base-8, user_rsp) window must live in the user

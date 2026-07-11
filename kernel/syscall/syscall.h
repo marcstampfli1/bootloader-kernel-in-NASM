@@ -132,6 +132,7 @@
 #define SYS_SET_FS            115 // set_fs(addr) — userspace TLS base (MSR_FS_BASE)
 #define SYS_SET_CLEARTID      116 // set_cleartid(addr) — kernel stores 1 + futex-wakes on exit
 #define SYS_RMDIR             117 // rmdir(path_ptr, pathlen) -> 0 or -errno (empty dir only)
+#define SYS_SIGALTSTACK       118 // sigaltstack(new_stack_t*, old_stack_t*) -> 0 or -errno
 
 // signalfd flags (Linux-compatible).
 #define SFD_CLOEXEC  0x0002

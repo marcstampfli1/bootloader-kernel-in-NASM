@@ -120,6 +120,7 @@
 #define SYS_FUTEX             114
 #define SYS_SET_FS            115
 #define SYS_SET_CLEARTID      116
+#define SYS_SIGALTSTACK       118
 
 // futex ops (kernel/proc/futex.h).  timeout arg is RELATIVE
 // nanoseconds, 0 = wait forever.
