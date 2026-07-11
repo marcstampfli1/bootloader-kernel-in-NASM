@@ -494,3 +494,50 @@ allocators stay consistent via the pinned bcache block.  Deferred: the poll path
 is correct and unblocks the whole Wayland-compositor bring-up (every compositor
 creates a socket lockfile); no MakaOS workload issues enough concurrent
 metadata writes for the lock-hold latency to matter yet.
+
+---
+
+## 14. virtio-gpu resource backing is physically contiguous (single mem_entry)
+
+- **What**: every virgl/DRM resource (textures, render targets, window/scanout
+  backing, vertex/staging buffers) is allocated with `pmm_buddy_alloc(order)` --
+  a physically contiguous, power-of-2 block -- and attached to the device as a
+  single `nr_entries=1` mem_entry via `virtio_gpu_resource_attach_backing_single`.
+- **Where**: `kernel/drivers/video/drm.c` (`drm_ioctl_create_dumb`,
+  `drm_ioctl_virtgpu_resource_create`), `kernel/drivers/video/virtio_gpu.c`
+  (`virtio_gpu_resource_attach_backing_single`). Same pattern for the 64 MiB
+  per-resource size cap in `drm_ioctl_virtgpu_resource_create`.
+- **Scale failure**:
+  - **Fragmentation cliff.** A 1080p BGRA window is ~8 MiB = order-11 = 2048
+    contiguous pages. Fine at boot; after hours of churn high-order buddy blocks
+    get scarce, so `pmm_buddy_alloc` returns ENOMEM even with plenty of free
+    *scattered* memory. Windows are large and long-lived -- exactly the
+    allocations most likely to fail.
+  - **Power-of-2 internal waste.** A 5 MiB texture rounds up to an 8 MiB block:
+    up to ~2x waste on every non-power-of-2 resource, and windows are rarely a
+    clean power of two.
+  - The **64 MiB per-resource cap** is a symptom of the same thing -- a bound
+    needed because high-order contiguous allocs are dangerous, not because the
+    resource requires it.
+  - Neither the guest nor the device requires physical contiguity: virtio-gpu's
+    RESOURCE_ATTACH_BACKING is *built* for scatter-gather (an array of
+    nr_entries {addr,length} mem_entries). Using one entry manufactures a
+    contiguity requirement the hardware never imposes. What actually needs to be
+    contiguous is *virtual* (the guest's single mmap of the resource + the HHDM
+    kernel view), which page tables provide over scattered frames. Physical
+    contiguity buys only simple pointer math.
+- **Target**: allocate per-page (or a few large blocks), describe the backing to
+  the device as a multi-entry scatter list (nr_entries > 1), map it
+  virtually-contiguous into the userspace VMA and into a kernel window. Removes
+  the fragmentation cliff, the power-of-2 waste, and the artificial size cap in
+  one move. Mirrors Linux GEM/GBM sg-list backing.
+- **Blocking order**: needs (1) `virtio_gpu_resource_attach_backing` variant that
+  emits an nr_entries>1 mem_entry array from a page list; (2) an mmap resolver
+  (`drm_resolve_dumb_mmap`) that installs PTEs for a page list rather than one
+  contiguous range; (3) a kernel virtually-contiguous mapping (vmap-style) for
+  the HHDM-style readback path. Correctness is unaffected today (contiguous is a
+  strict subset of what the device accepts); this is purely a scaling stopgap.
+- **Note**: NOT the cause of the 2026-07 black-texture bug -- that backing is
+  contiguous, correctly sized, and correctly attached; the 16x16 round-trip
+  selftest proves the mechanism. Contiguity is a scaling problem, not a
+  correctness one here.
