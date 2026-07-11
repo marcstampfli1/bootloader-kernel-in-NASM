@@ -1853,6 +1853,12 @@ static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
 
     int fd = drm_install_fd(pf);
     if (fd < 0) {
+        // Unwind BOTH references taken above: the per-page refs AND the host
+        // resource ref.  Omitting the latter stranded the host virtio-gpu
+        // resource's refcount at +1 forever (the res_rc node + the host GPU
+        // resource outlive the owner and every clone) when the fd table was
+        // full (-ENFILE) on a res3d PRIME export.
+        if (src_res_id) res_host_unref(src_res_id);
         for (uint32_t i = 0; i < bytes / 4096u; i++)
             pmm_ref_dec(phys + (phys_addr_t)i * 4096u);
         kfree(db); kfree(pf); return fd;
