@@ -91,15 +91,19 @@ extern const struct in6_addr in6addr_loopback;   // ::1
 // IPv4 class/multicast tests (host byte order input).
 #define IN_MULTICAST(a)  ((((in_addr_t)(a)) & 0xF0000000) == 0xE0000000)
 
+#define IP_TOS              1
 #define IP_TTL              2
 #define IPV6_UNICAST_HOPS   16
 
 // Multicast socket options (accepted, ignored by the stack).
+#define IP_MULTICAST_IF     32
 #define IP_MULTICAST_TTL    33
 #define IP_MULTICAST_LOOP   34
 #define IP_ADD_MEMBERSHIP   35
 #define IP_DROP_MEMBERSHIP  36
+#define IPV6_MULTICAST_IF   17
 #define IPV6_MULTICAST_HOPS 18
+#define IPV6_TCLASS         67
 #define IPV6_MULTICAST_LOOP 19
 #define IPV6_JOIN_GROUP     20
 #define IPV6_LEAVE_GROUP    21

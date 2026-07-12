@@ -49,6 +49,7 @@ struct ucred {
 #define SO_TYPE      3
 #define SO_ERROR     4
 #define SO_KEEPALIVE 9
+#define SO_OOBINLINE 10
 #define SO_SNDBUF    7
 #define SO_RCVBUF    8
 #define SO_LINGER    13
