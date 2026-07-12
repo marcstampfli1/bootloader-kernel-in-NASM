@@ -429,6 +429,22 @@ static void init_kthread(void) {
     }
 #endif
 
+#ifdef MAKAOS_JDKTEST
+    // OpenJDK Zero first-light (build with JDKTEST=1 + CONSOLE_SERIAL=1): run the
+    // cross-built HotSpot-Zero VM to print `java -version`, proving the full
+    // OpenJDK runtime (static-PIE launcher -> dlopen libjvm.so -> java.base) runs
+    // on MakaOS.  Boot at -m 1024M (see AVIANTEST note above).
+    {
+        static const char* java_argv[]  = {
+            "/jdk/bin/java",
+            "-XX:+ErrorFileToStderr",       // full hs_err report to serial (no fs flush on MakaOS)
+            "-cp", "/jdk", "Hello", NULL }; // run /jdk/Hello.class
+        static const int   java_stdio[3] = { -1, -1, -1 };  // inherit tty0 (serial-mirrored)
+        task_t* jv = elf_exec_kernel("/jdk/bin/java", pid_alloc(), java_argv, envp, java_stdio);
+        if (jv) sched_add(jv);
+    }
+#endif
+
     // Regression-test harness: uncomment to stress AHCI concurrent pread.
     // Kept in-tree so future changes to the submit path can be validated.
     // stress_pread_launch();

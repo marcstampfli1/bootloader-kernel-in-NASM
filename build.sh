@@ -111,6 +111,12 @@ if [ "${AVIANTEST:-0}" = "1" ]; then
   KERNEL_CFLAGS+=( -DMAKAOS_AVIANTEST )
   echo "[build] boot Avian first-light ENABLED (-DMAKAOS_AVIANTEST)"
 fi
+# JDKTEST=1 stages the cross-built OpenJDK Zero java.base image + runs
+# `/jdk/bin/java -version` at boot (behind -DMAKAOS_JDKTEST in main.c).
+if [ "${JDKTEST:-0}" = "1" ]; then
+  KERNEL_CFLAGS+=( -DMAKAOS_JDKTEST )
+  echo "[build] boot OpenJDK 'java -version' ENABLED (-DMAKAOS_JDKTEST)"
+fi
 
 # ── User compile flags ─────────────────────────────────────────────────────
 # -fPIE (position-independent) so every userland object -- libc especially --
@@ -896,6 +902,9 @@ echo "[+] Creating disk image (GPT + ESP + ext2)"
 
 EXT2_LBA=4096
 EXT2_SECTORS=1048576  # 512 MiB — DE stack (sway+swaybar+swaybg+tofi) + xkb tree + the 83 MB libSDL3.so
+# JDKTEST stages the ~55 MB exploded OpenJDK java.base image (6437 class files +
+# libjvm.so); grow the rootfs to 1 GiB so it fits with headroom.
+if [ "${JDKTEST:-0}" = "1" ]; then EXT2_SECTORS=2097152; fi  # 1 GiB
 ESP_START=2048
 ESP_END=4095
 
@@ -1057,6 +1066,31 @@ ext2_install_bin() {
     ext2_setperm "$img" "/$dst" 0100755 0 0
 }
 
+# ext2_install_tree <img> <src_dir> <dst_prefix>
+# Recursively stage a host directory tree into the ext2 image under /<dst_prefix>
+# using ONE debugfs session (mkdir every subdir parent-first, then write every
+# file).  Far faster than per-file debugfs invocations for large trees (the JDK's
+# 6437-file java.base module).  dst_prefix has no leading slash.
+ext2_install_tree() {
+    local img="$1" src="$2" dstpref="$3"
+    src="$(cd "$src" && pwd)"   # absolutize for debugfs `write`
+    local script; script="$(mktemp)"
+    {
+        echo "mkdir /$dstpref"
+        ( cd "$src" && find . -mindepth 1 -type d | LC_ALL=C sort ) \
+            | sed "s|^\./|mkdir /$dstpref/|"
+        # -L: follow symlinks so a symlink-to-file (e.g. lib/jvm.cfg) is reported
+        # as -type f and `write` copies its target's content.
+        ( cd "$src" && find -L . -type f ) \
+            | while IFS= read -r f; do
+                  rel="${f#./}"
+                  printf 'write %s/%s /%s/%s\n' "$src" "$rel" "$dstpref" "$rel"
+              done
+    } > "$script"
+    debugfs -w "$img" -f "$script" > /dev/null 2>&1 || true
+    rm -f "$script"
+}
+
 if [ -f "$BUILD_DIR/user_test_vmalloc.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_test_vmalloc.elf" bin/vmalloc
 fi
@@ -1077,6 +1111,28 @@ if [ "${AVIANTEST:-0}" = "1" ] && [ -f "$BUILD_DIR/avian-app/avian" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/avian-app/classpath.jar avian/classpath.jar" > /dev/null 2>&1 || true
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/avian-app/Hello.class avian/Hello.class" > /dev/null 2>&1 || true
     echo "[build] Avian JVM installed: /bin/avian + /avian/{classpath.jar,Hello.class}"
+fi
+# OpenJDK Zero java.base (JDKTEST=1): stage the exploded runtime image at /jdk so
+# `/jdk/bin/java -version` runs at boot.  Only bin/java + lib/ + the java.base
+# exploded classes are staged (not the full images/ tree with every module).
+if [ "${JDKTEST:-0}" = "1" ]; then
+    JDK_IMG="build/third_party/openjdk17u/build/linux-x86_64-zero-release/jdk"
+    if [ -x "$JDK_IMG/bin/java" ]; then
+        debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk"         > /dev/null 2>&1 || true
+        debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk/bin"     > /dev/null 2>&1 || true
+        debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk/modules" > /dev/null 2>&1 || true
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$JDK_IMG/bin/java" jdk/bin/java
+        ext2_install_tree "$BUILD_DIR/ext2.img" "$JDK_IMG/lib"                jdk/lib
+        ext2_install_tree "$BUILD_DIR/ext2.img" "$JDK_IMG/modules/java.base"  jdk/modules/java.base
+        [ -f "$JDK_IMG/release" ] && debugfs -w "$BUILD_DIR/ext2.img" -R "write $JDK_IMG/release /jdk/release" > /dev/null 2>&1 || true
+        # Hello.class -- a user class for `java Hello` (compiled by the host JDK 17
+        # to Java-17 bytecode, which the cross-built VM runs).
+        [ -f "$BUILD_DIR/jdktest/Hello.class" ] && \
+            debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/jdktest/Hello.class /jdk/Hello.class" > /dev/null 2>&1 || true
+        echo "[build] OpenJDK java.base staged at /jdk (bin/java + lib + modules/java.base + Hello.class)"
+    else
+        echo "[build] JDKTEST=1 but $JDK_IMG/bin/java missing -- run 'make java.base' first"
+    fi
 fi
 if [ -f "$BUILD_DIR/user_virgltest.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_virgltest.elf" bin/virgltest
