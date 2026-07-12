@@ -275,6 +275,13 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
 # list user_entry.o explicitly in each link line.
 cp "$BUILD_DIR/user_entry.o" "$SYSROOT/usr/lib/crt0.o"
 
+# crtdso.o — supplies a hidden, self-referential __dso_handle for shared
+# objects built via `gcc -shared` (C++ static destructors reference it via
+# __cxa_atexit, and MakaOS links .so's with no crt fragments).  The cross-gcc
+# startfile spec selects crtdso.o for -shared and crt0.o otherwise.
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" -fPIC \
+    -c "$USERLAND_DIR/libc/crtdso.c" -o "$SYSROOT/usr/lib/crtdso.o"
+
 # Default link script for sysroot users.
 cp "$USERLAND_DIR/link.ld" "$SYSROOT/usr/lib/makaos-link.ld"
 
