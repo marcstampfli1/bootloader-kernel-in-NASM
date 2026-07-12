@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_SYSCALL_H
 #define _MAKAOS_SYSCALL_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 // MakaOS-specific syscall numbers and raw syscall macros.
 // These are the kernel ABI — numbers must match kernel/syscall/syscall.h.
 
@@ -180,4 +183,7 @@ static inline long __syscall_ret(uint64_t r) {
     return s;
 }
 
+#ifdef __cplusplus
+}
+#endif
 #endif

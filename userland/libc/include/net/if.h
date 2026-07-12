@@ -5,6 +5,9 @@
 
 #ifndef _MAKAOS_NET_IF_H
 #define _MAKAOS_NET_IF_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/socket.h>
 
@@ -82,4 +85,7 @@ struct ifconf {
 unsigned int if_nametoindex(const char* name);
 char*        if_indextoname(unsigned int index, char* name);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

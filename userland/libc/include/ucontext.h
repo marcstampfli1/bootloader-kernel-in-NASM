@@ -1,5 +1,8 @@
 #ifndef _UCONTEXT_H
 #define _UCONTEXT_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 // glibc-compatible <ucontext.h> for x86-64.  A SA_SIGINFO handler receives a
 // `ucontext_t*` as its third argument; JVMs (Avian, HotSpot) read and MODIFY
 // uc_mcontext.gregs[REG_RIP] (advance past a faulting/polling instruction to
@@ -67,4 +70,7 @@ int  setcontext(const ucontext_t* ucp);
 void makecontext(ucontext_t* ucp, void (*func)(void), int argc, ...);
 int  swapcontext(ucontext_t* oucp, const ucontext_t* ucp);
 
+#ifdef __cplusplus
+}
+#endif
 #endif /* _UCONTEXT_H */

@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_SETJMP_H
 #define _MAKAOS_SETJMP_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // Callee-saved register snapshot + rip/rsp + mxcsr.  Layout must
 // match userland/libc/setjmp.asm exactly:
@@ -26,4 +29,7 @@ __attribute__((__noreturn__)) void siglongjmp(sigjmp_buf env, int val);
 #define _setjmp   setjmp
 #define _longjmp  longjmp
 
+#ifdef __cplusplus
+}
+#endif
 #endif

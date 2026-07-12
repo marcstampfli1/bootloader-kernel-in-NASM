@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_NETINET_IN_H
 #define _MAKAOS_NETINET_IN_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/socket.h>
 #include <stdint.h>
@@ -154,4 +157,7 @@ struct ipv6_mreq {
     unsigned int    ipv6mr_interface;
 };
 
+#ifdef __cplusplus
+}
+#endif
 #endif
