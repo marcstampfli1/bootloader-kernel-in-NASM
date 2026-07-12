@@ -1946,6 +1946,17 @@ int getloadavg(double loadavg[], int nelem) {
     return n;
 }
 
+// glibc malloc extensions. MakaOS's allocator does not support returning free
+// memory to the OS or per-block size introspection, so these report "nothing
+// trimmed" / unknown. Consumers (e.g. the JVM's trim-native-heap command and
+// native memory tracking) treat these as unavailable.
+int malloc_trim(size_t pad) { (void)pad; return 0; }
+size_t malloc_usable_size(void* ptr) { (void)ptr; return 0; }
+void malloc_stats(void) {}
+struct mallinfo { int arena, ordblks, smblks, hblks, hblkhd, usmblks,
+                      fsmblks, uordblks, fordblks, keepcost; };
+struct mallinfo mallinfo(void) { struct mallinfo mi; memset(&mi, 0, sizeof(mi)); return mi; }
+
 // ── scheduling / priority hints ──────────────────────────────────────────
 // sched_getcpu: which CPU the caller runs on.  MakaOS exposes no getcpu, so
 // report 0 -- callers (Mesa's u_thread) use it only for cache/affinity hints.
