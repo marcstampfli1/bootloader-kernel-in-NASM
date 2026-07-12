@@ -1906,7 +1906,45 @@ long sysconf(int name) {
     }
 }
 long pathconf(const char* path, int name) { (void)path; (void)name; return -1; }
-int  confstr(int name, char* buf, size_t len) { (void)name; (void)buf; (void)len; return 0; }
+
+// confstr: report a modern glibc/NPTL identity so callers that gate legacy
+// workarounds on the version (e.g. OpenJDK) take the current path. Returns the
+// buffer size needed including the terminating NUL.
+int confstr(int name, char* buf, size_t len) {
+    const char* val;
+    switch (name) {
+    case _CS_GNU_LIBC_VERSION:       val = "glibc 2.38"; break;
+    case _CS_GNU_LIBPTHREAD_VERSION: val = "NPTL 2.38";  break;
+    default:
+        if (buf && len) buf[0] = '\0';
+        return 0;
+    }
+    size_t need = strlen(val) + 1;
+    if (buf && len) {
+        size_t copy = need < len ? need : len;
+        memcpy(buf, val, copy);
+        buf[copy - 1] = '\0';
+    }
+    return (int)need;
+}
+
+// mincore: MakaOS exposes no page-residency query, so report ENOSYS. Callers
+// (e.g. OpenJDK's committed-memory probing) treat this as "unknown" and skip
+// the optimisation.
+int mincore(void* addr, size_t len, unsigned char* vec) {
+    (void)addr; (void)len; (void)vec;
+    errno = ENOSYS;
+    return -1;
+}
+
+// getloadavg: MakaOS keeps no load-average statistic, so report zero load for
+// the requested samples. Returns the number of samples filled (<= 3).
+int getloadavg(double loadavg[], int nelem) {
+    if (nelem < 0) return -1;
+    int n = nelem < 3 ? nelem : 3;
+    for (int i = 0; i < n; i++) loadavg[i] = 0.0;
+    return n;
+}
 
 // ── scheduling / priority hints ──────────────────────────────────────────
 // sched_getcpu: which CPU the caller runs on.  MakaOS exposes no getcpu, so

@@ -36,6 +36,9 @@ struct shmid_ds {
 #define SHM_REMAP   040000
 #define SHM_HUGETLB 04000
 
+// Segment-attach address must be a multiple of SHMLBA.
+#define SHMLBA 4096
+
 int   shmget(key_t key, size_t size, int shmflg);
 void* shmat(int shmid, const void* shmaddr, int shmflg);
 int   shmdt(const void* shmaddr);

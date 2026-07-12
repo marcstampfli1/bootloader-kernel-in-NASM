@@ -26,6 +26,18 @@ struct dl_phdr_info {
     void*              dlpi_tls_data;
 };
 
+// ElfW(type) selects the native-width ELF type (this port is LP64-only).
+#define ElfW(type) Elf64_##type
+
+// Dynamic-linker link-map node (as returned by dlinfo(RTLD_DI_LINKMAP)).
+struct link_map {
+    Elf64_Addr       l_addr;   /* module load bias */
+    char*            l_name;   /* module path */
+    void*            l_ld;     /* module .dynamic (Elf64_Dyn*) */
+    struct link_map* l_next;
+    struct link_map* l_prev;
+};
+
 int dl_iterate_phdr(int (*callback)(struct dl_phdr_info* info, size_t size,
                                     void* data),
                     void* data);

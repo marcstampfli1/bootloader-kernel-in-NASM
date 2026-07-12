@@ -182,6 +182,11 @@ int pthread_attr_getguardsize(const pthread_attr_t* a, size_t* sz) {
     *sz = 0;                    // MakaOS threads carry no separate guard region
     return 0;
 }
+int pthread_attr_setguardsize(pthread_attr_t* a, size_t sz) {
+    (void)sz;                   // no separate guard region; accept and ignore
+    if (!a) return EINVAL;
+    return 0;
+}
 // pthread_getattr_np: recover a live thread's attributes (glibc extension the
 // JVM uses to locate a thread's stack). We report the stack the thread was
 // created with; the primordial thread is handled by its caller before this

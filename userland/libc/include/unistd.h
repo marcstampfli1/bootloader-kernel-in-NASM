@@ -48,6 +48,8 @@ long   sysconf(int name);
 // confstr — string-valued runtime queries (just _CS_PATH for foot).
 size_t confstr(int name, char* buf, size_t len);
 #define _CS_PATH 0
+#define _CS_GNU_LIBC_VERSION       2
+#define _CS_GNU_LIBPTHREAD_VERSION 3
 // _SC_* names — only the subset foot / harfbuzz probe today.
 #define _SC_NPROCESSORS_CONF  10
 #define _SC_NPROCESSORS_ONLN  11

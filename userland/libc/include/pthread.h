@@ -104,6 +104,7 @@ int pthread_attr_getstacksize(const pthread_attr_t* a, size_t* sz);
 int pthread_attr_setstack(pthread_attr_t* a, void* stack, size_t sz);
 int pthread_attr_getstack(const pthread_attr_t* a, void** stackaddr, size_t* sz);
 int pthread_attr_getguardsize(const pthread_attr_t* a, size_t* sz);
+int pthread_attr_setguardsize(pthread_attr_t* a, size_t sz);
 int pthread_getattr_np(pthread_t t, pthread_attr_t* a);
 int pthread_attr_setdetachstate(pthread_attr_t* a, int state);
 int pthread_attr_getdetachstate(const pthread_attr_t* a, int* state);

@@ -606,6 +606,20 @@ int dladdr(const void* addr, Dl_info* info) {
     return 0;
 }
 
+// dlvsym: versioned symbol lookup. MakaOS has no symbol versioning, so we
+// ignore the requested version and resolve the plain name.
+void* dlvsym(void* handle, const char* name, const char* version) {
+    (void)version;
+    return dlsym(handle, name);
+}
+
+// dlinfo: MakaOS's loader does not yet expose a link map, so information
+// requests (e.g. RTLD_DI_LINKMAP) fail. Callers use this only for diagnostics.
+int dlinfo(void* handle, int request, void* info) {
+    (void)handle; (void)request; (void)info;
+    return -1;
+}
+
 // dl_iterate_phdr: enumerate loaded objects. MakaOS's loader does not yet
 // expose its link map for iteration, so we visit nothing and return 0. This
 // degrades gracefully: the only in-tree consumer (OpenJDK os_linux.cpp) uses

@@ -37,6 +37,7 @@ int   munmap(void* addr, size_t len);
 int   mprotect(void* addr, size_t len, int prot);
 int   madvise(void* addr, size_t len, int advice);
 int   msync(void* addr, size_t len, int flags);
+int   mincore(void* addr, size_t len, unsigned char* vec);
 
 // POSIX shared memory
 int shm_open(const char* name, int flags, mode_t mode);

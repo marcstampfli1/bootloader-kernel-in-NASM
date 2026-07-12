@@ -45,6 +45,7 @@ __attribute__((__noreturn__)) void exit(int status);
 __attribute__((__noreturn__)) void _Exit(int status);
 __attribute__((__noreturn__)) void abort(void);
 int  atexit(void (*fn)(void));
+int  getloadavg(double loadavg[], int nelem);
 int  system(const char* cmd);
 
 // Random (CSPRNG-backed via /dev/urandom)
