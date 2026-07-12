@@ -24,7 +24,11 @@ typedef jmp_buf sigjmp_buf;
 
 int  setjmp(jmp_buf env);
 __attribute__((__noreturn__)) void longjmp(jmp_buf env, int val);
-int  sigsetjmp(sigjmp_buf env, int save_mask);
+// sigsetjmp must expand to __sigsetjmp (the real symbol libc provides) at the
+// call site -- a plain function wrapper would save the wrapper's frame, not the
+// caller's. This is the glibc approach and matches libc.h's own macro.
+int  __sigsetjmp(sigjmp_buf env, int save_mask);
+#define sigsetjmp(env, save_mask) __sigsetjmp(env, save_mask)
 __attribute__((__noreturn__)) void siglongjmp(sigjmp_buf env, int val);
 #define _setjmp   setjmp
 #define _longjmp  longjmp
