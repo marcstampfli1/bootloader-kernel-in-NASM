@@ -71,6 +71,12 @@ char*      ctime_r(const time_t* t, char* buf);          // buf >= 26 bytes
 char*      asctime_r(const struct tm* tm, char* buf);    // buf >= 26 bytes
 double     difftime(time_t a, time_t b);
 
+// Timezone globals + init. MakaOS operates in UTC; tzset() sets these to UTC.
+extern char* tzname[2];
+extern long  timezone;
+extern int   daylight;
+void       tzset(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -46,3 +46,17 @@ int clock_nanosleep(clockid_t id, int flags,
     }
     return nanosleep(req, rem) == 0 ? 0 : errno;
 }
+
+// ── Timezone (UTC) ───────────────────────────────────────────────────
+// MakaOS has no timezone database, so it operates in UTC. tzset() is a
+// compatibility no-op that (re)asserts the UTC globals; TZ is ignored.
+char* tzname[2] = { (char*)"UTC", (char*)"UTC" };
+long  timezone  = 0;
+int   daylight  = 0;
+
+void tzset(void) {
+    tzname[0] = (char*)"UTC";
+    tzname[1] = (char*)"UTC";
+    timezone  = 0;
+    daylight  = 0;
+}
