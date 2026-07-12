@@ -171,6 +171,30 @@ int pthread_attr_setstack(pthread_attr_t* a, void* stack, size_t sz) {
     if (!a || !stack || sz < 16 * 1024) return EINVAL;
     a->stack = stack; a->stack_size = sz; return 0;
 }
+int pthread_attr_getstack(const pthread_attr_t* a, void** stackaddr, size_t* sz) {
+    if (!a || !stackaddr || !sz) return EINVAL;
+    *stackaddr = a->stack;      // lowest address of the stack mapping
+    *sz = a->stack_size;
+    return 0;
+}
+int pthread_attr_getguardsize(const pthread_attr_t* a, size_t* sz) {
+    if (!a || !sz) return EINVAL;
+    *sz = 0;                    // MakaOS threads carry no separate guard region
+    return 0;
+}
+// pthread_getattr_np: recover a live thread's attributes (glibc extension the
+// JVM uses to locate a thread's stack). We report the stack the thread was
+// created with; the primordial thread is handled by its caller before this
+// (its descriptor has no libc-managed stack).
+int pthread_getattr_np(pthread_t t, pthread_attr_t* a) {
+    if (!t || !a) return EINVAL;
+    pthread_attr_init(a);
+    a->stack       = t->stack;
+    a->stack_size  = t->stack_size;
+    a->detachstate = (t->state == PT_DETACHED) ? PTHREAD_CREATE_DETACHED
+                                               : PTHREAD_CREATE_JOINABLE;
+    return 0;
+}
 int pthread_attr_setdetachstate(pthread_attr_t* a, int state) {
     if (!a) return EINVAL;
     if (state != PTHREAD_CREATE_JOINABLE && state != PTHREAD_CREATE_DETACHED)

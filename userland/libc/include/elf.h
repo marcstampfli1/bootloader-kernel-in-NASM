@@ -143,6 +143,33 @@ typedef struct {
 #define ELF64_ST_TYPE(i)    ((i) & 0xf)
 #define ELF64_ST_INFO(b, t) (((b) << 4) + ((t) & 0xf))
 
+// e_ident[] indices, magic, class and data encoding.
+#define EI_MAG0    0
+#define EI_MAG1    1
+#define EI_MAG2    2
+#define EI_MAG3    3
+#define EI_CLASS   4
+#define EI_DATA    5
+#define EI_VERSION 6
+#define EI_OSABI   7
+#define EI_PAD     8
+#define EI_NIDENT  16
+
+#define ELFMAG0 0x7f
+#define ELFMAG1 'E'
+#define ELFMAG2 'L'
+#define ELFMAG3 'F'
+#define ELFMAG  "\177ELF"
+#define SELFMAG 4
+
+#define ELFCLASSNONE 0
+#define ELFCLASS32   1
+#define ELFCLASS64   2
+
+#define ELFDATANONE 0
+#define ELFDATA2LSB 1
+#define ELFDATA2MSB 2
+
 // Auxiliary vector entry (the kernel-provided auxv the loader passes at exec).
 typedef struct {
     uint32_t a_type;

@@ -33,6 +33,12 @@ size_t wcsrtombs(char* dst, const wchar_t** src, size_t n, mbstate_t* ps);
 size_t mbrlen(const char* s, size_t n, mbstate_t* ps);
 int    mbsinit(const mbstate_t* ps);
 
+// Wide-character strftime (declared here per POSIX; see impl for the current
+// limitation). struct tm is forward-declared to avoid pulling in <time.h>.
+struct tm;
+size_t wcsftime(wchar_t* s, size_t maxsize, const wchar_t* format,
+                const struct tm* tm);
+
 // Wide string primitives
 size_t  wcslen(const wchar_t* s);
 wchar_t* wcschr(const wchar_t* s, wchar_t c);

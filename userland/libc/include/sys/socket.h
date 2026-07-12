@@ -13,6 +13,7 @@ extern "C" {
 #define AF_LOCAL   AF_UNIX   // POSIX alias
 #define AF_INET    2
 #define AF_INET6   10
+#define AF_PACKET  17   // low-level packet interface (Linux value)
 #define PF_UNSPEC  AF_UNSPEC
 #define PF_UNIX    AF_UNIX
 #define PF_LOCAL   AF_UNIX

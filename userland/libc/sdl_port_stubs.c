@@ -361,6 +361,18 @@ size_t wcsxfrm(wchar_t* dst, const wchar_t* src, size_t n) {
     return len;
 }
 
+// wcsftime: wide-character strftime. MakaOS has no wide locale/time formatter
+// yet, so this produces an empty result (0 characters). Callers that use it
+// for optional locale-aware wide time strings (e.g. the JVM) fall back to a
+// narrow/default path. TODO: format via strftime + widening once wide locale
+// support lands.
+size_t wcsftime(wchar_t* s, size_t maxsize, const wchar_t* format,
+                const struct tm* tm) {
+    (void)format; (void)tm;
+    if (maxsize > 0 && s) s[0] = L'\0';
+    return 0;
+}
+
 int wcscoll(const wchar_t* a, const wchar_t* b) {
     return wcscmp(a, b);
 }
