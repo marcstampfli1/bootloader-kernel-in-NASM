@@ -438,6 +438,7 @@ static void init_kthread(void) {
         static const char* java_argv[]  = {
             "/jdk/bin/java",
             "-XX:+ErrorFileToStderr",       // full hs_err report to serial (no fs flush on MakaOS)
+            "-Xms256m", "-Xmx3g",           // large heap -- exercises the high-RAM support
             "-cp", "/jdk", "Hello", NULL }; // run /jdk/Hello.class
         static const int   java_stdio[3] = { -1, -1, -1 };  // inherit tty0 (serial-mirrored)
         task_t* jv = elf_exec_kernel("/jdk/bin/java", pid_alloc(), java_argv, envp, java_stdio);

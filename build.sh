@@ -1125,8 +1125,15 @@ if [ "${JDKTEST:-0}" = "1" ]; then
         ext2_install_tree "$BUILD_DIR/ext2.img" "$JDK_IMG/lib"                jdk/lib
         ext2_install_tree "$BUILD_DIR/ext2.img" "$JDK_IMG/modules/java.base"  jdk/modules/java.base
         [ -f "$JDK_IMG/release" ] && debugfs -w "$BUILD_DIR/ext2.img" -R "write $JDK_IMG/release /jdk/release" > /dev/null 2>&1 || true
-        # Hello.class -- a user class for `java Hello` (compiled by the host JDK 17
-        # to Java-17 bytecode, which the cross-built VM runs).
+        # Hello.class -- the `java Hello` demo (allocates a multi-hundred-MB heap
+        # to exercise the high-RAM support). Compiled from the tracked source by
+        # the host JDK 17 to Java-17 bytecode, which the cross-built VM runs.
+        HELLO_SRC="$USERLAND_DIR/apps/jdktest/Hello.java"
+        HOST_JAVAC="/usr/lib/jvm/java-17-openjdk-amd64/bin/javac"
+        mkdir -p "$BUILD_DIR/jdktest"
+        if [ -f "$HELLO_SRC" ] && [ -x "$HOST_JAVAC" ]; then
+            "$HOST_JAVAC" -d "$BUILD_DIR/jdktest" "$HELLO_SRC" || echo "[build] warn: Hello.java compile failed"
+        fi
         [ -f "$BUILD_DIR/jdktest/Hello.class" ] && \
             debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/jdktest/Hello.class /jdk/Hello.class" > /dev/null 2>&1 || true
         echo "[build] OpenJDK java.base staged at /jdk (bin/java + lib + modules/java.base + Hello.class)"
