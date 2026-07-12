@@ -16,5 +16,6 @@
 // source- but not ABI-number-compatible). Values match Linux/x86-64 so ported
 // code that hardcodes them works. Add a tag here only when the shim handles it.
 #define SYS_gettid 186
+#define SYS_futex  202
 
 #endif // _SYS_SYSCALL_H

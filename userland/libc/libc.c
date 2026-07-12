@@ -1982,6 +1982,22 @@ int gettid(void) { return (int)syscall0(SYS_GETPID); }
 long syscall(long n, ...) {
     switch (n) {
     case 186: return gettid();   // SYS_gettid
+    case 202: {                  // SYS_futex -> MakaOS native futex (114)
+        va_list ap;
+        va_start(ap, n);
+        void* uaddr = va_arg(ap, void*);
+        int   op    = va_arg(ap, int);
+        int   val   = va_arg(ap, int);
+        void* to    = va_arg(ap, void*);
+        va_end(ap);
+        // MakaOS's futex is always process-private and uses the monotonic
+        // clock, so strip the flags it does not model, leaving a plain
+        // FUTEX_WAIT/FUTEX_WAKE/etc. for the kernel.
+        op &= ~(128 | 256);      // FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME
+        return (long)syscall4(114, (uint64_t)(uintptr_t)uaddr,
+                              (uint64_t)op, (uint64_t)(unsigned)val,
+                              (uint64_t)(uintptr_t)to);
+    }
     default:  errno = ENOSYS; return -1;
     }
 }
