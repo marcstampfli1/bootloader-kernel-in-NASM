@@ -58,6 +58,15 @@ struct flock {
     pid_t   l_pid;
 };
 
+// LFS record lock: LP64 makes off_t 64-bit, so this is identical to flock.
+struct flock64 {
+    short   l_type;
+    short   l_whence;
+    off_t   l_start;
+    off_t   l_len;
+    pid_t   l_pid;
+};
+
 int open(const char* path, int flags, ...);
 int openat(int dirfd, const char* path, int flags, ...);
 int creat(const char* path, mode_t mode);

@@ -143,3 +143,13 @@ int posix_memalign(void** memptr, size_t alignment, size_t size) {
     *memptr = malloc(size);
     return *memptr ? 0 : ENOMEM;
 }
+
+// ── memalign ─────────────────────────────────────────────────────────
+// Legacy glibc aligned allocator (<malloc.h>).  Shares posix_memalign's
+// current alignment<=16 limitation (scalability-debt-ledger-#9).  Returns
+// NULL on failure rather than an errno, per the glibc contract.
+void* memalign(size_t alignment, size_t size) {
+    void* p = 0;
+    if (posix_memalign(&p, alignment, size) != 0) return 0;
+    return p;
+}
