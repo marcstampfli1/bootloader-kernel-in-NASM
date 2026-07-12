@@ -47,6 +47,18 @@ int     isatty(int fd);
 long   sysconf(int name);
 // confstr — string-valued runtime queries (just _CS_PATH for foot).
 size_t confstr(int name, char* buf, size_t len);
+// pathconf/fpathconf — per-path configurable limits.
+long pathconf(const char* path, int name);
+long fpathconf(int fd, int name);
+#define _PC_LINK_MAX          0
+#define _PC_MAX_CANON         1
+#define _PC_MAX_INPUT         2
+#define _PC_NAME_MAX          3
+#define _PC_PATH_MAX          4
+#define _PC_PIPE_BUF          5
+#define _PC_CHOWN_RESTRICTED  6
+#define _PC_NO_TRUNC          7
+#define _PC_VDISABLE          8
 #define _CS_PATH 0
 #define _CS_GNU_LIBC_VERSION       2
 #define _CS_GNU_LIBPTHREAD_VERSION 3

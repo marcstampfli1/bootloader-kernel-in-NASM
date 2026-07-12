@@ -1678,6 +1678,15 @@ static inline int setrlimit(int resource, const struct rlimit* rlim) {
 #define _CS_PATH            0
 #define _CS_GNU_LIBC_VERSION       2
 #define _CS_GNU_LIBPTHREAD_VERSION 3
+#define _PC_LINK_MAX          0
+#define _PC_MAX_CANON         1
+#define _PC_MAX_INPUT         2
+#define _PC_NAME_MAX          3
+#define _PC_PATH_MAX          4
+#define _PC_PIPE_BUF          5
+#define _PC_CHOWN_RESTRICTED  6
+#define _PC_NO_TRUNC          7
+#define _PC_VDISABLE          8
 #define _SC_PAGESIZE        30
 #define _SC_NGROUPS_MAX     3
 #define _SC_ARG_MAX         0

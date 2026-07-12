@@ -1914,7 +1914,23 @@ long sysconf(int name) {
     default:             return -1;
     }
 }
-long pathconf(const char* path, int name) { (void)path; (void)name; return -1; }
+// pathconf/fpathconf: report the fixed configurable limits MakaOS enforces.
+static long pathconf_value(int name) {
+    switch (name) {
+    case _PC_LINK_MAX:         return 127;
+    case _PC_MAX_CANON:        return 255;
+    case _PC_MAX_INPUT:        return 255;
+    case _PC_NAME_MAX:         return 255;   // ext2/virtfs component limit
+    case _PC_PATH_MAX:         return 4096;
+    case _PC_PIPE_BUF:         return 4096;
+    case _PC_CHOWN_RESTRICTED: return 1;
+    case _PC_NO_TRUNC:         return 1;
+    case _PC_VDISABLE:         return 0;
+    default:                   return -1;
+    }
+}
+long pathconf(const char* path, int name)  { (void)path; return pathconf_value(name); }
+long fpathconf(int fd, int name)            { (void)fd;   return pathconf_value(name); }
 
 // confstr: report a modern glibc/NPTL identity so callers that gate legacy
 // workarounds on the version (e.g. OpenJDK) take the current path. Returns the

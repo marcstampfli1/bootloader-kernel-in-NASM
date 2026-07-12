@@ -30,4 +30,10 @@ struct statvfs {
 int statvfs(const char* path, struct statvfs* buf);
 int fstatvfs(int fd, struct statvfs* buf);
 
+
+#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+#define statvfs64  statvfs
+#define fstatvfs64 fstatvfs
+#endif
+
 #endif
