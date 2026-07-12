@@ -38,6 +38,40 @@ if [ ! -d "$SRC_DIR" ]; then
     (cd "$THIRD_PARTY" && unzip -q "glfw-${GLFW_VER}.zip")
 fi
 
+# Patch GLFW's module loader (src/posix_module.c): GLFW loads its backend libs
+# (wayland-client/cursor/egl, xkbcommon, EGL, GLES) via runtime dlopen, but MakaOS
+# ships them as static .a. When the .so is not dlopen-able, fall back to resolving
+# symbols from the main program via RTLD_DEFAULT (a non-NULL sentinel handle marks
+# that). NOTE: this only helps for symbols actually present + exported in the
+# loading binary's dynsym -- which today means the PIC libs (wayland/xkbcommon).
+# Mesa's EGL/GLES are non-PIC, so fully satisfying GLFW's dlopen still needs the
+# Mesa+wayland stack as real .so's (rebuild Mesa -fPIC) -- see the GLFW notes in
+# the JVM-port memory / SCALABILITY_DEBT.
+PM="$SRC_DIR/src/posix_module.c"
+if ! grep -q "_glfw_makaos_static_module" "$PM"; then
+    python3 - "$PM" <<'PY'
+import sys
+f=sys.argv[1]; s=open(f).read()
+s=s.replace(
+"void* _glfwPlatformLoadModule(const char* path)\n{\n    return dlopen(path, RTLD_LAZY | RTLD_LOCAL);\n}",
+"static int _glfw_makaos_static_module;\n\n"
+"void* _glfwPlatformLoadModule(const char* path)\n{\n"
+"    void* m = dlopen(path, RTLD_LAZY | RTLD_LOCAL);\n"
+"    if (m) return m;\n"
+"    return &_glfw_makaos_static_module;  /* MakaOS: fall back to static syms */\n}")
+s=s.replace(
+"void _glfwPlatformFreeModule(void* module)\n{\n    dlclose(module);\n}",
+"void _glfwPlatformFreeModule(void* module)\n{\n    if (module != &_glfw_makaos_static_module) dlclose(module);\n}")
+s=s.replace(
+"GLFWproc _glfwPlatformGetModuleSymbol(void* module, const char* name)\n{\n    return dlsym(module, name);\n}",
+"GLFWproc _glfwPlatformGetModuleSymbol(void* module, const char* name)\n{\n"
+"    if (module == &_glfw_makaos_static_module) return (GLFWproc) dlsym(RTLD_DEFAULT, name);\n"
+"    return dlsym(module, name);\n}")
+open(f,'w').write(s)
+print("[port-glfw] patched posix_module.c (RTLD_DEFAULT static fallback)")
+PY
+fi
+
 SHARED_ARG="OFF"
 [ "${BUILD_SHARED:-0}" = "1" ] && SHARED_ARG="ON"
 
