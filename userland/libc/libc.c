@@ -40,6 +40,15 @@ char* program_invocation_short_name = _prog_name_default;
 static char* s_empty_env[] = { NULL };
 char** environ = s_empty_env;
 
+// __dso_handle identifies a module to __cxa_atexit for per-DSO destructor
+// registration. It is normally supplied by crtbeginS.o, but MakaOS builds
+// shared objects with a bare `ld -shared` (no crt fragments), so we provide a
+// weak fallback here. libc.a is linked into each module (executable or shared),
+// giving each its own copy; a null handle registers destructors against the
+// global list, which run at process exit -- correct for a module that is never
+// dlclosed (e.g. libjvm.so).
+__attribute__((weak)) void* __dso_handle = 0;
+
 // Count entries in environ
 static int _env_count(void) {
     int n = 0;
