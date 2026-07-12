@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# port-glfw.sh - cross-build GLFW (Wayland backend) to the MakaOS sysroot.
+#
+# GLFW is what LWJGL (and therefore Minecraft) loads for its window, GL context
+# and input.  MakaOS already has the whole foundation GLFW-Wayland sits on:
+# wayland-client/cursor/egl, xkbcommon, EGL/GLESv2 and Mesa/virgl GL (proven by
+# the sway compositor + DarkPlaces).  So we build real GLFW's Wayland backend
+# rather than shimming SDL.
+#
+# Default build is the STATIC lib (libglfw3.a) for a standalone smoke test.
+# BUILD_SHARED=1 builds libglfw.so instead (for LWJGL to dlopen) -- see note.
+#
+# Prereqs (all present after a prior `bash build.sh`): the wayland/xkb/EGL ports
+# in build/sysroot, host wayland-scanner, and scripts/makaos-toolchain.cmake.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export REPO_ROOT
+BUILD_DIR="$REPO_ROOT/build"
+THIRD_PARTY="$BUILD_DIR/third_party"
+SYSROOT="${SYSROOT:-$BUILD_DIR/sysroot}"
+TOOLCHAIN_FILE="$REPO_ROOT/scripts/makaos-toolchain.cmake"
+GLFW_VER="3.4"
+SRC_DIR="$THIRD_PARTY/glfw-${GLFW_VER}"
+BLD_DIR="$SRC_DIR/build-makaos"
+
+log() { echo "[port-glfw] $*"; }
+
+export PKG_CONFIG_PATH="$SYSROOT/usr/lib/pkgconfig"
+export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
+export PKG_CONFIG_LIBDIR="$SYSROOT/usr/lib/pkgconfig"
+
+# ── fetch ──────────────────────────────────────────────────────────────────
+if [ ! -d "$SRC_DIR" ]; then
+    log "downloading GLFW ${GLFW_VER}"
+    curl -fsSL -o "$THIRD_PARTY/glfw-${GLFW_VER}.zip" \
+        "https://github.com/glfw/glfw/releases/download/${GLFW_VER}/glfw-${GLFW_VER}.zip"
+    (cd "$THIRD_PARTY" && unzip -q "glfw-${GLFW_VER}.zip")
+fi
+
+SHARED_ARG="OFF"
+[ "${BUILD_SHARED:-0}" = "1" ] && SHARED_ARG="ON"
+
+# ── configure ──────────────────────────────────────────────────────────────
+# Wayland only (no X11), no libdecor (client-side decorations are irrelevant for
+# a fullscreen game and libdecor is unported).  wayland-scanner is a host tool,
+# so it must be found on the host PATH, not the sysroot (the toolchain sets
+# FIND_ROOT_PATH_MODE_PROGRAM=NEVER, which already does that).
+log "cmake configure (Wayland backend, shared=${SHARED_ARG})"
+rm -rf "$BLD_DIR"
+cmake \
+    -S "$SRC_DIR" -B "$BLD_DIR" \
+    -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DBUILD_SHARED_LIBS="${SHARED_ARG}" \
+    -DGLFW_BUILD_WAYLAND=ON \
+    -DGLFW_BUILD_X11=OFF \
+    -DGLFW_BUILD_EXAMPLES=OFF \
+    -DGLFW_BUILD_TESTS=OFF \
+    -DGLFW_BUILD_DOCS=OFF \
+    -DGLFW_LIBRARY_TYPE=$([ "$SHARED_ARG" = "ON" ] && echo SHARED || echo STATIC)
+
+# ── build + install ────────────────────────────────────────────────────────
+log "cmake build"
+cmake --build "$BLD_DIR" -j"$(nproc)"
+
+log "install into sysroot"
+DESTDIR="$SYSROOT" cmake --install "$BLD_DIR"
+
+log "done:"
+find "$SYSROOT" -name "libglfw*" -newer "$SRC_DIR/CMakeLists.txt" 2>/dev/null | sed "s|$SYSROOT|  \$SYSROOT|"
+ls "$SYSROOT/usr/include/GLFW/glfw3.h" 2>/dev/null && echo "  headers installed"
