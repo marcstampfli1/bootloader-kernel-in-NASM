@@ -25,6 +25,15 @@ typedef uint32_t socklen_t;
 typedef uint64_t fsblkcnt_t;
 typedef uint64_t fsfilcnt_t;
 typedef int      sig_atomic_t;
+
+// LFS (*64) types -- LP64, so identical to the plain 64-bit types. loff_t is
+// the Linux 64-bit file offset.
+typedef off_t      off64_t;
+typedef off_t      loff_t;
+typedef ino_t      ino64_t;
+typedef blkcnt_t   blkcnt64_t;
+typedef fsblkcnt_t fsblkcnt64_t;
+typedef fsfilcnt_t fsfilcnt64_t;
 #ifndef _SSIZE_T_DEFINED
 #define _SSIZE_T_DEFINED 1
 typedef long ssize_t;
