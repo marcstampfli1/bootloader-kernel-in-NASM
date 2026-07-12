@@ -34,6 +34,12 @@ typedef ino_t      ino64_t;
 typedef blkcnt_t   blkcnt64_t;
 typedef fsblkcnt_t fsblkcnt64_t;
 typedef fsfilcnt_t fsfilcnt64_t;
+
+// BSD unsigned aliases.
+typedef unsigned char  u_char;
+typedef unsigned short u_short;
+typedef unsigned int   u_int;
+typedef unsigned long  u_long;
 #ifndef _SSIZE_T_DEFINED
 #define _SSIZE_T_DEFINED 1
 typedef long ssize_t;

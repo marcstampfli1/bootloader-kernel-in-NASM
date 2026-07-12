@@ -53,6 +53,7 @@ uint32_t ntohl(uint32_t v);
 #define INET_ADDRSTRLEN   16
 #define INET6_ADDRSTRLEN  46
 #define IPPROTO_IPV6      41
+#define IPPROTO_ICMPV6    58
 
 extern const struct in6_addr in6addr_any;        // ::
 extern const struct in6_addr in6addr_loopback;   // ::1
@@ -101,7 +102,10 @@ extern const struct in6_addr in6addr_loopback;   // ::1
 #define IP_MULTICAST_LOOP   34
 #define IP_ADD_MEMBERSHIP   35
 #define IP_DROP_MEMBERSHIP  36
+#define IPV6_CHECKSUM        7
 #define IPV6_MULTICAST_IF   17
+#define IPV6_ADD_MEMBERSHIP 20
+#define IPV6_DROP_MEMBERSHIP 21
 #define IPV6_MULTICAST_HOPS 18
 #define IPV6_TCLASS         67
 #define IPV6_MULTICAST_LOOP 19

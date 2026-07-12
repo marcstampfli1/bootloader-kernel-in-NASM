@@ -41,6 +41,9 @@ struct ucred {
 
 // Socket options
 #define SOL_SOCKET   1
+#define SOL_RAW      255
+
+struct linger { int l_onoff; int l_linger; };
 #define SO_REUSEADDR 2
 #define SOMAXCONN    128
 // Timeouts — accepted by setsockopt, not yet enforced by the stack.
@@ -65,6 +68,7 @@ struct ucred {
 // send/recv flags
 #define MSG_DONTWAIT 0x40
 #define MSG_NOSIGNAL 0x4000
+#define MSG_OOB      0x01
 #define MSG_PEEK     0x02
 
 struct sockaddr {
