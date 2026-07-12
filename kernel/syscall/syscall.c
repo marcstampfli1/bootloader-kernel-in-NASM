@@ -801,12 +801,23 @@ static void kill_bcast_cb(task_t* t, void* data) {
 }
 
 // ── sys_kill ──────────────────────────────────────────────────────────────
+// Top of the POSIX realtime signal range userspace declares (SIGRTMAX in
+// <signal.h>). MakaOS has no per-task RT delivery (NSIG=32); operations on
+// [NSIG, SIGRTMAX_COMPAT] are accepted as benign no-ops rather than EINVAL so
+// glibc-style callers that treat a failure as fatal (OpenJDK's NIO NativeThread)
+// keep working. Proper fix: 64-bit signal masks (docs/SCALABILITY_DEBT.md).
+#define SIGRTMAX_COMPAT 63
+
 // kill(pid, sig): send signal `sig` to the task with the given pid.
 // pid > 0: send to the task with that pid.
 // pid == 0: send to all tasks in the caller's thread group.
 // pid == -1: broadcast to all tasks (except idle/kernel threads).
 static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
     int sig = (int)(int64_t)sig_raw;
+    // RT signals (>= NSIG, <= SIGRTMAX): accepted but undeliverable (no per-task
+    // RT delivery yet). Report success so senders -- e.g. NativeThread.signal()
+    // pthread_kill'ing the NIO interrupt signal -- do not error. See sys_sigaction.
+    if (sig >= NSIG && sig <= SIGRTMAX_COMPAT) return 0;
     if (sig < 1 || sig >= NSIG) return (uint64_t)-EINVAL;
 
     int64_t pid = (int64_t)pid_raw;
@@ -2347,7 +2358,24 @@ static inline int sigaction_addr_ok(uint64_t a) {
     return a < USER_ADDR_CEIL;
 }
 
+// SIGRTMAX -- the top of the POSIX realtime range userspace declares (see
+// <signal.h>). MakaOS has no per-task RT delivery (NSIG=32), but a handler
+// install / send on an RT signal must be a benign NO-OP, not an EINVAL error:
+// glibc-style code (OpenJDK's sun.nio.ch.NativeThread installs a handler on
+// SIGRTMAX-2 for blocking-I/O interruption) treats a sigaction failure as fatal
+// and its static initializer throws, taking down VM boot. Accepting the install
+// (with no slot, so it is never delivered) degrades gracefully: Thread.interrupt
+// of a blocked NIO op is a no-op, everything else proceeds. Proper fix would be
+// 64-bit signal masks (see docs/SCALABILITY_DEBT.md).
 static uint64_t sys_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t oldact_ptr) {
+    if (sig >= NSIG && sig <= SIGRTMAX_COMPAT) {
+        // RT signal: report "was SIG_DFL", accept the new action, deliver never.
+        if (oldact_ptr) {
+            k_sigaction_t z; __builtin_memset(&z, 0, sizeof z);
+            if (copy_to_user((void*)oldact_ptr, &z, sizeof z) != 0) return (uint64_t)-EFAULT;
+        }
+        return 0;
+    }
     if (sig < 1 || sig >= NSIG) return (uint64_t)-EINVAL;
     // POSIX: only SIGKILL and SIGSTOP are uncatchable.  SIGSEGV/SIGBUS/SIGFPE/
     // SIGILL/SIGTRAP ARE catchable — a JVM installs a SIGSEGV handler for its
