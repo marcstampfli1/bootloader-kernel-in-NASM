@@ -628,3 +628,33 @@ The original debt writeup, for history:
   becomes a thin client of that registry.
 - **Blocking order**: kernel device registry (shared with #2), then rewrite the
   three enumerators as registry queries instead of a synth patch.
+
+## 17. mprotect is a no-op stub (no SYS_MPROTECT)
+
+- **What**: `userland/libc/jdk_compat.c`'s `mprotect()` returns success without
+  changing any page permissions -- MakaOS has no user-facing mprotect syscall.
+- **Where**: `userland/libc/jdk_compat.c`; the VMM already has the perm-tightening
+  + TLB-shootdown machinery (see `kernel/mm/tlb.h`), just no syscall entry.
+- **Scale failure**: guard pages (stack-overflow detection), W^X for JITs, and any
+  runtime that relies on `PROT_NONE`/`PROT_READ` transitions silently keep their
+  original permissions. The JVM's StackOverflowError guard page is inert.
+- **Target**: add `SYS_MPROTECT` wired into the VMM (change VMA perms + shoot down
+  the TLB), then make libc `mprotect` a thin syscall wrapper.
+- **Blocking order**: independent; do when a runtime needs real page protection.
+
+## 18. Only 32 signals; realtime signals (32-63) are accepted-but-undeliverable
+
+- **What**: `NSIG` is 32 and the per-task `pending`/`blocked` masks are `uint32_t`,
+  so signals 32-63 (the POSIX realtime range `SIGRTMIN..SIGRTMAX`) cannot be
+  delivered. `sys_sigaction`/`sys_kill` accept them as benign no-ops so glibc-style
+  callers do not treat the failure as fatal (see `SIGRTMAX_COMPAT`).
+- **Where**: `kernel/proc/signal.h` (`NSIG`, `sigstate_t.pending/blocked`),
+  `kernel/syscall/syscall.c` (`sys_sigaction`, `sys_kill`).
+- **Scale failure**: RT signals never fire. OpenJDK's `sun.nio.ch.NativeThread`
+  installs its blocking-I/O interrupt on `SIGRTMAX-2`, so `Thread.interrupt()` of a
+  thread blocked in a native NIO call is a no-op; any app using `SIGRTMIN+n` for
+  queued/realtime notification gets nothing.
+- **Target**: widen the signal masks to `uint64_t` and `NSIG` to 64, then deliver
+  32-63 like standard signals (every `1u << (sig-1)` becomes `1ull << ...`).
+- **Blocking order**: independent; touches the signal-delivery core, so pair with
+  a sigtest extension that exercises a signal >= 32.
