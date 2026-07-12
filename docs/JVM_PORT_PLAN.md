@@ -144,30 +144,46 @@ The signal layer (SA_SIGINFO/ucontext + pthread_kill/shared-dispositions +
 sigaltstack) is COMPLETE and verified by userland/apps/sigtest (4 paths, all pass
 under a `SIGTEST=1` boot). Next is Phase 1 (Avian first-light).
 
-## Phase 1 status (2026-07-12): Avian cross-built and RUNNING on MakaOS
+## Phase 1 status (2026-07-12): Avian prints Hello World on MakaOS
 
-`scripts/port-avian.sh` cross-builds Avian (interpreter) to a static MakaOS
-x86-64 `avian` (7.4MB) + classpath.jar; `AVIANTEST=1 bash build.sh` installs and
-boot-spawns it. The JVM cross-compiles and runs end to end on MakaOS: it loads
-and links classes from the embedded classpath, runs the bytecode interpreter, and
-executes class static initializers (reaches `String.<clinit>`). Getting Hello
-World to print is blocked on `NoClassDefFoundError: java/lang/String$1` during
-`String.<clinit>`.
+`scripts/port-avian.sh` cross-builds Avian (interpreter) to a MakaOS x86-64 PIE
+`avian` + classpath.jar; `AVIANTEST=1 bash build.sh` installs and boot-spawns it.
+The JVM runs end to end: it loads and links classes from classpath.jar, runs the
+bytecode interpreter, and executes `Hello.main`, which prints
+`Hello from Avian JVM on MakaOS` and continues cleanly. Boot the AVIANTEST image
+at **-m 1024M** (MakaOS hangs very early at 2048M, a separate RAM-size bug).
 
-Ruled out for the String$1 failure: file I/O (a read()-vs-mmap swap fails
-identically), zip parsing (a host reproduction of Avian's exact central-directory
-walk reaches all 622 entries including String$1), hashing (the two hash overloads
-are byte-identical), embedded-jar integrity (byte-complete, 966263 B), and
-missing dependencies (java/util/Comparator etc. present). Remaining: a
-MakaOS-runtime issue in Avian's `JarIndex`/classloader (src/finder.cpp) or class
-name resolution -- needs VM instrumentation (debug prints in
-`JarIndex::open`/`findNode`, rebuild + boot) to pinpoint.
+Three fixes past the "JVM starts but no main" state:
 
-Boot the AVIANTEST image at **-m 1024M**; MakaOS hangs very early at 2048M (a
-separate RAM-size bug worth a look).
+1. **`NoClassDefFoundError: java/lang/String$1`** was not a jar/IO/hash bug: the
+   boot classloader had an empty finder. Fix: `kernel/main.c` passes
+   `-Xbootclasspath:/avian/classpath.jar` in the boot-spawn argv.
+2. **`UnsatisfiedLinkError` on native methods** (Avian_java_lang_System_arraycopy):
+   Avian resolves builtins via `dlsym(dlopen(NULL), ...)`, i.e. the main exe's
+   dynamic symbol table. Avian's own `make` links a static ET_EXEC with no
+   PT_DYNAMIC/DT_HASH, so those symbols cannot be found. Fix: `port-avian.sh`
+   bypasses that link and does an `ld` PIE link (`-pie --export-dynamic
+   --hash-style=sysv -T userland/link-pie.ld`, libc.a before libstdc++.a). MakaOS
+   maps the ET_DYN at VMM_USER_CODE_BASE; elf.c applies R_X86_64_RELATIVE.
+3. **`abort()` in `findInterfaceMethod`** during HashMap bootstrap: an
+   `invokeinterface` of a `java.lang.Object` method (Avian's own HashMap.java calls
+   `cell.hashCode()` on a `Cell` interface reference) resolves the target to
+   Object, which is not an interface and is absent from the receiver's interface
+   table, so the itable scan falls through to abort. This is a genuine Avian
+   interpreter+JIT gap. Fix (patched into the vendored source by port-avian.sh, in
+   the shared `findInterfaceMethod` so it covers both): if the resolved method's
+   class is not an interface, dispatch it virtually, per the JVMS invokeinterface
+   rules.
 
-Build gotchas encoded in port-avian.sh / already fixed: `java-version=8` (Avian's
+Debugging note: at `-O3`, `__builtin_return_address` in a `NO_RETURN` abort plus
+the interpreter's `vmRun` assembly break the C frame chain, so line attribution is
+unreliable (resolveClassInObject / baseSize / stringHash were all falsely blamed).
+Capturing the call site via `__builtin_FILE()/__builtin_LINE()` default args on
+`expect`/`abort` pinned it exactly. The final build is a clean, fully-optimized
+`-O3` (no `-O0` or `-fno-strict-aliasing` needed).
+
+Earlier build gotchas (already encoded in port-avian.sh): `java-version=8` (Avian's
 old `javac 1.x` version parse breaks on a modern JDK), `rdynamic=-Wl,--export-dynamic`
 (the makaos gcc rejects bare `-rdynamic`), libc `extern "C"` header guards +
 netinet/ip.h + ctime_r (commit 6d1c9fe -- Avian is the first big C++ port), and
-two tiny Avian source patches (posix.cpp limits.h, java-lang.cpp sysctl).
+two tiny Avian portability patches (posix.cpp limits.h, java-lang.cpp sysctl).
