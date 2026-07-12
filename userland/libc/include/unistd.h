@@ -145,4 +145,14 @@ int mknod(const char* path, unsigned mode, unsigned dev);
 }
 #endif
 
+
+// LFS (*64) aliases -- MakaOS is LP64 with 64-bit off_t/ino_t,
+// so the large-file variants are the same as the plain functions.
+#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+#define lseek64     lseek
+#define pread64     pread
+#define pwrite64    pwrite
+#define ftruncate64 ftruncate
+#endif
+
 #endif

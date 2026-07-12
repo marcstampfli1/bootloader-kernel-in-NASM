@@ -45,4 +45,12 @@ int    versionsort(const struct dirent** a, const struct dirent** b);
 }
 #endif
 
+
+// LFS (*64) aliases -- MakaOS is LP64 with 64-bit off_t/ino_t,
+// so the large-file variants are the same as the plain functions.
+#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+#define readdir64 readdir
+#define dirent64  dirent
+#endif
+
 #endif

@@ -88,4 +88,14 @@ mode_t umask(mode_t mask);
 }
 #endif
 
+
+// LFS (*64) aliases -- MakaOS is LP64 with 64-bit off_t/ino_t,
+// so the large-file variants are the same as the plain functions.
+#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+#define stat64    stat
+#define fstat64   fstat
+#define lstat64   lstat
+#define fstatat64 fstatat
+#endif
+
 #endif

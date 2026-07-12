@@ -82,4 +82,12 @@ int fcntl(int fd, int cmd, ...);
 }
 #endif
 
+
+// LFS (*64) aliases -- MakaOS is LP64 with 64-bit off_t/ino_t,
+// so the large-file variants are the same as the plain functions.
+#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+#define open64   open
+#define openat64 openat
+#endif
+
 #endif
