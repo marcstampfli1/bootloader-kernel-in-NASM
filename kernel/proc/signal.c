@@ -315,7 +315,7 @@ static int build_rt_frame(int sig, k_sigaction_t* ka,
     // siginfo
     rf->info.si_signo  = sig;
     rf->info.si_errno  = 0;
-    rf->info.si_code   = 0;               // SI_KERNEL-ish; refine per-signal later
+    rf->info.si_code   = g_current->sigstate.fault_si_code;  // fault code, or 0 (SI_USER)
     rf->info.si_pid    = 0;
     rf->info.si_uid    = 0;
     rf->info.si_status = 0;
@@ -487,6 +487,11 @@ static int signal_build_frame(int sig, k_sigaction_t* ka,
 static void signal_setup_frame(int sig, k_sigaction_t* ka, uint64_t saved_rax) {
     syscall_kframe_t* kf = SYSCALL_KFRAME(g_current);
 
+    // This path delivers pending signals (kill/raise/tkill), not synchronous
+    // faults, so the siginfo carries SI_USER (0). (Synchronous faults are
+    // delivered immediately via signal_deliver_fault, which sets a fault code.)
+    g_current->sigstate.fault_si_code = 0;
+
     sig_uctx_t src;
     src.rip = kf->rip; src.rsp = kf->rsp; src.rflags = kf->rflags;
     src.rbp = kf->rbp; src.rbx = kf->rbx;
@@ -530,9 +535,28 @@ int signal_fault_deliverable(struct task_t* t, int sig) {
     return 1;
 }
 
+// POSIX si_code for a signal raised by a synchronous CPU exception. These are
+// the asm-generic values every JVM/libc expects (SEGV_MAPERR=1, FPE_INTDIV=1,
+// ...). A positive/kernel code (never SI_USER=0) is what tells the JVM the fault
+// is a real hardware fault it may recover (implicit null check / safepoint poll)
+// rather than an external kill.
+static int fault_code_for(int sig) {
+    switch (sig) {
+        case SIGSEGV: return 1;   // SEGV_MAPERR (address not mapped)
+        case SIGBUS:  return 2;   // BUS_ADRERR  (nonexistent physical address)
+        case SIGFPE:  return 1;   // FPE_INTDIV  (integer divide by zero)
+        case SIGILL:  return 1;   // ILL_ILLOPC  (illegal opcode)
+        case SIGTRAP: return 1;   // TRAP_BRKPT  (breakpoint)
+        default:      return 0x80;// SI_KERNEL   (sent by the kernel, not a user)
+    }
+}
+
 void signal_deliver_fault(int sig, interrupt_frame_t* f) {
     if (!g_current || sig < 1 || sig >= NSIG) return;
     sigstate_t* ss = &g_current->sigstate;
+    // Tag the siginfo this fault will carry: a real fault code, so the handler
+    // (e.g. the JVM's) sees a genuine hardware fault, not SI_USER.
+    ss->fault_si_code = fault_code_for(sig);
     k_sigaction_t* ka = &g_current->sighand->handlers[sig];
     uint32_t bit = 1u << (uint32_t)(sig - 1);
 

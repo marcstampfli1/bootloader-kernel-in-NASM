@@ -171,6 +171,14 @@ typedef struct {
     uint32_t          blocked;           // bitmap of blocked signals
     uint64_t          sigframe_rsp;      // address of the frame on the user stack
     uint64_t          fault_addr;        // CR2 of the last user #PF -> siginfo.si_addr
+    int               fault_si_code;     // si_code for the next delivered siginfo:
+                                         // a POSIX fault code (SEGV_MAPERR, FPE_INTDIV,
+                                         // ...) for a synchronous CPU exception, or 0
+                                         // (SI_USER) for a kill()/raise()-sourced signal.
+                                         // Set by the delivery path before building the
+                                         // frame. The JVM keys its implicit-exception
+                                         // recovery on this: SI_USER makes it treat every
+                                         // fault as an unrecoverable external kill.
     uint8_t           siginfo_frame;     // 1 = last delivery built an rt_sigframe
                                          // (SA_SIGINFO); sys_sigreturn restores from
                                          // its ucontext instead of the sigframe_t
