@@ -564,16 +564,35 @@ static int vsnprintf_impl(char* buf, size_t size, const char* fmt, va_list ap) {
         }
         if (left_align) zero_pad = 0;  // POSIX: '-' overrides '0'
 
-        // Width
+        // Width -- a '*' takes the width from an int argument (a negative value
+        // means left-justify with the absolute width, per C99). Consuming that
+        // argument is mandatory: skipping it (as the old digit-only parser did
+        // for "%*d"/"%.*s") shifts every following va_arg by one slot -- e.g.
+        // HotSpot's "%.*s%s" then reads the precision int as the next string
+        // pointer and strlen()s it.
         int width = 0;
-        while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+        if (*fmt == '*') {
+            fmt++;
+            int w = va_arg(ap, int);
+            if (w < 0) { left_align = 1; zero_pad = 0; width = -w; }
+            else       { width = w; }
+        } else {
+            while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+        }
 
-        // Precision
+        // Precision -- '.' then digits, or '.*' taking the precision from an int
+        // argument (a negative value means "no precision", i.e. omitted).
         int prec = -1;
         if (*fmt == '.') {
             fmt++;
-            prec = 0;
-            while (*fmt >= '0' && *fmt <= '9') { prec = prec * 10 + (*fmt - '0'); fmt++; }
+            if (*fmt == '*') {
+                fmt++;
+                int p = va_arg(ap, int);
+                prec = (p < 0) ? -1 : p;
+            } else {
+                prec = 0;
+                while (*fmt >= '0' && *fmt <= '9') { prec = prec * 10 + (*fmt - '0'); fmt++; }
+            }
         }
 
         // Length modifier
@@ -917,7 +936,18 @@ int sscanf(const char* str, const char* fmt, ...) {
             while (*fmt >= '0' && *fmt <= '9') fmt++;
 
             int is_long = 0;
-            if (*fmt == 'l') { is_long = 1; fmt++; }
+            if (*fmt == 'l') {
+                is_long = 1; fmt++;
+                // 'll' (long long) -- consume the second 'l'.  On LP64 long and
+                // long long are both 64-bit, so is_long already selects the wide
+                // store/parse; the bug was leaving the 2nd 'l' unconsumed, which
+                // turned "%lld" into is_long + an unknown 'l' + a literal 'd', so
+                // the number never parsed. HotSpot's JLONG_FORMAT is "%lld"
+                // (int64_t == long long here), so every %lld sscanf hit this.
+                if (*fmt == 'l') fmt++;
+            }
+            if (*fmt == 'z' || *fmt == 'j' || *fmt == 't') { is_long = 1; fmt++; }  // size_t/intmax_t/ptrdiff_t
+            else if (*fmt == 'h') { fmt++; if (*fmt == 'h') fmt++; }                // short/char -> int
 
             if (*fmt == '%') {
                 if (*s == '%') { s++; }
@@ -976,6 +1006,17 @@ int sscanf(const char* str, const char* fmt, ...) {
                 if (is_long) *va_arg(ap, unsigned long*)      = (unsigned long)v;
                 else         *va_arg(ap, unsigned int*)        = (unsigned int)v;
                 s = end; count++; fmt++;
+                continue;
+            }
+            if (*fmt == 'n') {
+                // %n: store the count of input chars consumed so far. It does
+                // NOT consume input and does NOT count toward the return value.
+                // Omitting it (as before) left the caller's counter untouched --
+                // HotSpot's "sscanf(s, "%ld%n", ...)" then saw an unchanged -1
+                // and treated a perfectly-parsed default as a parse error.
+                if (is_long) *va_arg(ap, long*) = (long)(s - str);
+                else         *va_arg(ap, int*)  = (int)(s - str);
+                fmt++;
                 continue;
             }
             // Unknown specifier: skip.
@@ -2969,6 +3010,7 @@ int vsscanf(const char* buf, const char* fmt, va_list ap) {
 static int scanf_core(const char** bufp, const char* fmt, va_list ap) {
     int matched = 0;
     const char* b = *bufp;
+    const char* const start = *bufp;
     while (*fmt) {
         if (*fmt == ' ' || *fmt == '\t' || *fmt == '\n') {
             while (*b == ' ' || *b == '\t' || *b == '\n') b++;
@@ -3033,6 +3075,12 @@ static int scanf_core(const char** bufp, const char* fmt, va_list ap) {
             matched++;
             break;
         }
+        case 'n':
+            // Chars consumed so far; not a match, consumes no input.
+            if (llflag)        *va_arg(ap, long long*) = (long long)(b - start);
+            else if (longflag) *va_arg(ap, long*)      = (long)(b - start);
+            else               *va_arg(ap, int*)       = (int)(b - start);
+            break;
         case '%': if (*b++ != '%') return matched; break;
         default: return matched;
         }
