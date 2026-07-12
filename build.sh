@@ -185,7 +185,7 @@ SYSROOT_CFLAGS=(
 # (ports linked via -lc).  libc.h keeps its static-inline copies for
 # in-tree apps that include it directly.
 for src in unistd fcntl sys_stat sys_socket sys_eventfd sys_timerfd \
-           sys_signalfd sys_ioctl sys_time sys_file sys_epoll sys_prctl sys_sysinfo sys_statfs sys_times sys_shm ifaddrs utmpx sched spawn \
+           sys_signalfd sys_ioctl sys_time sys_file sys_epoll sys_prctl sys_sysinfo sys_statfs sys_times sys_shm ifaddrs utmpx sched spawn sys_sendfile sys_inotify sys_xattr \
            time arpa_inet string ctype makaos_input poll select signal resolv \
            getopt wordexp tls; do
   "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
@@ -258,7 +258,7 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_sys_signalfd.o" "$BUILD_DIR/user_sys_ioctl.o" \
    "$BUILD_DIR/user_sys_time.o" "$BUILD_DIR/user_sys_file.o" \
    "$BUILD_DIR/user_sys_epoll.o" \
-   "$BUILD_DIR/user_sys_prctl.o" "$BUILD_DIR/user_sys_sysinfo.o" "$BUILD_DIR/user_sys_statfs.o" "$BUILD_DIR/user_sys_times.o" "$BUILD_DIR/user_sys_shm.o" "$BUILD_DIR/user_ifaddrs.o" "$BUILD_DIR/user_utmpx.o" "$BUILD_DIR/user_sched.o" "$BUILD_DIR/user_spawn.o" \
+   "$BUILD_DIR/user_sys_prctl.o" "$BUILD_DIR/user_sys_sysinfo.o" "$BUILD_DIR/user_sys_statfs.o" "$BUILD_DIR/user_sys_times.o" "$BUILD_DIR/user_sys_shm.o" "$BUILD_DIR/user_ifaddrs.o" "$BUILD_DIR/user_utmpx.o" "$BUILD_DIR/user_sched.o" "$BUILD_DIR/user_spawn.o" "$BUILD_DIR/user_sys_sendfile.o" "$BUILD_DIR/user_sys_inotify.o" "$BUILD_DIR/user_sys_xattr.o" \
    "$BUILD_DIR/user_time.o" "$BUILD_DIR/user_arpa_inet.o" \
    "$BUILD_DIR/user_ctype.o" "$BUILD_DIR/user_makaos_input.o" \
    "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_select.o" "$BUILD_DIR/user_signal.o" \
