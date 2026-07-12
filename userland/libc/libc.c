@@ -1378,6 +1378,23 @@ char* strsep(char** stringp, const char* delim) {
     return start;
 }
 
+// vfork: MakaOS has no suspend-parent vfork; fall back to fork(). Functionally
+// correct (the child gets its own address space); only less efficient than a
+// true vfork for the immediate fork+exec pattern.
+pid_t vfork(void) { return fork(); }
+
+// posix_fallocate: MakaOS has no fallocate syscall, so we grow the file to make
+// the byte range addressable (sparse, not physically preallocated). This
+// satisfies callers that only need the size to exist. Returns an errno value
+// (0 on success), never -1, and never shrinks the file.
+int posix_fallocate(int fd, off_t offset, off_t len) {
+    if (len <= 0 || offset < 0) return EINVAL;
+    off_t need = offset + len;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size >= need) return 0;
+    return ftruncate(fd, need) == 0 ? 0 : errno;
+}
+
 static char* s_strtok_save = NULL;
 char* strtok(char* s, const char* delim) {
     return strtok_r(s, delim, &s_strtok_save);
@@ -1865,6 +1882,7 @@ void endpwent(void) {
 long sysconf(int name) {
     switch (name) {
     case _SC_CLK_TCK:    return 100;
+    case _SC_GETPW_R_SIZE_MAX: return 1024;
     case _SC_OPEN_MAX:   return 1024;
     case _SC_PAGESIZE:   return 4096;
     case _SC_NGROUPS_MAX:return 32;

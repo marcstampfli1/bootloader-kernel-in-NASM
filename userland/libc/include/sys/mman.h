@@ -17,6 +17,7 @@ extern "C" {
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
 #define MAP_ANON      MAP_ANONYMOUS
+#define MAP_NORESERVE 0x4000   // don't reserve swap; overcommit (advisory)
 
 #define MAP_FAILED ((void*)-1)
 

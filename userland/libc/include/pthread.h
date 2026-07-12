@@ -39,6 +39,8 @@ typedef struct {
 #define PTHREAD_CREATE_JOINABLE 0
 #define PTHREAD_CREATE_DETACHED 1
 
+#define PTHREAD_STACK_MIN 16384   // minimum thread stack (bytes)
+
 typedef struct {
     volatile int locked;            // 0 = free, 1 = held
     int          owner;             // owning KERNEL TID (recursive/errorcheck)

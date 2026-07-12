@@ -56,6 +56,7 @@ size_t confstr(int name, char* buf, size_t len);
 #define _SC_PHYS_PAGES        85
 #define _SC_AVPHYS_PAGES      86
 #define _SC_CLK_TCK           2
+#define _SC_GETPW_R_SIZE_MAX  70
 #define _SC_OPEN_MAX          4
 int     ftruncate(int fd, off_t len);
 int     truncate(const char* path, off_t len);
@@ -81,6 +82,7 @@ ssize_t pwrite(int fd, const void* buf, size_t n, off_t off);
 
 // Process
 pid_t  fork(void);
+pid_t  vfork(void);
 pid_t  getpid(void);
 pid_t  getppid(void);
 int    gettid(void);               // calling thread's kernel task id

@@ -20,7 +20,10 @@ int getpriority(int which, int who);
 #define RLIMIT_DATA    2
 #define RLIMIT_STACK   3
 #define RLIMIT_CORE    4
+#define RLIMIT_RSS     5
+#define RLIMIT_NPROC   6
 #define RLIMIT_NOFILE  7
+#define RLIMIT_MEMLOCK 8
 #define RLIMIT_AS      9
 
 #define RLIM_INFINITY ((unsigned long)-1)

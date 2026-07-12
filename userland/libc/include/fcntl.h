@@ -57,6 +57,7 @@ struct flock {
 int open(const char* path, int flags, ...);
 int openat(int dirfd, const char* path, int flags, ...);
 int creat(const char* path, mode_t mode);
+int posix_fallocate(int fd, off_t offset, off_t len);
 int fcntl(int fd, int cmd, ...);
 
 // memfd sealing (Linux values).  The kernel's fcntl returns -EINVAL
