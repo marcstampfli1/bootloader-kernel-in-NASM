@@ -89,6 +89,9 @@ typedef struct dso {
     const char*      strtab;     // DT_STRTAB
     uint64_t         strsz;      // DT_STRSZ -- bounds st_name (fail closed on corrupt .so)
     const uint32_t*  hash;       // DT_HASH (SysV): [nbucket, nchain, bucket[], chain[]]
+    uint32_t         nsyms;      // dynsym entry count -- from DT_HASH nchain, else
+                                 // derived (strtab - symtab)/syment for GNU_HASH-only
+                                 // .so's (prebuilt glibc libs ship no DT_HASH)
     const unsigned long* fini_arr; // DT_FINI_ARRAY (run in reverse on dlclose)
     uint64_t         fini_sz;
     unsigned long long ino;      // (dev,ino) is the dedup key -- robust to path
@@ -192,7 +195,20 @@ static unsigned long elf_hash(const char* s) {
 // Look up `name` in one object's dynsym (SysV hash chain).  Returns the defined
 // symbol (st_shndx != UNDEF) or NULL.
 static const Elf64_Sym* dso_lookup(const dso_t* d, const char* name) {
-    if (!d->hash || !d->symtab || !d->strtab) return NULL;
+    if (!d->symtab || !d->strtab) return NULL;
+    // GNU_HASH-only object (no DT_HASH): linear scan the dynsym. Prebuilt glibc
+    // libraries (LWJGL's liblwjgl.so, and many others) ship only .gnu.hash, which
+    // this loader does not index; a linear scan over d->nsyms is correct (just
+    // slower) and keeps such libraries loadable.
+    if (!d->hash) {
+        for (uint32_t i = 0; i < d->nsyms; i++) {
+            const Elf64_Sym* s = &d->symtab[i];
+            if (s->st_shndx != SHN_UNDEF && s->st_name < d->strsz
+                && strcmp(name, d->strtab + s->st_name) == 0)
+                return s;
+        }
+        return NULL;
+    }
     uint32_t nbucket = d->hash[0];
     uint32_t nchain  = d->hash[1];          // == symtab entry count; bounds every index
     if (!nbucket || !nchain) return NULL;
@@ -338,7 +354,7 @@ static int apply_rela(dso_t* d, const Elf64_Rela* rela, uint64_t sz) {
                 set_err("dlopen: initial-exec TLS (TPOFF64) in a .so unsupported", 0); return -1;
             }
             uint32_t tsym = ELF64_R_SYM(r->r_info);
-            const Elf64_Sym* ts = (tsym && d->hash && tsym < d->hash[1]) ? &d->symtab[tsym] : (const Elf64_Sym*)0;
+            const Elf64_Sym* ts = (tsym && tsym < d->nsyms) ? &d->symtab[tsym] : (const Elf64_Sym*)0;
             unsigned long mod, off;
             if (ts && ts->st_shndx == SHN_UNDEF) {
                 // Cross-module __thread import (e.g. libc's errno): the var lives
@@ -363,7 +379,7 @@ static int apply_rela(dso_t* d, const Elf64_Rela* rela, uint64_t sz) {
 
         // Bound the symbol index + name against the .so's tables (OOB guard).
         uint32_t symi = ELF64_R_SYM(r->r_info);
-        if (!d->hash || symi >= d->hash[1]) { set_err("dlopen: bad reloc symbol index", 0); return -1; }
+        if (!d->nsyms || symi >= d->nsyms) { set_err("dlopen: bad reloc symbol index", 0); return -1; }
         const Elf64_Sym* s = &d->symtab[symi];
         if (s->st_name >= d->strsz) { set_err("dlopen: bad reloc symbol name", 0); return -1; }
         const char* name = d->strtab + s->st_name;
@@ -508,8 +524,10 @@ static void* dlopen_impl(const char* path, int flags) {
     uint64_t soname_off = 0;
     for (const Elf64_Dyn* e = dyn; e->d_tag != DT_NULL; e++) {
         switch (e->d_tag) {
-            case DT_NEEDED:       if (n_needed < MAX_NEEDED) needed[n_needed++] = e->d_un;
-                                  else needed_overflow = 1; break;
+            case DT_NEEDED:
+                if (n_needed < MAX_NEEDED) needed[n_needed++] = e->d_un;
+                else needed_overflow = 1;
+                break;
             case DT_SONAME:       soname_off = e->d_un; break;
             case DT_SYMTAB:       d->symtab = (const Elf64_Sym*)(base + e->d_un); break;
             case DT_STRTAB:       d->strtab = (const char*)(base + e->d_un); break;
@@ -534,6 +552,16 @@ static void* dlopen_impl(const char* path, int flags) {
     // /jdk/lib/server, but its dependents just NEED "libjvm.so").
     d->soname = (soname_off && d->strtab && soname_off < d->strsz) ? (d->strtab + soname_off) : NULL;
 
+    // Symbol count. From DT_HASH's nchain when present; otherwise (GNU_HASH-only,
+    // e.g. prebuilt glibc .so's) derive it from the dynsym/dynstr layout -- the
+    // linker lays .dynstr immediately after the contiguous .dynsym, so
+    // (strtab - symtab)/syment is the entry count.
+    if (d->hash)
+        d->nsyms = d->hash[1];
+    else if (d->symtab && d->strtab && (unsigned long)d->strtab > (unsigned long)d->symtab)
+        d->nsyms = (uint32_t)(((unsigned long)d->strtab - (unsigned long)d->symtab)
+                              / sizeof(Elf64_Sym));
+
     // Publish BEFORE loading dependencies + relocating so the object's own
     // symbols are visible to its deps' relocations, and a circular DT_NEEDED
     // chain dedups against the already-published object instead of recursing.
@@ -544,6 +572,24 @@ static void* dlopen_impl(const char* path, int flags) {
     for (int i = 0; i < n_needed; i++) {
         if (!d->strtab || needed[i] >= d->strsz) continue;
         const char* nm = d->strtab + needed[i];
+        // glibc core sonames (libc.so.6, libpthread.so.0, libdl.so.2, libm.so.6,
+        // librt.so.1, ld-linux-x86-64.so.2) are provided by the process's own
+        // statically-linked libc -- there is no such .so file on MakaOS. A
+        // prebuilt glibc library (LWJGL's liblwjgl.so, etc.) NEEDs them; treat
+        // them as already satisfied so those libraries load. Match "libX.so"
+        // prefix so the version suffix does not matter.
+        {
+            static const char* const glibc_core[] = {
+                "libc.so", "libpthread.so", "libdl.so", "libm.so",
+                "librt.so", "ld-linux", "libresolv.so", "libutil.so", 0 };
+            int is_glibc = 0;
+            for (int g = 0; glibc_core[g]; g++) {
+                const char* a = glibc_core[g]; const char* b = nm;
+                while (*a && *a == *b) { a++; b++; }
+                if (*a == 0) { is_glibc = 1; break; }
+            }
+            if (is_glibc) continue;
+        }
         // Already satisfied by an object loaded earlier (matched by SONAME)?
         // ld.so semantics: a NEEDED that is already present is not reloaded --
         // and critically, is NOT sought again by path (so a dep loaded from
@@ -673,7 +719,7 @@ int dladdr(const void* addr, Dl_info* info) {
         // whose nchain bounds the symbol table -- present since we build .so's
         // with --hash-style=both).
         if (d->symtab && d->hash && d->strtab) {
-            uint32_t nsym = d->hash[1];
+            uint32_t nsym = d->nsyms;
             const Elf64_Sym* best = 0; unsigned long best_val = 0;
             for (uint32_t i = 0; i < nsym; i++) {
                 const Elf64_Sym* s = &d->symtab[i];

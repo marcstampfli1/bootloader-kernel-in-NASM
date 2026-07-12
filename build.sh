@@ -191,7 +191,7 @@ SYSROOT_CFLAGS=(
 # (ports linked via -lc).  libc.h keeps its static-inline copies for
 # in-tree apps that include it directly.
 for src in unistd fcntl sys_stat sys_socket sys_eventfd sys_timerfd \
-           sys_signalfd sys_ioctl sys_time sys_file sys_epoll sys_prctl sys_sysinfo sys_statfs sys_times sys_shm ifaddrs utmpx sched spawn sys_sendfile sys_inotify sys_xattr ssp jdk_compat \
+           sys_signalfd sys_ioctl sys_time sys_file sys_epoll sys_prctl sys_sysinfo sys_statfs sys_times sys_shm ifaddrs utmpx sched spawn sys_sendfile sys_inotify sys_xattr ssp jdk_compat glibc_compat \
            time arpa_inet string ctype makaos_input poll select signal resolv \
            getopt wordexp tls; do
   "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
@@ -264,7 +264,7 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_sys_signalfd.o" "$BUILD_DIR/user_sys_ioctl.o" \
    "$BUILD_DIR/user_sys_time.o" "$BUILD_DIR/user_sys_file.o" \
    "$BUILD_DIR/user_sys_epoll.o" \
-   "$BUILD_DIR/user_sys_prctl.o" "$BUILD_DIR/user_sys_sysinfo.o" "$BUILD_DIR/user_sys_statfs.o" "$BUILD_DIR/user_sys_times.o" "$BUILD_DIR/user_sys_shm.o" "$BUILD_DIR/user_ifaddrs.o" "$BUILD_DIR/user_utmpx.o" "$BUILD_DIR/user_sched.o" "$BUILD_DIR/user_spawn.o" "$BUILD_DIR/user_sys_sendfile.o" "$BUILD_DIR/user_sys_inotify.o" "$BUILD_DIR/user_sys_xattr.o" "$BUILD_DIR/user_ssp.o" "$BUILD_DIR/user_jdk_compat.o" \
+   "$BUILD_DIR/user_sys_prctl.o" "$BUILD_DIR/user_sys_sysinfo.o" "$BUILD_DIR/user_sys_statfs.o" "$BUILD_DIR/user_sys_times.o" "$BUILD_DIR/user_sys_shm.o" "$BUILD_DIR/user_ifaddrs.o" "$BUILD_DIR/user_utmpx.o" "$BUILD_DIR/user_sched.o" "$BUILD_DIR/user_spawn.o" "$BUILD_DIR/user_sys_sendfile.o" "$BUILD_DIR/user_sys_inotify.o" "$BUILD_DIR/user_sys_xattr.o" "$BUILD_DIR/user_ssp.o" "$BUILD_DIR/user_jdk_compat.o" "$BUILD_DIR/user_glibc_compat.o" \
    "$BUILD_DIR/user_time.o" "$BUILD_DIR/user_arpa_inet.o" \
    "$BUILD_DIR/user_ctype.o" "$BUILD_DIR/user_makaos_input.o" \
    "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_select.o" "$BUILD_DIR/user_signal.o" \
@@ -446,6 +446,31 @@ if [ -f "$GL_L/libglfw3.a" ] && [ -f "$GL_L/libEGL.a" ] && [ -f "$GL_L/dri/virti
         "$GL_L/libz.a" -lm -lpthread \
         -o "$BUILD_DIR/user_glfwtest.elf"
     echo "[build] glfwtest linked (PIE+export-dynamic) against GLFW-Wayland + Mesa GL"
+
+    # libglfw.so -- a self-contained MakaOS shared lib for LWJGL (Minecraft) to
+    # dlopen from the JVM. Whole-archives GLFW + the wayland/EGL/GLES/xkb symbols
+    # (exported in its own dynsym so GLFW's dlsym(RTLD_DEFAULT,...) fallback finds
+    # them) + Mesa/virgl; only libc stays undefined (resolved at load against the
+    # java process). --hash-style=both so MakaOS's loader reads DT_HASH.
+    # GLX proc-loader shim (glXGetProcAddress -> Mesa eglGetProcAddress) so LWJGL
+    # can resolve the full desktop-GL entry-point set from this same Mesa state.
+    "$USER_CC" --sysroot="$SYSROOT" -m64 -mno-red-zone -fPIC -O2 \
+        -c "$USERLAND_DIR/gl/gl_glx_shim.c" -o "$BUILD_DIR/gl_glx_shim.o"
+    "$USER_CXX" --sysroot="$SYSROOT" -m64 -mno-red-zone -shared -fPIC \
+        -Wl,--hash-style=both -Wl,-soname,libglfw.so -Wl,--allow-multiple-definition \
+        "$BUILD_DIR/gl_glx_shim.o" \
+        -Wl,--whole-archive \
+            "$GL_L/libglfw3.a" \
+            "$GL_L/libwayland-client.a" "$GL_L/libwayland-cursor.a" "$GL_L/libwayland-egl.a" \
+            "$GL_L/libxkbcommon.a" "$GL_L/libEGL.a" "$GL_L/libGLESv2.a" \
+        -Wl,--no-whole-archive \
+        -Wl,--start-group \
+            "$GL_L/dri/virtio_gpu_dri.so" "$GL_L/libgbm.a" "$GL_L/libglapi.a" \
+            "$GL_L/libdrm.a" "$GL_L/libexpat.a" "$GL_L/libffi.a" "$GL_L/libwayland-server.a" \
+            "$GL_L/libz.a" \
+        -Wl,--end-group \
+        -o "$BUILD_DIR/libglfw.so"
+    echo "[build] libglfw.so (self-contained Wayland GLFW for LWJGL) built"
 fi
 
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
@@ -934,7 +959,7 @@ EXT2_LBA=4096
 EXT2_SECTORS=1048576  # 512 MiB — DE stack (sway+swaybar+swaybg+tofi) + xkb tree + the 83 MB libSDL3.so
 # JDKTEST stages the ~55 MB exploded OpenJDK java.base image (6437 class files +
 # libjvm.so); grow the rootfs to 1 GiB so it fits with headroom.
-if [ "${JDKTEST:-0}" = "1" ]; then EXT2_SECTORS=2097152; fi  # 1 GiB
+if [ "${JDKTEST:-0}" = "1" ] || [ "${LWJGLTEST:-0}" = "1" ]; then EXT2_SECTORS=2097152; fi  # 1 GiB
 ESP_START=2048
 ESP_END=4095
 
@@ -1145,7 +1170,7 @@ fi
 # OpenJDK Zero java.base (JDKTEST=1): stage the exploded runtime image at /jdk so
 # `/jdk/bin/java -version` runs at boot.  Only bin/java + lib/ + the java.base
 # exploded classes are staged (not the full images/ tree with every module).
-if [ "${JDKTEST:-0}" = "1" ]; then
+if [ "${JDKTEST:-0}" = "1" ] || [ "${LWJGLTEST:-0}" = "1" ]; then
     JDK_IMG="build/third_party/openjdk17u/build/linux-x86_64-zero-release/jdk"
     if [ -x "$JDK_IMG/bin/java" ]; then
         debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk"         > /dev/null 2>&1 || true
@@ -1153,7 +1178,12 @@ if [ "${JDKTEST:-0}" = "1" ]; then
         debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk/modules" > /dev/null 2>&1 || true
         ext2_install_bin "$BUILD_DIR/ext2.img" "$JDK_IMG/bin/java" jdk/bin/java
         ext2_install_tree "$BUILD_DIR/ext2.img" "$JDK_IMG/lib"                jdk/lib
-        ext2_install_tree "$BUILD_DIR/ext2.img" "$JDK_IMG/modules/java.base"  jdk/modules/java.base
+        # Stage every built exploded module (java.base, jdk.unsupported for
+        # sun.misc.Unsafe which LWJGL/Minecraft need, and any others built).
+        for moddir in "$JDK_IMG/modules"/*/; do
+            [ -d "$moddir" ] || continue
+            ext2_install_tree "$BUILD_DIR/ext2.img" "$moddir" "jdk/modules/$(basename "$moddir")"
+        done
         [ -f "$JDK_IMG/release" ] && debugfs -w "$BUILD_DIR/ext2.img" -R "write $JDK_IMG/release /jdk/release" > /dev/null 2>&1 || true
         # Hello.class -- the `java Hello` demo (allocates a multi-hundred-MB heap
         # to exercise the high-RAM support). Compiled from the tracked source by
@@ -1170,6 +1200,22 @@ if [ "${JDKTEST:-0}" = "1" ]; then
     else
         echo "[build] JDKTEST=1 but $JDK_IMG/bin/java missing -- run 'make java.base' first"
     fi
+fi
+# LWJGLTEST=1: stage /lwjgl (LWJGL jars + prebuilt core/opengl natives + our
+# Wayland libglfw.so + HelloWindow.class) and autostart the JVM under sway so
+# LWJGL opens a GLFW window on MakaOS. Needs /jdk (staged above) + AUTOLOGIN sway.
+if [ "${LWJGLTEST:-0}" = "1" ] && [ -d "$BUILD_DIR/lwjgl" ] && [ -f "$BUILD_DIR/libglfw.so" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /lwjgl" > /dev/null 2>&1 || true
+    for f in lwjgl-3.3.3.jar lwjgl-glfw-3.3.3.jar lwjgl-opengl-3.3.3.jar HelloWindow.class; do
+        [ -f "$BUILD_DIR/lwjgl/$f" ] && debugfs -w "$BUILD_DIR/ext2.img" -R \
+            "write $BUILD_DIR/lwjgl/$f /lwjgl/$(basename "$f")" > /dev/null 2>&1 || true
+    done
+    # The .so's must be +x: MakaOS requires a file be executable to mmap it PROT_EXEC.
+    # ext2_install_bin stages with 0100755.
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/lwjgl/natives/liblwjgl.so"        lwjgl/liblwjgl.so
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/lwjgl/natives/liblwjgl_opengl.so" lwjgl/liblwjgl_opengl.so
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libglfw.so"                       lwjgl/libglfw.so
+    echo "[build] LWJGL staged at /lwjgl (jars + core natives + our libglfw.so + HelloWindow.class)"
 fi
 if [ -f "$BUILD_DIR/user_virgltest.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_virgltest.elf" bin/virgltest
@@ -1409,6 +1455,20 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     if [ -f "$BUILD_DIR/user_glfwtest.elf" ]; then
         printf 'bindsym Mod1+g exec /bin/glfwtest\n' >> "$BUILD_DIR/etc_stage/sway_config"
         [ "${GLFWTEST:-0}" = "1" ] && printf 'exec /bin/glfwtest\n' >> "$BUILD_DIR/etc_stage/sway_config"
+    fi
+    # LWJGL window test: autostart the JVM under sway (needs WAYLAND_DISPLAY) so
+    # LWJGL -> our libglfw.so -> Mesa/virgl opens a window. -Dorg.lwjgl.glfw.libname
+    # points LWJGL at our Wayland GLFW instead of its bundled X11 one.
+    if [ "${LWJGLTEST:-0}" = "1" ]; then
+        LWJGL_CP="/lwjgl/lwjgl-3.3.3.jar:/lwjgl/lwjgl-glfw-3.3.3.jar:/lwjgl/lwjgl-opengl-3.3.3.jar:/lwjgl"
+        # -Dos.name=Linux: LWJGL's Platform.get() only knows Linux/Windows/macOS;
+        # our JVM reports os.name=MakaOS, so present as Linux (we ARE linux-ABI).
+        # -Dorg.lwjgl.opengl.libname=/lwjgl/libglfw.so: LWJGL resolves desktop-GL
+        # entry points from the SAME .so GLFW made the context current in (one
+        # Mesa/glapi instance); its glXGetProcAddress shim forwards to Mesa's
+        # eglGetProcAddress, which knows the full GL 4.x set.
+        printf 'exec /jdk/bin/java -Dos.name=Linux -Dorg.lwjgl.librarypath=/lwjgl -Dorg.lwjgl.glfw.libname=/lwjgl/libglfw.so -Dorg.lwjgl.opengl.libname=/lwjgl/libglfw.so -cp %s HelloWindow\n' \
+            "$LWJGL_CP" >> "$BUILD_DIR/etc_stage/sway_config"
     fi
     if [ -f "$BUILD_DIR/quake-id1/pak0.pak" ]; then
         printf 'exec /bin/dplaunch\n' >> "$BUILD_DIR/etc_stage/sway_config"

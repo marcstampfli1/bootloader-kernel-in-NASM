@@ -658,3 +658,30 @@ The original debt writeup, for history:
   32-63 like standard signals (every `1u << (sig-1)` becomes `1ull << ...`).
 - **Blocking order**: independent; touches the signal-delivery core, so pair with
   a sigtest extension that exercises a signal >= 32.
+
+## 19. Mesa/GL is whole-archived per-consumer instead of shared .so's
+
+- **What**: `libglfw.so` (the LWJGL/Minecraft window+GL library) whole-archives
+  the entire Mesa stack (libEGL/libGLESv2/libglapi/libgbm + the virgl DRI
+  megadriver) into one self-contained shared object. Every future GL consumer
+  that needs its own dlopen-able GL would re-embed the same ~15 MB of Mesa.
+- **Where**: `build.sh` (the `libglfw.so` link), `scripts/port-mesa.sh`
+  (`-Ddefault_library=static`, `-Dglx=disabled`, `-Dglvnd=false`).
+- **Why it is this way (not just laziness)**: two real constraints.
+  (a) *Single-instance correctness*: GLFW makes the GL context current in one
+  `libglapi` state; LWJGL's GL calls must dispatch through that SAME state or every
+  `gl*` hits a NULL context. One self-contained .so trivially guarantees one
+  instance. (b) *Duplicate globals*: Mesa's EGL frontend and the DRI megadriver
+  each define the same global (e.g. `dri2_lookup_egl_image_validated`), resolved
+  today by `-Wl,--allow-multiple-definition` at static-link time. Split into
+  separate .so's, those become genuine cross-.so ODR conflicts the loader could
+  bind to the wrong copy.
+- **Scale failure**: N GL apps -> N embedded Mesa copies on disk and N rebuilds;
+  no shared GL upgrade path.
+- **Target**: build Mesa as real shared objects (`libEGL.so`, `libglapi.so`,
+  `libgbm.so`, the DRI driver), deduped by SONAME by our loader (already done for
+  the JVM), so GLFW and every GL consumer share ONE Mesa instance the clean way.
+  First untangle the duplicate-global symbols (give the megadriver its own copies
+  or hidden visibility) so `--allow-multiple-definition` is no longer needed.
+- **Blocking order**: independent of the Minecraft bring-up (inside one process
+  the single self-contained .so is correct); do it before a second GL app ships.
