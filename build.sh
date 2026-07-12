@@ -418,6 +418,29 @@ if [ -f "$GL_L/libEGL.a" ] && [ -f "$GL_L/dri/virtio_gpu_dri.so" ]; then
     echo "[build] gltest linked against the static Mesa GL stack"
 fi
 
+# glfwtest -- GLFW-Wayland smoke test (the windowing path Minecraft's LWJGL needs).
+# Links the ported GLFW static lib on top of the same Mesa GL stack as gltest,
+# plus the Wayland client libs GLFW's backend uses (cursor + egl-window + xkb).
+# Built only if GLFW is ported (scripts/port-glfw.sh) and the Mesa libs exist.
+if [ -f "$GL_L/libglfw3.a" ] && [ -f "$GL_L/libEGL.a" ] && [ -f "$GL_L/dri/virtio_gpu_dri.so" ]; then
+    "$USER_CC" -ffreestanding -m64 -mno-red-zone -fno-pie -fno-pic -fno-plt \
+        -fno-stack-protector -fno-builtin -O0 -Wall -isystem "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/glfwtest/glfwtest.c" -o "$BUILD_DIR/user_glfwtest.o"
+    "$USER_CXX" --sysroot="$SYSROOT" -m64 -mno-red-zone -no-pie -s \
+        "$BUILD_DIR/user_glfwtest.o" \
+        -Wl,--gc-sections -Wl,--allow-multiple-definition -Wl,--start-group \
+        "$GL_L/libglfw3.a" \
+        "$GL_L/dri/virtio_gpu_dri.so" \
+        "$GL_L/libEGL.a" "$GL_L/libGLESv2.a" "$GL_L/libgbm.a" "$GL_L/libglapi.a" \
+        "$GL_L/libdrm.a" "$GL_L/libexpat.a" \
+        "$GL_L/libwayland-client.a" "$GL_L/libwayland-cursor.a" "$GL_L/libwayland-egl.a" \
+        "$GL_L/libxkbcommon.a" "$GL_L/libffi.a" \
+        -Wl,--end-group \
+        "$GL_L/libz.a" -lm -lpthread \
+        -o "$BUILD_DIR/user_glfwtest.elf"
+    echo "[build] glfwtest linked against GLFW-Wayland + the static Mesa GL stack"
+fi
+
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
 ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
    -o "$BUILD_DIR/user_helloraw.elf"
@@ -1149,6 +1172,10 @@ if [ -f "$BUILD_DIR/user_gltest.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_gltest.elf" bin/gltest
     echo "[+] gltest ELF installed at bin/gltest (static Mesa GL stack)"
 fi
+if [ -f "$BUILD_DIR/user_glfwtest.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_glfwtest.elf" bin/glfwtest
+    echo "[+] glfwtest ELF installed at bin/glfwtest (GLFW-Wayland smoke test)"
+fi
 if [ -f "$BUILD_DIR/user_helloraw.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_helloraw.elf" bin/helloraw
 fi
@@ -1370,6 +1397,12 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # Launch DarkPlaces (Quake) with Mod1+d; auto-launch it on startup when the
     # Quake data is present so the desktop boots straight into the game.
     printf 'bindsym Mod1+d exec /bin/dplaunch\n' >> "$BUILD_DIR/etc_stage/sway_config"
+    # GLFW-Wayland smoke test: Mod1+g launches it; GLFWTEST=1 also autostarts it
+    # so a headless run-gl.sh boot proves the window/GL-context path unattended.
+    if [ -f "$BUILD_DIR/user_glfwtest.elf" ]; then
+        printf 'bindsym Mod1+g exec /bin/glfwtest\n' >> "$BUILD_DIR/etc_stage/sway_config"
+        [ "${GLFWTEST:-0}" = "1" ] && printf 'exec /bin/glfwtest\n' >> "$BUILD_DIR/etc_stage/sway_config"
+    fi
     if [ -f "$BUILD_DIR/quake-id1/pak0.pak" ]; then
         printf 'exec /bin/dplaunch\n' >> "$BUILD_DIR/etc_stage/sway_config"
     fi
