@@ -58,6 +58,7 @@ typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;
 #define DT_RELA 7
 #define DT_RELASZ 8
 #define DT_STRSZ 10
+#define DT_SONAME 14
 #define ELF_ST_BIND(i) ((i) >> 4)
 #define STB_WEAK 2
 #define DT_INIT_ARRAY 25
@@ -95,6 +96,10 @@ typedef struct dso {
     int              refcnt;
     int              closing;    // guard: a dtor that dlclose()s its own handle
     int              tls_modid;  // dynamic-TLS module id (0 = no PT_TLS)
+    char             path[192];  // resolved load path, for dladdr's dli_fname
+    const char*      soname;     // DT_SONAME (into strtab); satisfies a NEEDED
+                                 // already loaded from a non-/lib path (e.g. the
+                                 // JDK's libjvm.so under /jdk/lib/server)
 } dso_t;
 
 // ── Dynamic TLS (general-dynamic model) ────────────────────────────────────
@@ -476,6 +481,9 @@ static void* dlopen_impl(const char* path, int flags) {
     memset(d, 0, sizeof *d);
     d->base = base; d->map_start = (unsigned long)res; d->map_len = span; d->refcnt = 1;
     d->ino = st.st_ino; d->dev = st.st_dev;   // dedup key
+    // Retain the load path so dladdr can report dli_fname (OpenJDK's os::jvm_path
+    // maps a libjvm.so code address back to its .so path to derive JAVA_HOME).
+    { size_t pl = 0; while (path[pl] && pl < sizeof(d->path) - 1) { d->path[pl] = path[pl]; pl++; } d->path[pl] = '\0'; }
 
     // Register the .so's TLS block as a dynamic-TLS module (id in DTPMOD64
     // relocs).  s_tls_mod is written under s_lock, which dlopen_impl holds.
@@ -497,10 +505,12 @@ static void* dlopen_impl(const char* path, int flags) {
     const Elf64_Rela* jmprel = NULL; uint64_t jmprel_sz = 0;
     const unsigned long* init_arr = NULL; uint64_t init_sz = 0;
     uint64_t needed[MAX_NEEDED]; int n_needed = 0, needed_overflow = 0;
+    uint64_t soname_off = 0;
     for (const Elf64_Dyn* e = dyn; e->d_tag != DT_NULL; e++) {
         switch (e->d_tag) {
             case DT_NEEDED:       if (n_needed < MAX_NEEDED) needed[n_needed++] = e->d_un;
                                   else needed_overflow = 1; break;
+            case DT_SONAME:       soname_off = e->d_un; break;
             case DT_SYMTAB:       d->symtab = (const Elf64_Sym*)(base + e->d_un); break;
             case DT_STRTAB:       d->strtab = (const char*)(base + e->d_un); break;
             case DT_STRSZ:        d->strsz  = e->d_un; break;
@@ -519,6 +529,10 @@ static void* dlopen_impl(const char* path, int flags) {
         set_err("dlopen: too many DT_NEEDED", path);
         munmap(res, span); free(d); return NULL;
     }
+    // Resolve our own SONAME so later NEEDED lookups can match us by name even
+    // when we were loaded from a non-standard path (the JDK's libjvm.so lives at
+    // /jdk/lib/server, but its dependents just NEED "libjvm.so").
+    d->soname = (soname_off && d->strtab && soname_off < d->strsz) ? (d->strtab + soname_off) : NULL;
 
     // Publish BEFORE loading dependencies + relocating so the object's own
     // symbols are visible to its deps' relocations, and a circular DT_NEEDED
@@ -529,7 +543,38 @@ static void* dlopen_impl(const char* path, int flags) {
     // object's relocations below can bind against them.
     for (int i = 0; i < n_needed; i++) {
         if (!d->strtab || needed[i] >= d->strsz) continue;
-        char dp[128]; dep_path(d->strtab + needed[i], dp, sizeof dp);
+        const char* nm = d->strtab + needed[i];
+        // Already satisfied by an object loaded earlier (matched by SONAME)?
+        // ld.so semantics: a NEEDED that is already present is not reloaded --
+        // and critically, is NOT sought again by path (so a dep loaded from
+        // /jdk/lib/server by absolute path still satisfies a bare-soname NEEDED).
+        int already = 0;
+        for (dso_t* q = s_loaded; q; q = q->next) {
+            if (q == d || !q->soname) continue;
+            const char* a = q->soname; const char* b = nm;
+            while (*a && *a == *b) { a++; b++; }
+            if (*a == *b) { already = 1; break; }
+        }
+        if (already) continue;
+        // Resolve the NEEDED path. First try the loading object's OWN directory
+        // ($ORIGIN / DT_RPATH semantics): the JDK ships libnio.so NEEDing
+        // libnet.so with both in /jdk/lib, but a bare soname otherwise resolves
+        // only to /lib. Fall back to dep_path (/lib/<soname>) if not found there.
+        char dp[192];
+        int resolved = 0;
+        {
+            int slash = -1;
+            for (int k = 0; d->path[k]; k++) if (d->path[k] == '/') slash = k;
+            if (slash >= 0) {
+                int j = 0;
+                for (int k = 0; k <= slash && j < (int)sizeof(dp) - 1; k++) dp[j++] = d->path[k];
+                for (int k = 0; nm[k] && j < (int)sizeof(dp) - 1; k++) dp[j++] = nm[k];
+                dp[j] = '\0';
+                struct stat st2;
+                if (stat(dp, &st2) == 0) resolved = 1;
+            }
+        }
+        if (!resolved) dep_path(nm, dp, sizeof dp);
         if (!dlopen_impl(dp, flags)) {   // already under s_lock
             set_err("dlopen: dependency failed", dp);
             unpublish(d); munmap(res, span); free(d); return NULL;
@@ -561,10 +606,18 @@ void* dlopen(const char* path, int flags) {
 
 void* dlsym(void* handle, const char* name) {
     s_err_set = 0;
-    if (!handle || !name) { set_err("dlsym: bad argument", 0); return NULL; }
+    if (!name) { set_err("dlsym: bad argument", 0); return NULL; }
     dl_lock();
     void* r = NULL;
-    if (handle == &s_global) {              // dlopen(NULL): search the global scope
+    // RTLD_DEFAULT ((void*)0) and RTLD_NEXT ((void*)-1) request the global scope
+    // (main exe + every loaded object) rather than one object's table. resolve_sym
+    // already walks s_loaded then s_exe, which is exactly the default scope; a
+    // precise RTLD_NEXT (skip up to the caller's object) is approximated by it,
+    // since no in-tree consumer relies on the skip. This is essential for OpenJDK,
+    // which resolves sched_getcpu/sigaction/JVM_* via dlsym(RTLD_DEFAULT, ...) --
+    // a NULL return there sends HotSpot down its vsyscall-getcpu fallback, which
+    // faults (MakaOS maps no vsyscall page).
+    if (handle == RTLD_DEFAULT || handle == RTLD_NEXT || handle == &s_global) {
         unsigned long v = resolve_sym(name);
         if (v) r = (void*)v;
     } else {
@@ -600,9 +653,40 @@ char* dlerror(void) {
     return s_err;
 }
 
+// dladdr: map a runtime address to the loaded object containing it, reporting
+// the object's path (dli_fname), load base (dli_fbase), and the nearest
+// preceding exported symbol (dli_sname/dli_saddr). Walks the dlopen object list
+// only -- addresses in the main executable are not resolved (no consumer needs
+// that yet; OpenJDK's os::jvm_path queries a libjvm.so address, which is a
+// dlopen'd object). Returns nonzero on success, 0 if the address is unknown
+// (glibc convention -- inverted from the usual 0-is-success).
 int dladdr(const void* addr, Dl_info* info) {
-    (void)addr;
-    if (info) { info->dli_fname = 0; info->dli_fbase = 0; info->dli_sname = 0; info->dli_saddr = 0; }
+    if (!info) return 0;
+    info->dli_fname = 0; info->dli_fbase = 0; info->dli_sname = 0; info->dli_saddr = 0;
+    unsigned long a = (unsigned long)addr;
+    dl_lock();
+    for (dso_t* d = s_loaded; d; d = d->next) {
+        if (a < d->map_start || a >= d->map_start + d->map_len) continue;
+        info->dli_fname = d->path;
+        info->dli_fbase = (void*)d->base;
+        // Nearest defined symbol at or below `a` (best-effort; needs DT_HASH,
+        // whose nchain bounds the symbol table -- present since we build .so's
+        // with --hash-style=both).
+        if (d->symtab && d->hash && d->strtab) {
+            uint32_t nsym = d->hash[1];
+            const Elf64_Sym* best = 0; unsigned long best_val = 0;
+            for (uint32_t i = 0; i < nsym; i++) {
+                const Elf64_Sym* s = &d->symtab[i];
+                if (s->st_shndx == 0 || s->st_name >= d->strsz) continue;  // undefined / corrupt
+                unsigned long v = d->base + s->st_value;
+                if (v <= a && v >= best_val) { best = s; best_val = v; }
+            }
+            if (best) { info->dli_sname = d->strtab + best->st_name; info->dli_saddr = (void*)best_val; }
+        }
+        dl_unlock();
+        return 1;
+    }
+    dl_unlock();
     return 0;
 }
 
