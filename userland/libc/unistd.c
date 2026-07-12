@@ -101,6 +101,8 @@ uid_t getuid(void)   { return (uid_t)syscall0(SYS_GETUID); }
 uid_t geteuid(void)  { return (uid_t)syscall0(SYS_GETEUID); }
 gid_t getgid(void)   { return (gid_t)syscall0(SYS_GETGID); }
 gid_t getegid(void)  { return (gid_t)syscall0(SYS_GETEGID); }
+int   setuid(uid_t uid) { return (int)__syscall_ret(syscall1(SYS_SETUID, (uint64_t)uid)); }
+int   setgid(gid_t gid) { return (int)__syscall_ret(syscall1(SYS_SETGID, (uint64_t)gid)); }
 
 // ── File ownership ──────────────────────────────────────────────────
 int chown(const char* path, uid_t uid, gid_t gid) {
