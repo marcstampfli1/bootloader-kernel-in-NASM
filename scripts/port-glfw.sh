@@ -72,6 +72,37 @@ print("[port-glfw] patched posix_module.c (RTLD_DEFAULT static fallback)")
 PY
 fi
 
+# MakaOS has no cursor theme installed, and GLFW's Wayland init treats a missing
+# theme as fatal + later derefs the (NULL) theme when the pointer enters. Make the
+# theme non-fatal and guard the NULL-theme derefs -- a game draws its own cursor.
+WW="$SRC_DIR/src/wl_window.c"; WI="$SRC_DIR/src/wl_init.c"
+if ! grep -q "MakaOS: no cursor theme" "$WW"; then
+    python3 - "$WI" "$WW" <<'PY'
+import sys
+wi, ww = sys.argv[1], sys.argv[2]
+s=open(wi).read()
+s=s.replace(
+'    if (!_glfw.wl.cursorTheme)\n    {\n        _glfwInputError(GLFW_PLATFORM_ERROR,\n                        "Wayland: Failed to load default cursor theme");\n        return GLFW_FALSE;\n    }',
+'    if (!_glfw.wl.cursorTheme)\n    {\n        _glfwInputError(GLFW_PLATFORM_ERROR,\n                        "Wayland: no cursor theme found, continuing without one");\n    }')
+open(wi,'w').write(s)
+s=open(ww).read()
+# _glfwSetCursorWayland default-cursor path
+s=s.replace(
+'        if (cursor)\n            setCursorImage(window, &cursor->wl);\n        else\n        {\n            struct wl_cursor* defaultCursor =',
+'        if (cursor)\n            setCursorImage(window, &cursor->wl);\n        else if (!_glfw.wl.cursorTheme)\n        {\n            /* MakaOS: no cursor theme -> leave the compositor default cursor. */\n        }\n        else\n        {\n            struct wl_cursor* defaultCursor =')
+# pointerHandleMotion themed path
+s=s.replace(
+'            struct wl_cursor* cursor = wl_cursor_theme_get_cursor(theme, cursorName);\n            if (!cursor)\n                return;',
+'            if (!theme)\n                return;\n\n            struct wl_cursor* cursor = wl_cursor_theme_get_cursor(theme, cursorName);\n            if (!cursor)\n                return;')
+# _glfwCreateStandardCursorWayland
+s=s.replace(
+'    cursor->wl.cursor = wl_cursor_theme_get_cursor(_glfw.wl.cursorTheme, name);\n\n    if (_glfw.wl.cursorThemeHiDPI)',
+'    if (!_glfw.wl.cursorTheme)\n    {\n        _glfwInputError(GLFW_CURSOR_UNAVAILABLE,\n                        "Wayland: no cursor theme, standard cursor unavailable");\n        return GLFW_FALSE;\n    }\n\n    cursor->wl.cursor = wl_cursor_theme_get_cursor(_glfw.wl.cursorTheme, name);\n\n    if (_glfw.wl.cursorThemeHiDPI)')
+open(ww,'w').write(s)
+print("[port-glfw] patched wl_init.c/wl_window.c (NULL cursor theme guards)")
+PY
+fi
+
 SHARED_ARG="OFF"
 [ "${BUILD_SHARED:-0}" = "1" ] && SHARED_ARG="ON"
 

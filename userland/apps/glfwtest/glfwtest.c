@@ -32,9 +32,9 @@ int main(void) {
     printf("[glfwtest] GL_RENDERER = %s\n", (const char*)glGetString(GL_RENDERER));
 
     int frames = 0;
-    for (int i = 0; i < 120 && !glfwWindowShouldClose(win); i++) {
-        float t = (float)i / 120.0f;
-        glClearColor(0.2f, t, 0.8f, 1.0f);   // animate green so a live window is obvious
+    for (int i = 0; i < 20 && !glfwWindowShouldClose(win); i++) {
+        float t = (float)i / 20.0f;
+        glClearColor(0.2f, t, 0.8f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         glfwSwapBuffers(win);
         glfwPollEvents();

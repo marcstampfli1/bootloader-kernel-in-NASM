@@ -423,22 +423,29 @@ fi
 # plus the Wayland client libs GLFW's backend uses (cursor + egl-window + xkb).
 # Built only if GLFW is ported (scripts/port-glfw.sh) and the Mesa libs exist.
 if [ -f "$GL_L/libglfw3.a" ] && [ -f "$GL_L/libEGL.a" ] && [ -f "$GL_L/dri/virtio_gpu_dri.so" ]; then
-    "$USER_CC" -ffreestanding -m64 -mno-red-zone -fno-pie -fno-pic -fno-plt \
+    # PIE + --export-dynamic so the wayland/EGL/GLES/xkb symbols GLFW resolves via
+    # its dlopen fallback (dlsym(RTLD_DEFAULT,...) -- MakaOS ships those libs static,
+    # not as dlopen-able .so) live in glfwtest's own dynamic symbol table.
+    # --whole-archive forces those symbols in (GLFW references them only through
+    # dlsym'd pointers, so they would not otherwise be pulled). libwayland-server.a
+    # resolves the server-side symbols the whole-archived EGL wayland-drm pulls in.
+    "$USER_CC" -fPIE -ffreestanding -m64 -mno-red-zone \
         -fno-stack-protector -fno-builtin -O0 -Wall -isystem "$SYSROOT/usr/include" \
         -c "$USERLAND_DIR/apps/glfwtest/glfwtest.c" -o "$BUILD_DIR/user_glfwtest.o"
-    "$USER_CXX" --sysroot="$SYSROOT" -m64 -mno-red-zone -no-pie -s \
+    "$USER_CXX" --sysroot="$SYSROOT" -m64 -mno-red-zone -pie -Wl,--export-dynamic -s \
         "$BUILD_DIR/user_glfwtest.o" \
-        -Wl,--gc-sections -Wl,--allow-multiple-definition -Wl,--start-group \
-        "$GL_L/libglfw3.a" \
-        "$GL_L/dri/virtio_gpu_dri.so" \
-        "$GL_L/libEGL.a" "$GL_L/libGLESv2.a" "$GL_L/libgbm.a" "$GL_L/libglapi.a" \
-        "$GL_L/libdrm.a" "$GL_L/libexpat.a" \
-        "$GL_L/libwayland-client.a" "$GL_L/libwayland-cursor.a" "$GL_L/libwayland-egl.a" \
-        "$GL_L/libxkbcommon.a" "$GL_L/libffi.a" \
+        -Wl,--allow-multiple-definition \
+        -Wl,--whole-archive \
+            "$GL_L/libwayland-client.a" "$GL_L/libwayland-cursor.a" "$GL_L/libwayland-egl.a" \
+            "$GL_L/libxkbcommon.a" "$GL_L/libEGL.a" "$GL_L/libGLESv2.a" \
+        -Wl,--no-whole-archive \
+        -Wl,--start-group \
+            "$GL_L/libglfw3.a" "$GL_L/dri/virtio_gpu_dri.so" "$GL_L/libgbm.a" "$GL_L/libglapi.a" \
+            "$GL_L/libdrm.a" "$GL_L/libexpat.a" "$GL_L/libffi.a" "$GL_L/libwayland-server.a" \
         -Wl,--end-group \
         "$GL_L/libz.a" -lm -lpthread \
         -o "$BUILD_DIR/user_glfwtest.elf"
-    echo "[build] glfwtest linked against GLFW-Wayland + the static Mesa GL stack"
+    echo "[build] glfwtest linked (PIE+export-dynamic) against GLFW-Wayland + Mesa GL"
 fi
 
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
