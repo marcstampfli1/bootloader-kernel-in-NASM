@@ -33,6 +33,10 @@ extern "C" {
 #define F_GETLK     5
 #define F_SETLK     6
 #define F_SETLKW    7
+// LFS aliases (LP64: identical to the base commands).
+#define F_GETLK64   F_GETLK
+#define F_SETLK64   F_SETLK
+#define F_SETLKW64  F_SETLKW
 #define F_DUPFD_CLOEXEC 8
 
 // fcntl fd flags

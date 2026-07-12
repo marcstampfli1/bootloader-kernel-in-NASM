@@ -106,6 +106,33 @@ extern const struct in6_addr in6addr_loopback;   // ::1
 #define IPV6_MULTICAST_IF   17
 #define IPV6_ADD_MEMBERSHIP 20
 #define IPV6_DROP_MEMBERSHIP 21
+
+// Source-specific multicast (Linux values + structures).
+#define IP_UNBLOCK_SOURCE         37
+#define IP_BLOCK_SOURCE           38
+#define IP_ADD_SOURCE_MEMBERSHIP  39
+#define IP_DROP_SOURCE_MEMBERSHIP 40
+#define MCAST_JOIN_GROUP          42
+#define MCAST_BLOCK_SOURCE        43
+#define MCAST_UNBLOCK_SOURCE      44
+#define MCAST_LEAVE_GROUP         45
+#define MCAST_JOIN_SOURCE_GROUP   46
+#define MCAST_LEAVE_SOURCE_GROUP  47
+
+struct ip_mreq_source {
+    struct in_addr imr_multiaddr;
+    struct in_addr imr_interface;
+    struct in_addr imr_sourceaddr;
+};
+struct group_req {
+    uint32_t                gr_interface;
+    struct sockaddr_storage gr_group;
+};
+struct group_source_req {
+    uint32_t                gsr_interface;
+    struct sockaddr_storage gsr_group;
+    struct sockaddr_storage gsr_source;
+};
 #define IPV6_MULTICAST_HOPS 18
 #define IPV6_TCLASS         67
 #define IPV6_MULTICAST_LOOP 19

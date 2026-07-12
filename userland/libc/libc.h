@@ -1675,6 +1675,7 @@ static inline int setrlimit(int resource, const struct rlimit* rlim) {
 #define _SC_CLK_TCK         2
 #define _SC_GETPW_R_SIZE_MAX 70
 #define _SC_OPEN_MAX        4
+#define _SC_IOV_MAX         60
 #define _CS_PATH            0
 #define _CS_GNU_LIBC_VERSION       2
 #define _CS_GNU_LIBPTHREAD_VERSION 3

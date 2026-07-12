@@ -40,6 +40,7 @@ typedef unsigned char  u_char;
 typedef unsigned short u_short;
 typedef unsigned int   u_int;
 typedef unsigned long  u_long;
+typedef char*          caddr_t;
 #ifndef _SSIZE_T_DEFINED
 #define _SSIZE_T_DEFINED 1
 typedef long ssize_t;
