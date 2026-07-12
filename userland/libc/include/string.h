@@ -46,6 +46,7 @@ char*  strstr(const char* haystack, const char* needle);
 char*  strpbrk(const char* s, const char* accept);
 size_t strspn(const char* s, const char* accept);
 size_t strcspn(const char* s, const char* reject);
+char*  strsep(char** stringp, const char* delim);
 char*  strtok(char* s, const char* delim);
 char*  strtok_r(char* s, const char* delim, char** saveptr);
 char*  strdup(const char* s);

@@ -43,6 +43,12 @@ extern "C" {
 #define S_IRWXG (S_IRGRP|S_IWGRP|S_IXGRP)
 #define S_IRWXO (S_IROTH|S_IWOTH|S_IXOTH)
 
+// BSD-compatibility aliases (glibc exposes these under __USE_MISC); used by
+// portable code such as OpenJDK's attachListener_linux.cpp.
+#define S_IREAD  S_IRUSR
+#define S_IWRITE S_IWUSR
+#define S_IEXEC  S_IXUSR
+
 // Layout MUST match kernel stat_t in kernel/syscall/syscall.h — the
 // kernel writes this struct directly via SYS_STAT / SYS_FSTAT, so any
 // reorder silently breaks S_ISDIR / S_ISREG checks on valid inodes.

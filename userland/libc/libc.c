@@ -1366,6 +1366,18 @@ char* strtok_r(char* s, const char* delim, char** saveptr) {
     return tok;
 }
 
+// strsep: like strtok_r but returns empty tokens for adjacent delimiters and
+// advances *stringp to NULL past the last token (BSD/glibc extension used by
+// e.g. OpenJDK's cgroup parsing).
+char* strsep(char** stringp, const char* delim) {
+    char* start = *stringp;
+    if (!start) return NULL;
+    char* p = start + strcspn(start, delim);
+    if (*p) { *p++ = '\0'; *stringp = p; }
+    else    { *stringp = NULL; }
+    return start;
+}
+
 static char* s_strtok_save = NULL;
 char* strtok(char* s, const char* delim) {
     return strtok_r(s, delim, &s_strtok_save);

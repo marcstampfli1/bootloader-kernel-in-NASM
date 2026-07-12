@@ -30,7 +30,7 @@ static pthread_mutex_t s_lock = { .kind = PTHREAD_MUTEX_RECURSIVE };
 static void dl_lock(void)   { pthread_mutex_lock(&s_lock); }
 static void dl_unlock(void) { pthread_mutex_unlock(&s_lock); }
 
-// ── Minimal ELF64 (userland has no <elf.h>) ────────────────────────────────
+// ── Minimal ELF64 (local to the loader; <elf.h> has the public copies) ─────
 typedef struct { uint8_t e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version;
     uint64_t e_entry, e_phoff, e_shoff; uint32_t e_flags;
     uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx; } Elf64_Ehdr;
@@ -603,5 +603,24 @@ char* dlerror(void) {
 int dladdr(const void* addr, Dl_info* info) {
     (void)addr;
     if (info) { info->dli_fname = 0; info->dli_fbase = 0; info->dli_sname = 0; info->dli_saddr = 0; }
+    return 0;
+}
+
+// dl_iterate_phdr: enumerate loaded objects. MakaOS's loader does not yet
+// expose its link map for iteration, so we visit nothing and return 0. This
+// degrades gracefully: the only in-tree consumer (OpenJDK os_linux.cpp) uses
+// it to map a code address to its shared-object name for diagnostics, which
+// simply comes back empty. TODO: walk the dlopen object list + the main-exe
+// PT_LOAD headers once the loader publishes them.
+//
+// struct dl_phdr_info (defined in <link.h>) is used only as a pointer here, so
+// a forward declaration keeps this file off the <elf.h> include chain and away
+// from the loader's own local ELF typedefs above.
+struct dl_phdr_info;
+int dl_iterate_phdr(int (*callback)(struct dl_phdr_info* info, unsigned long size,
+                                    void* data),
+                    void* data) {
+    (void)callback;
+    (void)data;
     return 0;
 }
