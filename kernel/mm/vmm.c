@@ -1278,6 +1278,16 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
 
 kernel_panic:
     {
+        /* Fault-fixup: was the faulting instruction a sanctioned user access
+         * (copy_to/from_user, signal-frame build) registered in __ex_table?
+         * If so this is a bad or racing user pointer, NOT a kernel bug --
+         * resume at the fixup landing pad (which unwinds to -EFAULT) instead
+         * of panicking.  This is what stops userland from taking down the
+         * whole kernel with an unmapped/racing buffer or signal-frame page. */
+        extern uint64_t extable_fixup(uint64_t rip);
+        uint64_t fix = extable_fixup(f->ip);
+        if (fix) { f->ip = fix; return; }
+
         /* Short banner via the local serial path — we need at least
          * CR2 visible before we hand off, in case panic_from_exception
          * itself has a bug in this context. */

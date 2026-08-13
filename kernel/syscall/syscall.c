@@ -6,6 +6,7 @@
 #include "common.h"
 #include "checked.h"   // ckd_add_u64: overflow-safe add for the user-range guards
 #include "uaccess.h"   // _access_ok: the shared user (addr,len) range validator
+#include "extable.h"   // _ASM_EXTABLE: fault-safe user copy via the fixup table
 #include "kstr.h"      // str_lcpy: shared truncating NUL copy (was local strncpy_k)
 #include "sched.h"
 #include "signal.h"
@@ -328,16 +329,38 @@ static int user_buf_prefault(virt_addr_t addr, size_t len) {
 
         // Anonymous page: there is no backing store, so a freshly zeroed frame
         // IS the correct content (a new zero page, about to be written into or
-        // read as zero).  Allocate, zero, and map with the VMA's permissions.
+        // read as zero).  Allocate + zero the frame OUTSIDE the lock, then
+        // install it under mm->vma_lock with a presence re-check -- EXACTLY as
+        // the demand-fault handler does (vmm.c isr14).  A user-PML4 structural
+        // mutation (vmm_page_map -> vmm_pte_get may allocate intermediate PT
+        // pages) MUST be serialized by vma_lock (the vmm.c invariant: "User
+        // PML4s are serialized by their per-mm vma_lock").  The old unlocked
+        // map here raced isr14 / a sibling thread's fault on the SAME page
+        // tables -> torn PTE / a leaf installed into an orphaned intermediate
+        // table -> the page read back UNMAPPED -> vfs_read #PF -> the syscall
+        // returned a spurious -EFAULT.  This surfaced as intermittent "Bad
+        // address" reading class files once the JVM's JIT compiler threads ran
+        // concurrent mmap/fault traffic; it never fired under -Xint (no
+        // concurrent PT mutators).  Alloc-before-lock + locked presence re-check
+        // makes the fast path lock-free and the slow path race-free.
         phys_addr_t frame = pmm_buddy_alloc(0);
         if (frame == PMM_INVALID_ADDR) return -1;  // OOM — can't back the range
 
         // Zero the full page (512 × 8 bytes = 4096).
         __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
 
-        if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma_flags))) {
-            pmm_buddy_free(frame, 0);
-            return -1;
+        int lost = 0, failed = 0;
+        spin_lock(&mm->vma_lock);
+        if (vmm_page_phys(pml4, page) != PMM_INVALID_ADDR) {
+            lost = 1;                               // a racer backed it first
+        } else if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma_flags))) {
+            failed = 1;                             // OOM installing a PT page
+        }
+        spin_unlock(&mm->vma_lock);
+        if (lost || failed) {
+            pmm_buddy_free(frame, 0);               // release the now-unused frame
+            if (failed) return -1;
+            continue;                               // racer's mapping is valid
         }
     }
     return 0;
@@ -473,6 +496,14 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_zero   = (dev[0]=='z' && dev[1]=='e' && dev[2]=='r' && dev[3]=='o' && dev[4]=='\0');
         uint8_t match_urnd   = (dev[0]=='u' && dev[1]=='r' && dev[2]=='a' && dev[3]=='n'
                              && dev[4]=='d' && dev[5]=='o' && dev[6]=='m' && dev[7]=='\0');
+        // /dev/random: same non-blocking kernel CSPRNG as /dev/urandom (modern
+        // Linux never blocks it once seeded).  Without a /dev/random, Java's
+        // default securerandom.source=file:/dev/random and SecureRandom.
+        // getInstanceStrong() (NativePRNGBlocking) fall back to the glacial
+        // ThreadedSeedGenerator -- which stalled Minecraft's bootstrap for many
+        // minutes waiting on software entropy.
+        uint8_t match_rnd    = (dev[0]=='r' && dev[1]=='a' && dev[2]=='n' && dev[3]=='d'
+                             && dev[4]=='o' && dev[5]=='m' && dev[6]=='\0');
         // /dev/input/event<N>: parse the decimal number so every
         // registered input_device_t gets its own node, not just event0.
         int match_eventn = -1;
@@ -521,6 +552,7 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         else if (match_null)   f = vfs_null_open();
         else if (match_zero)   f = vfs_zero_open();
         else if (match_urnd)   f = vfs_urandom_open();
+        else if (match_rnd)    f = vfs_urandom_open();  // /dev/random == CSPRNG, non-blocking
         else return (uint64_t)-ENOENT;
         // fall through to got_file
     }
@@ -663,27 +695,41 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
     if (new_brk == old_brk) return old_brk;
 
     if (new_brk > old_brk) {
-        // ── Grow heap ─────────────────────────────────────────────────────
-        // Rather than remove+add (which races readers and loses flags),
-        // ask mm_vma_remove to drop the old heap VMA (deferred free via
-        // call_rcu) and then mm_vma_add to install the enlarged one.
+        // ── Grow heap (IN PLACE) ──────────────────────────────────────────
+        // Extend the existing heap VMA's ->end under mm->vma_lock.  NEVER
+        // remove+add: the old code dropped the heap VMA (mm_vma_remove) and
+        // then re-added an enlarged one (mm_vma_add), leaving a WINDOW in which
+        // no VMA covered the heap at all.  A sibling thread reading into a heap
+        // buffer during that window hit mm_vma_find()==NULL in user_buf_prefault
+        // and the read(2) returned a spurious -EFAULT -- the intermittent "Bad
+        // address" reading class files, triggered once the JVM's JIT compiler
+        // threads ran concurrent malloc()/brk() while the main thread read.
+        // An in-place end bump is race-free: a concurrent reader observes either
+        // the old (smaller) or the new (larger) end, and every address in the
+        // pre-existing range stays covered throughout.
         virt_addr_t heap_vma_start = mm->brk_start;
         virt_addr_t vma_end = (new_brk + PAGE_MASK) & ~PAGE_MASK;
 
-        // mm_vma_remove takes mm->vma_lock internally.
-        extern uint8_t mm_vma_remove(mm_t*, virt_addr_t, virt_addr_t);
-        // We need to know the old end to pass it in.  Read it under RCU.
-        virt_addr_t old_end = 0;
-        rcu_read_lock();
-        for (vma_t* v = rcu_dereference(mm->vmas); v; v = rcu_dereference(v->next)) {
-            if (v->start == heap_vma_start) { old_end = v->end; break; }
+        int extended = 0, overlap = 0;
+        spin_lock(&mm->vma_lock);
+        vma_t* heap = NULL;
+        for (vma_t* v = mm->vmas; v; v = v->next) {
+            if (v->start == heap_vma_start) { heap = v; continue; }
+            // Any OTHER VMA overlapping [heap_start, vma_end) blocks the grow.
+            if (heap_vma_start < v->end && vma_end > v->start) overlap = 1;
         }
-        rcu_read_unlock();
-        if (old_end)
-            mm_vma_remove(mm, heap_vma_start, old_end);
+        if (!overlap && heap) {
+            if (vma_end > heap->end) heap->end = vma_end;  // in-place, race-free
+            extended = 1;
+        }
+        spin_unlock(&mm->vma_lock);
 
-        if (!mm_vma_add(mm, heap_vma_start, vma_end, VMA_R | VMA_W | VMA_ANON))
-            return (uint64_t)-ENOMEM;
+        if (overlap) return (uint64_t)-ENOMEM;
+        if (!extended) {
+            // First grow (no heap VMA yet): install it fresh.
+            if (!mm_vma_add(mm, heap_vma_start, vma_end, VMA_R | VMA_W | VMA_ANON))
+                return (uint64_t)-ENOMEM;
+        }
 
         mm->brk = new_brk;
         return new_brk;
@@ -3783,10 +3829,30 @@ static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
 
 // ── Helper: copy bytes from user to kernel safely ─────────────────────────
 // Returns 0 on success, -EFAULT if the pointer is bad or in kernel space.
+// Fault-safe byte copy for kernel<->user transfers.  The `rep movsb` is
+// registered in the fault-fixup table (extable.h): if it faults on a bad or
+// racing user page that the page-fault handler cannot resolve, the handler
+// resumes execution at label 2 instead of panicking, leaving RCX = bytes not
+// yet copied.  Returns the number of bytes NOT copied (0 == full success).
+// This is what closes the "concurrent munmap between the access check and the
+// access itself still faults" residual documented on the prefault helpers.
+static uint64_t __attribute__((noinline))
+__uaccess_copy(void* dst, const void* src, uint64_t len) {
+    uint64_t not_copied;
+    __asm__ volatile(
+        "1: rep movsb\n\t"
+        "2:\n\t"
+        _ASM_EXTABLE(1b, 2b)
+        : "=c"(not_copied), "+D"(dst), "+S"(src)
+        : "0"(len)
+        : "memory", "cc");
+    return not_copied;
+}
+
 int copy_from_user(void* dst, const void* src_u, uint64_t len) {
     if (!_access_ok((uint64_t)src_u, len)) return -EFAULT;
     if (user_buf_prefault((virt_addr_t)src_u, len) != 0) return -EFAULT;
-    __builtin_memcpy(dst, src_u, len);
+    if (__uaccess_copy(dst, src_u, len) != 0) return -EFAULT;
     return 0;
 }
 
@@ -3823,7 +3889,7 @@ static int64_t copy_path_from_user(char* dst, const void* uptr, uint64_t dstsz) 
 int copy_to_user(void* dst_u, const void* src, uint64_t len) {
     if (!_access_ok((uint64_t)dst_u, len)) return -EFAULT;
     if (user_buf_prefault((virt_addr_t)dst_u, len) != 0) return -EFAULT;
-    __builtin_memcpy(dst_u, src, len);
+    if (__uaccess_copy(dst_u, src, len) != 0) return -EFAULT;
     return 0;
 }
 

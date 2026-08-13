@@ -484,13 +484,40 @@ extern uint64_t tsc_read_ns(void);
 // Lookup: plain acquire-loads down the L0 / L1 chain.  No lock needed
 // because every store in irtree_alloc is publish-once with release
 // semantics; we either see the leaf or we don't.
+// A live leaf is always a kernel higher-half (HHDM/heap) pointer.  Anything
+// below the higher-half base is a corrupted slot -- e.g. the non-canonical
+// (bit-47-cleared) value a work-stealing use-after-free leaves in l1tab.
+// Validate before EVERY dereference so a corrupt slot recovers (re-fetch from
+// disk) instead of #GP-ing the whole process.
+static inline int irtree_leaf_ok(irtree_leaf_t* p) {
+    return (uintptr_t)p >= 0xFFFF800000000000ULL;
+}
+static void irtree_report_corrupt(uint32_t ino, uint32_t l0, uint32_t l1,
+                                  irtree_l1_t* l1tab, irtree_leaf_t* leaf) {
+    // Rate-limited: the corruption is recovered transparently, so we only
+    // need a few samples for observability, not a per-hit flood.
+    static volatile uint32_t seen;
+    uint32_t n = __atomic_fetch_add(&seen, 1u, __ATOMIC_RELAXED);
+    if (n >= 8) return;
+    extern void kprintf_atomic(const char*, ...);
+    kprintf_atomic("[irtree] recovered corrupt leaf #%u ino=%u l0=%u l1=%u val=%p l1tab=%p\n",
+                   n, ino, l0, l1, (void*)leaf, (void*)l1tab);
+}
+
 static irtree_leaf_t* irtree_lookup(uint32_t ino) {
     uint32_t l0 = (ino >> IRTREE_BITS) & IRTREE_MASK;
     uint32_t l1 = ino & IRTREE_MASK;
     irtree_l1_t* l1tab = __atomic_load_n(&s_irtree[l0], __ATOMIC_ACQUIRE);
     if (!l1tab) return NULL;
     irtree_leaf_t* leaf = __atomic_load_n(&l1tab->leaves[l1], __ATOMIC_ACQUIRE);
-    if (!leaf || leaf->ino != ino) return NULL;
+    if (!leaf) return NULL;
+    if (UNLIKELY(!irtree_leaf_ok(leaf))) {
+        // Corrupted slot: clear it (recover -> re-fetch) and DON'T deref.
+        irtree_report_corrupt(ino, l0, l1, l1tab, leaf);
+        __atomic_store_n(&l1tab->leaves[l1], NULL, __ATOMIC_RELEASE);
+        return NULL;
+    }
+    if (leaf->ino != ino) return NULL;
     return leaf;
 }
 
@@ -521,6 +548,14 @@ static irtree_leaf_t* irtree_alloc_with_ref(uint32_t ino) {
         __atomic_store_n(&s_irtree[l0], l1tab, __ATOMIC_RELEASE);
     }
     irtree_leaf_t* leaf = l1tab->leaves[l1];
+    if (leaf && UNLIKELY(!irtree_leaf_ok(leaf))) {
+        // Corrupted slot (work-stealing UAF left a non-canonical pointer).
+        // Under s_irtree_alloc_lock we own the slot: report, drop it, and
+        // fall through to a fresh allocation that overwrites the poison.
+        irtree_report_corrupt(ino, l0, l1, l1tab, leaf);
+        leaf = NULL;
+        l1tab->leaves[l1] = NULL;
+    }
     if (leaf) {
         // Already present (another CPU raced us here).  Bump its
         // refcount and return — the caller's rcu_read_lock kept it
@@ -535,6 +570,16 @@ static irtree_leaf_t* irtree_alloc_with_ref(uint32_t ino) {
     // Fresh allocation from the typesafe slab.
     leaf = (irtree_leaf_t*)pmm_slab_alloc(&s_irtree_leaf_cache);
     if (!leaf) { spin_unlock(&s_irtree_alloc_lock); return NULL; }
+    if (UNLIKELY(!irtree_leaf_ok(leaf))) {
+        // The SLAB ITSELF handed back a non-canonical (bit-47-cleared) pointer
+        // -> the corruption is in the slab freelist head, not a post-store
+        // write into l1tab.  Report the exact value + which cache, drop it.
+        extern void kprintf_atomic(const char*, ...);
+        kprintf_atomic("[irtree] SLAB-RETURNED-NONCANON leaf=%p ino=%u\n",
+                       (void*)leaf, ino);
+        spin_unlock(&s_irtree_alloc_lock);
+        return NULL;
+    }
     seqlock_init(&leaf->seq);
     leaf->ino          = ino;
     leaf->valid        = 0;
@@ -701,6 +746,14 @@ uint32_t irtree_shrink(uint32_t max, uint64_t idle_ns_cutoff) {
             irtree_leaf_t* leaf = __atomic_load_n(&l1tab->leaves[l1],
                                                     __ATOMIC_ACQUIRE);
             if (!leaf) continue;
+            if (UNLIKELY(!irtree_leaf_ok(leaf))) {
+                // Corrupt slot — clear it (recover) instead of #GP-ing the
+                // shrinker on the bit-47-cleared pointer.  Leaks the pointed-at
+                // object but that is already lost; keep the kernel alive.
+                irtree_report_corrupt(l1 /*ino unknown here*/, l0, l1, l1tab, leaf);
+                __atomic_store_n(&l1tab->leaves[l1], NULL, __ATOMIC_RELEASE);
+                continue;
+            }
 
             // Quick unlocked check — spares the lock acquire when
             // the leaf is hot.  A racy race (leaf gets touched between
@@ -864,6 +917,7 @@ static uint8_t read_inode(uint32_t ino, ext2_inode_t* out) {
     inode_unlock(leaf);
     return 1;
 }
+
 
 // Internal disk writeback shared between inode_writeback (called with
 // the leaf seqlock held) and the legacy write_inode wrapper (which

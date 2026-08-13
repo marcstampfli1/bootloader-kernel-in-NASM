@@ -1319,9 +1319,23 @@ static void do_switch(uint8_t preempted) {
     // here (rather than just after context_switch) also covers tasks whose
     // successor resumed via a trampoline (first run) instead of returning
     // into do_switch.  RELAXED read: only this CPU writes switching_from.
+    //
+    // CRITICAL: NULL switching_from immediately after use.  It records a task we
+    // switched away from; that task can be TASK_DEAD and get RCU-reaped +
+    // kfree'd while this CPU sits idle (the idle loop advances RCU via
+    // rcu_note_qs WITHOUT re-entering do_switch, so a stale switching_from
+    // survives the grace period).  Its 1120-byte task_t is kmalloc class-2048 --
+    // the SAME class as irtree_l1_t (2048B) -- so the freed slot comes back as
+    // an inode-radix l1tab.  Re-reading the stale pointer here and storing
+    // on_cpu=0 (a byte at task_t offset 0x2f5) then clobbers l1tab+0x2f5 =
+    // leaves[94]+5 = bit 47 of a leaf pointer -> the deterministic bit-47 #GP.
+    // Clearing it once, here (while the task is still alive), closes the UAF.
     {
         task_t* so = c->switching_from;
-        if (so) __atomic_store_n(&so->on_cpu, 0u, __ATOMIC_RELEASE);
+        if (so) {
+            __atomic_store_n(&so->on_cpu, 0u, __ATOMIC_RELEASE);
+            c->switching_from = NULL;
+        }
     }
 
     // ── Deferred preemption for mid-exit tasks ──────────────────────────
@@ -1541,7 +1555,15 @@ static void do_switch(uint8_t preempted) {
     {
         cpu_t* cc = this_cpu();
         task_t* so = cc->switching_from;
-        if (so) __atomic_store_n(&so->on_cpu, 0u, __ATOMIC_RELEASE);
+        if (so) {
+            __atomic_store_n(&so->on_cpu, 0u, __ATOMIC_RELEASE);
+            // NULL after use: prevents a later do_switch (post-idle) from
+            // re-reading this pointer once the task has been RCU-reaped and its
+            // class-2048 slot reused (e.g. as an inode-radix l1tab).  See the
+            // matching entry-clear above -- this is the write that otherwise
+            // clobbers bit 47 of a reused leaf pointer.
+            cc->switching_from = NULL;
+        }
     }
 
     signal_deliver_pending(0, 0);

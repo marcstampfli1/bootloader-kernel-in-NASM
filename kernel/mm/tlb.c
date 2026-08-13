@@ -240,8 +240,15 @@ static void tlb_flush_common(task_mm_t* mm, uint64_t start, uint64_t end) {
     // cost as Linux.  Bounded: critical sections are short and the
     // receiver work is O(pages invalidated), so max latency is small.
     for (uint32_t i = 0; i < slot_idx; i++) {
-        while (!__atomic_load_n(&my_slots[i].done, __ATOMIC_ACQUIRE))
+        while (!__atomic_load_n(&my_slots[i].done, __ATOMIC_ACQUIRE)) {
+            // Drain OUR incoming shootdown queue while we wait for remote ACKs.
+            // If two CPUs shoot down concurrently and each waits on the other,
+            // relying on interrupt delivery alone can wedge when one is briefly
+            // IRQ-off (in an IPI handler); processing by hand here guarantees
+            // forward progress.  tlb_shootdown_drain is lock-free.
+            tlb_shootdown_drain();
             cpu_relax();
+        }
     }
 
     preempt_enable();
@@ -293,8 +300,15 @@ void tlb_flush_kernel_range(uint64_t start, uint64_t end) {
         tlb_do_flush(start, end);
 
     for (uint32_t i = 0; i < slot_idx; i++) {
-        while (!__atomic_load_n(&my_slots[i].done, __ATOMIC_ACQUIRE))
+        while (!__atomic_load_n(&my_slots[i].done, __ATOMIC_ACQUIRE)) {
+            // Drain OUR incoming shootdown queue while we wait for remote ACKs.
+            // If two CPUs shoot down concurrently and each waits on the other,
+            // relying on interrupt delivery alone can wedge when one is briefly
+            // IRQ-off (in an IPI handler); processing by hand here guarantees
+            // forward progress.  tlb_shootdown_drain is lock-free.
+            tlb_shootdown_drain();
             cpu_relax();
+        }
     }
 
     preempt_enable();

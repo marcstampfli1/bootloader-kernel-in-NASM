@@ -577,6 +577,17 @@ int task_exit_self_reaps(uint32_t flags) {
 //
 // The caller owns the surrounding teardown (cleartid, child reparent, files
 // release) and chooses exit_code's meaning (normal code vs -signo).
+
+// Wake one thread of the parent (skip already-dead ones).  waitpid() parks the
+// CALLING thread via sched_sleep; a spurious wake just makes that thread re-run
+// its sys_wait drain loop, so waking non-waiters is safe by the sched_sleep
+// contract (every sleeper re-checks its condition).
+static void wake_parent_thread(task_t* t, void* data) {
+    (void)data;
+    if (t->state == TASK_ZOMBIE || t->state == TASK_DEAD) return;
+    sched_wake(t);
+}
+
 void task_set_exit_state(task_t* t, int32_t exit_code) {
     t->exit_code = exit_code;
     if (task_exit_self_reaps(t->flags)) {
@@ -585,6 +596,21 @@ void task_set_exit_state(task_t* t, int32_t exit_code) {
         t->state = TASK_ZOMBIE;
         sched_add_zombie(t);
         signal_send_pid(t->ppid, SIGCHLD);
+        // signal_send_pid wakes ONLY the ppid'd thread, but the thread blocked
+        // in waitpid() may be a DIFFERENT (non-leader) thread of the parent --
+        // e.g. the JVM spawns from its main thread but reaps on a "process
+        // reaper" worker.  If the child exits after that reaper parks, the wake
+        // lands on the wrong thread and waitpid() hangs forever (observed:
+        // Minecraft's OSHI hardware probe hung MC's main thread waiting on a
+        // `getconf`/`uname` subprocess).  Broadcast a wake to EVERY thread of
+        // the parent PROCESS so whichever one is in wait() re-drains the zombie.
+        // The zombie is published (state + sched_add_zombie) BEFORE this wake,
+        // so a woken waiter is guaranteed to observe it.
+        rcu_read_lock();
+        task_t*  parent = sched_find_pid(t->ppid);
+        uint32_t ptgid  = parent ? parent->tgid : t->ppid;
+        rcu_read_unlock();
+        task_idx_tgid_walk(ptgid, wake_parent_thread, NULL);
     }
 }
 

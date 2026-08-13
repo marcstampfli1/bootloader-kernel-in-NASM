@@ -58,27 +58,35 @@ static phys_addr_t pcp_refill_one(cpu_t* c) {
     // Save one for the caller.
     phys_addr_t result = batch[--n];
 
-    // Push the rest onto pcp_pages.  We hold IRQs disabled, so no
-    // re-entry on this CPU.  Other CPUs don't touch our pcp_*.
-    uint32_t cnt = c->pcp_hdr.count;
-    int      space = SLAB_PCPU_PCP_DEPTH - (int)cnt;
-    int      pushed = (n < space) ? n : space;
-    for (int i = 0; i < pushed; i++) {
-        c->pcp_pages[cnt++] = batch[--n];
-    }
-    // Bump tid + count under cmpxchg semantics — owner-only write,
-    // but use the cmpxchg loop so that any IRQ-time fast paths that
-    // raced in see the updated tid (their CAS will fail and they'll
-    // retry against the fresh state).
-    uint64_t old_lo, old_hi;
-    this_cpu_load16b_field(pcp_hdr, &old_lo, &old_hi);
-    uint64_t new_lo = ((uint64_t)cnt) & 0xFFFFFFFFULL;  // count field
-    while (!this_cpu_cmpxchg16b_field(pcp_hdr, &old_lo, &old_hi,
+    // Push the leftover `n` frames onto pcp_pages.  We hold IRQs disabled, so
+    // this CPU won't re-enter -- but a CROSS-CPU pcp_drain_all (slab shrinker /
+    // OOM reclaim) CAN, concurrently, snapshot our stash, claim the header
+    // (count->0, tid++), and free those frames to buddy.  The old code read the
+    // count ONCE, wrote frames at that offset, and on a tid-mismatch retry
+    // re-published the SAME pre-drain count -- resurrecting the drained (now
+    // buddy-owned) frames as "available" in the stash, so a later pop handed a
+    // buddy-free frame to an owner: the [pmm] DOUBLE-ALLOC that surfaced as
+    // kstack/heap/pagetable double-ownership under exec+shrinker load.  Fix:
+    // mirror pcp_free -- re-read the LIVE count on every attempt and write our
+    // frames at the current top, so a racing drain that emptied the stash just
+    // makes us publish our own frames from 0, never the frames it freed.
+    for (;;) {
+        uint64_t old_lo, old_hi;
+        this_cpu_load16b_field(pcp_hdr, &old_lo, &old_hi);
+        uint32_t cur = (uint32_t)old_lo;
+        if (cur > SLAB_PCPU_PCP_DEPTH) continue;   // torn read; retry
+        int space  = SLAB_PCPU_PCP_DEPTH - (int)cur;
+        if (space <= 0 || n == 0) break;
+        int pushed = (n < space) ? n : space;
+        for (int i = 0; i < pushed; i++)
+            c->pcp_pages[cur + i] = batch[n - 1 - i];
+        uint64_t new_lo = ((uint64_t)(cur + pushed)) & 0xFFFFFFFFULL;
+        if (this_cpu_cmpxchg16b_field(pcp_hdr, &old_lo, &old_hi,
                                        new_lo, old_hi + 1)) {
-        // Some IRQ bumped tid while we were assembling — re-publish
-        // count (we still own the array writes; only the header
-        // changed).  Take whatever count is current and just bump.
-        new_lo = ((uint64_t)cnt) & 0xFFFFFFFFULL;
+            n -= pushed;    // committed; the rest (if any) loops or spills below
+        }
+        // else: a drain/alloc bumped tid -> our page writes are stale, retry
+        // against the fresh count (the frames we wrote were never published).
     }
 
     // Anything left over (rare — only if pcp was almost full) goes
@@ -96,31 +104,38 @@ static phys_addr_t pcp_refill_one(cpu_t* c) {
 // section.  Called when pcp is full on free, and from pcp_drain_all().
 static void pcp_drain_one(cpu_t* c, uint32_t how_many) {
     if (how_many == 0) return;
-    uint32_t cnt = c->pcp_hdr.count;
-    if (cnt == 0) return;
-    if (how_many > cnt) how_many = cnt;
 
+    // Snapshot-then-claim under a single fresh header read, mirroring the
+    // pcp_refill_one fix: the old code read the count, snapshotted frames, then
+    // re-read the header SEPARATELY and re-published a count derived from the
+    // STALE first read -- so a concurrent cross-CPU pcp_drain_all that reset our
+    // count to 0 and freed those frames in between would still let this claim
+    // "succeed", double-freeing the batch and resurrecting a stale count.  Read
+    // the header, snapshot the top `took`, and cmpxchg against THAT header; a
+    // racing drain fails the cmpxchg and we retry from a fresh read.
     phys_addr_t batch[SLAB_PCPU_PCP_DEPTH];
-    for (uint32_t i = 0; i < how_many; i++) {
-        cnt--;
-        batch[i] = c->pcp_pages[cnt];
+    uint32_t took = 0;
+    for (;;) {
+        uint64_t old_lo, old_hi;
+        this_cpu_load16b_field(pcp_hdr, &old_lo, &old_hi);
+        uint32_t cnt = (uint32_t)old_lo;
+        if (cnt == 0) return;
+        if (cnt > SLAB_PCPU_PCP_DEPTH) continue;     // torn read; retry
+        took = (how_many > cnt) ? cnt : how_many;
+        uint32_t newcnt = cnt - took;
+        for (uint32_t i = 0; i < took; i++)
+            batch[i] = c->pcp_pages[newcnt + i];     // the top `took` frames
+        uint64_t new_lo = ((uint64_t)newcnt) & 0xFFFFFFFFULL;
+        if (this_cpu_cmpxchg16b_field(pcp_hdr, &old_lo, &old_hi,
+                                       new_lo, old_hi + 1))
+            break;                                    // claimed exclusively
+        // else: a concurrent drain/alloc bumped tid -> re-read and retry.
     }
 
-    // Publish new count under cmpxchg.
-    uint64_t old_lo, old_hi;
-    this_cpu_load16b_field(pcp_hdr, &old_lo, &old_hi);
-    uint64_t new_lo = ((uint64_t)cnt) & 0xFFFFFFFFULL;
-    while (!this_cpu_cmpxchg16b_field(pcp_hdr, &old_lo, &old_hi,
-                                       new_lo, old_hi + 1)) {
-        new_lo = ((uint64_t)cnt) & 0xFFFFFFFFULL;
-    }
-
-    // Hand the batch back to the buddy in one locked block.
     uint64_t pmm_flags;
     pmm_pcp_lock(&pmm_flags);
-    for (uint32_t i = 0; i < how_many; i++) {
+    for (uint32_t i = 0; i < took; i++)
         pmm_buddy_free_locked_for_pcp(batch[i], 0);
-    }
     pmm_pcp_unlock(pmm_flags);
 
     c->pcp_drains++;
@@ -202,55 +217,42 @@ void pcp_free(phys_addr_t phys) {
     }
 }
 
+// Owner-local drain callback: runs ON the CPU whose cache is being drained --
+// remotely inside the VEC_IPI_CALL handler (IRQs already off) or inline for
+// self (we disable IRQs to match).  Either way this CPU's own lock-free
+// pcp_alloc/pcp_free/refill CANNOT run concurrently, so pcp_drain_one operates
+// on a stable {pcp_hdr, pcp_pages} with no cross-CPU racer at all.
+static void pcp_drain_self_cb(void* arg) {
+    (void)arg;
+    uint64_t flags = local_irq_save_pcp();     // no-op-ish in IPI ctx (already cli)
+    pcp_drain_one(this_cpu(), SLAB_PCPU_PCP_DEPTH);
+    local_irq_restore_pcp(flags);
+}
+
 void pcp_drain_all(void) {
-    // Walk every CPU's pcp and drain it to buddy.  Used by the shrinker (4F)
-    // and as a synchronous reclaim hook in pmm_buddy_alloc on OOM.  This is a
-    // genuine cross-CPU access to another core's pcp_hdr/pcp_pages, which the
-    // owning core also mutates lock-free.  We do NOT rely on a quiescence
-    // "contract" (the previous code did, and it was false: pcp_alloc/free take
-    // no g_pmm_lock, so a remote owner can race a drain — the source of the
-    // [pmm] DOUBLE-ALLOC).  Instead each per-CPU drain snapshots the frames and
-    // then claims the header with a LOCKed cmpxchg16b; any concurrent owner op
-    // bumps tid and fails the claim, forcing a retry.
+    // IPI-based OWNER-LOCAL drain.  Used by the slab shrinker (4F) under memory
+    // pressure.  The previous implementation drained each remote CPU's pcp
+    // stash CROSS-CPU (snapshot + LOCKed cmpxchg16b claim).  That claim is
+    // atomic against a SINGLE owner op, but the owner's multi-slot refill push
+    // (pcp_refill_one) writes pcp_pages[] then republishes the count in a
+    // separate step: a drain that snapshots between the slot write and the
+    // count publish -- or that a refill retries around -- can leave a frame
+    // both freed-to-buddy AND live in the stash, so a later pcp_alloc hands a
+    // buddy-owned frame to a caller ([pmm] pcp-returned-owned, then the
+    // write-after-free free-list scribble under exec+shrinker load, SMP-only).
+    //
+    // The robust fix: never touch a remote CPU's stash.  IPI each CPU to drain
+    // its OWN cache with IRQs off, exactly like pcp_alloc/pcp_free already do.
+    // The hot path stays 100% lock-free; only this rare reclaim path pays the
+    // IPI.  g_pmm_lock is always held IRQs-off and pcp_drain_all is only called
+    // with it released (slab_shrinker unlocks first), so the IPI handler taking
+    // g_pmm_lock in pcp_drain_one cannot self-deadlock.
     extern cpu_t g_cpus[MAX_CPUS];
+    extern void smp_call_function_single(uint32_t cpu, void (*fn)(void*), void* arg);
     for (uint32_t i = 0; i < MAX_CPUS; i++) {
-        cpu_t* c = &g_cpus[i];
-        if (!c->self) continue;  // CPU slot not initialised
-        // Cross-CPU drain: the owning core may concurrently pcp_alloc/free.
-        // It bumps pcp_hdr.tid on EVERY op, so we snapshot the frames first
-        // and then claim the whole stash with a LOCKed cmpxchg16b that only
-        // succeeds if the header (count,tid) is unchanged — which proves the
-        // snapshot was consistent.  On any concurrent owner op the CAS fails
-        // and we retry.  (The old code used plain reads then plain
-        // count=0/tid++ writes here, so a concurrent pcp_alloc could hand out
-        // a frame that this drain also freed to buddy — the [pmm] DOUBLE-ALLOC
-        // class.  Read-then-claim closes it without an IPI.)
-        for (;;) {
-            // Read both 8-byte words exactly as the cmpxchg16b will compare
-            // them: lo = [count|pad], hi = [tid].
-            uint64_t lo = *((volatile uint64_t*)&c->pcp_hdr);
-            uint64_t hi = *((volatile uint64_t*)&c->pcp_hdr + 1);
-            uint32_t cnt = (uint32_t)lo;
-            if (cnt == 0) break;
-            if (cnt > SLAB_PCPU_PCP_DEPTH) continue;   // torn header; retry
-            phys_addr_t frames[SLAB_PCPU_PCP_DEPTH];
-            for (uint32_t j = 0; j < cnt; j++)
-                frames[j] = c->pcp_pages[j];
-            // Claim: header (lo,hi) -> (0, hi+1).  Fails (retry) if the owner
-            // popped/pushed since our read, which also means our frame
-            // snapshot would be stale.
-            uint64_t exp_lo = lo, exp_hi = hi;
-            if (!cmpxchg16b_abs(&c->pcp_hdr, &exp_lo, &exp_hi,
-                                (uint64_t)0, hi + 1))
-                continue;
-            uint64_t pmm_flags;
-            pmm_pcp_lock(&pmm_flags);
-            for (uint32_t j = 0; j < cnt; j++)
-                pmm_buddy_free_locked_for_pcp(frames[j], 0);
-            pmm_pcp_unlock(pmm_flags);
-            c->pcp_drains++;
-            break;
-        }
+        if (!g_cpus[i].self) continue;         // CPU slot not initialised
+        // self -> runs inline; remote -> IPI + wait, target runs it IRQs-off.
+        smp_call_function_single(i, pcp_drain_self_cb, NULL);
     }
 }
 

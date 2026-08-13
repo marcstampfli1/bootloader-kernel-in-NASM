@@ -90,7 +90,21 @@ static inline void zero(virt_addr_t addr, uint64_t amount_bytes) {
   }
 }
 
+// DIAG: catch double-conversion (phys_to_virt fed an already-virtual address).
+// A real physical address is always < HHDM_OFFSET; anything >= it is a virtual
+// pointer wrongly passed as phys, which wraps bit 47 and yields a non-canonical
+// pointer. Report the caller RIP the first few times so the culprit is found.
+extern void kprintf_atomic(const char*, ...);
+static volatile uint32_t s_p2v_bad_reports;
+static void __attribute__((noinline)) phys_to_virt_bad(uint64_t phys, void* ra) {
+  uint32_t n = __atomic_fetch_add(&s_p2v_bad_reports, 1u, __ATOMIC_RELAXED);
+  if (n < 24)
+    kprintf_atomic("[p2v] BAD phys=%p (already virtual) caller=%p (rpt %u)\n",
+                   (void*)phys, ra, n);
+}
 static inline virt_addr_t phys_to_virt(phys_addr_t phys) {
+  if (__builtin_expect((uint64_t)phys >= HHDM_OFFSET, 0))
+    phys_to_virt_bad((uint64_t)phys, __builtin_return_address(0));
   return (virt_addr_t)(phys + HHDM_OFFSET);
 }
 
@@ -707,9 +721,24 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
   // slabs during refill).
   if (order == 0) {
     extern phys_addr_t pcp_alloc(void);
-    phys_addr_t r = pcp_alloc();
-    if (r != PMM_INVALID_ADDR) {
-      pmm_mark_allocated(r, 0);          // shared stamp — see above
+    // Never hand out a frame that is ALREADY owned (rc != 0).  A lock-free pcp
+    // race can leave a frame simultaneously in a per-CPU stash and on the buddy
+    // free list, so pcp_alloc may return a frame a live owner still holds.
+    // Returning it would double-own it (the corruption root).  Drop such a frame
+    // (do NOT re-free it -- its real owner still has it) and pop another; the
+    // dropped frame is reclaimed with its owner.  Bounded so a fully-poisoned
+    // stash can't spin forever -- fall through to the locked buddy path.
+    for (int attempt = 0; attempt < 64; attempt++) {
+      phys_addr_t r = pcp_alloc();
+      if (r == PMM_INVALID_ADDR) break;   // refill failed -> buddy path
+      uint64_t rfi = r >> PAGE_SHIFT;
+      if (rfi < g_total_frames &&
+          __atomic_load_n(&g_frame_refcount[rfi], __ATOMIC_RELAXED) != 0) {
+        kprintf_atomic("[pmm] pcp returned owned frame %p rc=%u -- dropped\n",
+                (void*)r, (unsigned)g_frame_refcount[rfi]);
+        continue;                          // corrupt: pop another
+      }
+      pmm_mark_allocated(r, 0);            // shared stamp — see above
 #if PMM_DEBUG_ALWAYS_ZERO
       __builtin_memset((void*)(r + HHDM_OFFSET), 0, PAGE_SIZE);
 #endif
@@ -719,13 +748,28 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
   }
 
   uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
-  phys_addr_t r = pmm_buddy_alloc_locked(order);
-  if (r == PMM_INVALID_ADDR) {
-    // Hard pressure: reclaim every empty slab page we're sitting on
-    // and retry once.  Guarantees we never fail an allocation while
-    // holding reclaimable slab pages.
-    pmm_slab_shrink_all_locked();
+  phys_addr_t r = PMM_INVALID_ADDR;
+  // Same invariant as the pcp path: never hand out an already-owned frame.  If
+  // the buddy free list is holding a corrupted (still-owned) block, drop it and
+  // pop another.  Bounded; all under g_pmm_lock so rc is stable here.
+  for (int attempt = 0; attempt < 64; attempt++) {
     r = pmm_buddy_alloc_locked(order);
+    if (r == PMM_INVALID_ADDR) {
+      // Hard pressure: reclaim every empty slab page we're sitting on
+      // and retry once.  Guarantees we never fail an allocation while
+      // holding reclaimable slab pages.
+      pmm_slab_shrink_all_locked();
+      r = pmm_buddy_alloc_locked(order);
+      if (r == PMM_INVALID_ADDR) break;
+    }
+    uint64_t rfi = r >> PAGE_SHIFT;
+    uint64_t n = order_to_pages(order), owned = 0;
+    for (uint64_t k = 0; k < n; k++)
+      if (rfi + k < g_total_frames && g_frame_refcount[rfi + k] != 0) { owned = 1; break; }
+    if (!owned) break;                     // clean block -> use it
+    kprintf_atomic("[pmm] buddy returned owned block %p order=%u -- dropped\n",
+            (void*)r, (unsigned)order);
+    r = PMM_INVALID_ADDR;                  // drop (leak); its owner still holds it
   }
   if (r != PMM_INVALID_ADDR) pmm_mark_allocated(r, order);   // shared stamp
   spin_unlock_irqrestore(&g_pmm_lock, flags);
@@ -745,11 +789,22 @@ void pmm_buddy_free(phys_addr_t addr, uint8_t order) {
   // freed -- a double pmm_buddy_free.  caller= points at the offending free
   // site (e.g. vmm_free_user_ex's PT/PD/PDPT frees).
   {
+    // A frame reaching the PUBLIC free with rc==0 was already freed -- a double
+    // pmm_buddy_free (page-table/kstack teardown of a frame some other owner
+    // still had, from an allocator double-hand-out).  Proceeding would push the
+    // SAME frame onto the free list twice: the second push corrupts the doubly-
+    // linked list and the coalesce bitmap, which is what cascades into wild
+    // double-allocs, scribbles and panics.  A double-free must be a NO-OP: the
+    // frame is already free, so drop this redundant free and keep the free list
+    // consistent.  (Boot-time population and the pcp drain use the _locked path,
+    // not this one, and legitimately free rc==0 frames -- so this guard is safe
+    // to apply only here, where a live free always carries rc>=1.)
     uint64_t _fi = addr >> PAGE_SHIFT;
     if (_fi < g_total_frames &&
         __atomic_load_n(&g_frame_refcount[_fi], __ATOMIC_RELAXED) == 0) {
-      kprintf_atomic("[pmm] DOUBLE-BUDDY-FREE frame=%p order=%u caller=%p\n",
+      kprintf_atomic("[pmm] double buddy_free dropped: frame=%p order=%u caller=%p\n",
               (void*)addr, (unsigned)order, __builtin_return_address(0));
+      return;
     }
   }
   // Phase 4E: order-0 hits the per-CPU pcp push.

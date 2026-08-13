@@ -299,37 +299,37 @@ static int build_rt_frame(int sig, k_sigaction_t* ka,
         ka->sa_restorer == 0 || ka->sa_restorer >= USER_ADDR_CEIL) {
         signal_force_kill(sig, "rt HANDLER", user_rsp, frame_base); return -1;
     }
-    {
-        extern vma_t* mm_vma_find(mm_t*, virt_addr_t);
-        mm_t* mm = g_current->mm_shared->mm;
-        rcu_read_lock();
-        int covered = mm && mm_vma_find(mm, frame_base - 8) &&
-                      mm_vma_find(mm, frame_base + sizeof(k_rt_sigframe_t) - 1);
-        rcu_read_unlock();
-        if (!covered) { signal_force_kill(sig, "rt VMA", user_rsp, frame_base); return -1; }
-    }
-
+    // Build the frame in a kernel-local buffer, then publish it to the user
+    // stack via copy_to_user.  copy_to_user is fault-safe (fault-fixup table):
+    // a bad or racing user stack page -- e.g. a sibling thread munmap'd it
+    // during process teardown -- returns -EFAULT here instead of taking an
+    // unrecoverable kernel #PF.  A dying or hostile process can therefore never
+    // panic the kernel by making its signal frame land on an unmapped page.
+    // `rf` is used ONLY for address arithmetic (the user-visible addresses of
+    // the embedded siginfo/ucontext/fpstate); it is never dereferenced.
     k_rt_sigframe_t* rf = (k_rt_sigframe_t*)frame_base;
+    k_rt_sigframe_t kf;
+    __builtin_memset(&kf, 0, sizeof(kf));
     uint64_t fault = g_current->sigstate.fault_addr;
 
     // siginfo
-    rf->info.si_signo  = sig;
-    rf->info.si_errno  = 0;
-    rf->info.si_code   = g_current->sigstate.fault_si_code;  // fault code, or 0 (SI_USER)
-    rf->info.si_pid    = 0;
-    rf->info.si_uid    = 0;
-    rf->info.si_status = 0;
-    rf->info.si_addr   = (sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE ||
-                          sig == SIGILL || sig == SIGTRAP)
-                         ? (void*)fault : (void*)0;
-    rf->info.si_value  = 0;
+    kf.info.si_signo  = sig;
+    kf.info.si_errno  = 0;
+    kf.info.si_code   = g_current->sigstate.fault_si_code;  // fault code, or 0 (SI_USER)
+    kf.info.si_pid    = 0;
+    kf.info.si_uid    = 0;
+    kf.info.si_status = 0;
+    kf.info.si_addr   = (sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE ||
+                         sig == SIGILL || sig == SIGTRAP)
+                        ? (void*)fault : (void*)0;
+    kf.info.si_value  = 0;
 
     // ucontext
-    rf->uc.uc_flags = 0;
-    rf->uc.uc_link  = 0;
-    rf->uc.uc_stack.ss_sp = 0; rf->uc.uc_stack.ss_flags = 2 /*SS_DISABLE*/;
-    rf->uc.uc_stack.ss_size = 0;
-    long long* g = rf->uc.uc_mcontext.gregs;
+    kf.uc.uc_flags = 0;
+    kf.uc.uc_link  = 0;
+    kf.uc.uc_stack.ss_sp = 0; kf.uc.uc_stack.ss_flags = 2 /*SS_DISABLE*/;
+    kf.uc.uc_stack.ss_size = 0;
+    long long* g = kf.uc.uc_mcontext.gregs;
     g[KREG_RIP] = (long long)src->rip;
     g[KREG_RSP] = (long long)user_rsp;
     g[KREG_EFL] = (long long)src->rflags;
@@ -345,11 +345,23 @@ static int build_rt_frame(int sig, k_sigaction_t* ka,
     g[KREG_RCX] = (long long)src->rcx; g[KREG_R11] = (long long)src->r11;
     g[KREG_CR2] = (long long)fault;
     g[KREG_CSGSFS] = 0; g[KREG_ERR] = 0; g[KREG_TRAPNO] = 0; g[KREG_OLDMASK] = 0;
-    rf->uc.uc_mcontext.fpregs = (void*)&rf->uc.__fpregs_mem;
-    __asm__ volatile("fxsave %0" : "=m"(rf->uc.__fpregs_mem));  // 16-aligned by construction
-    rf->uc.uc_sigmask = g_current->sigstate.blocked;
+    kf.uc.uc_mcontext.fpregs = (void*)&rf->uc.__fpregs_mem;  // USER address
+    // k_rt_sigframe_t carries no alignment on __fpregs_mem (it relied on the
+    // frame_base ≡ 8 (mod 16) user placement, which a kernel-stack copy does
+    // not reproduce).  fxsave requires a 16-byte-aligned target, so save into
+    // an aligned scratch buffer, then copy into the (possibly unaligned) field.
+    // Entry stubs keep RSP 16-aligned before calling C, so this local is valid.
+    _Alignas(16) uint8_t fpu_scratch[512];
+    __asm__ volatile("fxsave %0" : "=m"(fpu_scratch));
+    __builtin_memcpy(kf.uc.__fpregs_mem, fpu_scratch, sizeof(fpu_scratch));
+    kf.uc.uc_sigmask = g_current->sigstate.blocked;
 
-    rf->pretcode = ka->sa_restorer;      // handler's return address -> restorer -> sigreturn
+    kf.pretcode = ka->sa_restorer;       // handler's return address -> restorer -> sigreturn
+
+    extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
+    if (copy_to_user((void*)frame_base, &kf, sizeof(kf)) != 0) {
+        signal_force_kill(sig, "rt COPY", user_rsp, frame_base); return -1;
+    }
 
     g_current->sigstate.sigframe_rsp  = frame_base;
     g_current->sigstate.siginfo_frame = 1;
@@ -404,52 +416,62 @@ static int build_simple_frame(int sig, k_sigaction_t* ka,
         signal_force_kill(sig, "setup_frame HANDLER", user_rsp, frame_base); return -1;
     }
 
-    // Defense in depth: the canonical-range check above cannot tell a
-    // VALID-but-unmapped address from a mapped one — and a kernel-mode write to
-    // a user address with NO covering VMA is an unrecoverable #PF (panic), not
-    // a demand-page.  Require the whole frame window to be VMA-covered; demand
-    // paging handles not-yet-present pages.  mm_vma_find is an RCU reader walk
-    // and REQUIRES rcu_read_lock for the walk's duration.
-    {
-        extern vma_t* mm_vma_find(mm_t*, virt_addr_t);
-        mm_t* mm = g_current->mm_shared->mm;
-        rcu_read_lock();
-        int covered = mm && mm_vma_find(mm, frame_base - 8) &&
-                      mm_vma_find(mm, frame_base + sizeof(sigframe_t) - 1);
-        rcu_read_unlock();
-        if (!covered) {
-            signal_force_kill(sig, "setup_frame VMA", user_rsp, frame_base); return -1;
-        }
-    }
+    // Build the frame in a kernel-local buffer and publish it with the
+    // fault-safe copy_to_user, exactly as build_rt_frame does: a VALID-but-
+    // unmapped or racing user stack page returns -EFAULT here instead of an
+    // unrecoverable kernel #PF, so userland can never panic the kernel with a
+    // bad signal-frame address.  (This replaces the old mm_vma_find pre-check,
+    // which had a TOCTOU race: a sibling thread could munmap the stack between
+    // the check and the raw write.)
+    sigframe_t sf;
+    __builtin_memset(&sf, 0, sizeof(sf));
 
-    sigframe_t* frame = (sigframe_t*)frame_base;
-
-    frame->rip    = src->rip;
-    frame->rsp    = user_rsp;
-    frame->rflags = src->rflags;
-    frame->rbp    = src->rbp;
-    frame->rbx    = src->rbx;
-    frame->r12    = src->r12;
-    frame->r13    = src->r13;
-    frame->r14    = src->r14;
-    frame->r15    = src->r15;
+    sf.rip    = src->rip;
+    sf.rsp    = user_rsp;
+    sf.rflags = src->rflags;
+    sf.rbp    = src->rbp;
+    sf.rbx    = src->rbx;
+    sf.r12    = src->r12;
+    sf.r13    = src->r13;
+    sf.r14    = src->r14;
+    sf.r15    = src->r15;
     // Caller-saved arg registers — the handler will clobber them; saved here so
     // sigreturn can restore the interrupted code's exact register state.
-    frame->rdi    = src->rdi;
-    frame->rsi    = src->rsi;
-    frame->rdx    = src->rdx;
-    frame->r10    = src->r10;
-    frame->r8     = src->r8;
-    frame->r9     = src->r9;
-    frame->rax    = src->rax;
-    frame->blocked = g_current->sigstate.blocked;
-    frame->_pad   = 0;
+    sf.rdi    = src->rdi;
+    sf.rsi    = src->rsi;
+    sf.rdx    = src->rdx;
+    sf.r10    = src->r10;
+    sf.r8     = src->r8;
+    sf.r9     = src->r9;
+    sf.rax    = src->rax;
+    sf.blocked = g_current->sigstate.blocked;
+    sf._pad   = 0;
 
     // Save the interrupted FPU/SSE state.  g_current is running and the kernel
     // is -mno-sse, so its FPU registers still hold the user's live state; the
     // handler about to run will clobber them.  fxrstor in sys_sigreturn puts
-    // them back.  Target is 16-byte aligned (frame_base & ~0xF, fpu aligned(16)).
-    __asm__ volatile("fxsave %0" : "=m"(frame->fpu));
+    // them back.  fxsave REQUIRES a 16-byte-aligned target or it #GPs -- save
+    // into an explicitly-aligned scratch and copy into the frame, exactly like
+    // build_rt_frame does.  fxsave'ing straight into sf.fpu (relying on the
+    // struct field's aligned(16) attribute) #GP'd the kernel when a vfork'd `sh`
+    // took a signal via this legacy (non-SA_SIGINFO) path -- the field was not
+    // 16-aligned on the kernel stack in practice.
+    // The kernel entry stubs now keep RSP 16-byte aligned (SysV ABI) before
+    // calling C, so a naturally/aligned stack local is a valid fxsave target.
+    _Alignas(16) uint8_t fpu_scratch[512];
+    __asm__ volatile("fxsave %0" : "=m"(fpu_scratch));
+    __builtin_memcpy(sf.fpu, fpu_scratch, sizeof(sf.fpu));
+
+    extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
+    // The restorer address is pushed at frame_base-8 (the handler's return
+    // address); publish it together in one shot by copying the frame first,
+    // then the restorer slot -- both fault-safe.
+    uint64_t new_rsp  = frame_base - 8;
+    uint64_t restorer = ka->sa_restorer;
+    if (copy_to_user((void*)frame_base, &sf, sizeof(sf)) != 0 ||
+        copy_to_user((void*)new_rsp, &restorer, sizeof(restorer)) != 0) {
+        signal_force_kill(sig, "setup_frame COPY", user_rsp, frame_base); return -1;
+    }
 
     g_current->sigstate.sigframe_rsp = frame_base;
 
@@ -457,10 +479,6 @@ static int build_simple_frame(int sig, k_sigaction_t* ka,
     // cross-CPU signal_send (SIGKILL unblock) can't lose these via a torn RMW.
     atomic_or(&g_current->sigstate.blocked, 1u << (uint32_t)(sig - 1));
     atomic_or(&g_current->sigstate.blocked, ka->sa_mask);
-
-    // Push restorer address as the "return address" for the handler.
-    uint64_t new_rsp = frame_base - 8;
-    *(uint64_t*)new_rsp = ka->sa_restorer;
 
     redir->rip    = ka->sa_handler;
     redir->rsp    = new_rsp;
