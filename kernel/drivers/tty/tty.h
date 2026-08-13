@@ -140,6 +140,11 @@ void tty_input_char(tty_t* tty, char c);
 // Each open() returns a fresh vfs_file_t pointing to the same tty_t.
 struct vfs_file_t* tty_open(int idx);  // idx 0 = tty0
 
+// Open the CALLING process's controlling terminal (/dev/tty).  Returns NULL
+// when the caller has no controlling terminal -- POSIX says /dev/tty is the
+// ctty indirection, never a fixed alias for the console.
+struct vfs_file_t* tty_open_ctty(void);
+
 // Current owner uid of `tty` (see tty_t::owner_uid).  NULL-safe.
 uint32_t tty_get_owner(tty_t* tty);
 

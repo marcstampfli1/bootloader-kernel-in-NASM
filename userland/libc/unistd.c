@@ -418,16 +418,32 @@ int execvpe(const char* path, char* const argv[], char* const envp[]) {
         (uint64_t)path, (uint64_t)argv, (uint64_t)envp));
 }
 
-// setsid — new session/process group.  MakaOS has no multi-session
-// model; report the current pid as the "new session id."
-pid_t setsid(void) { return getpid(); }
-
-int setpgid(pid_t pid, pid_t pgid) {
-    (void)pid; (void)pgid; return 0;
+// ── Sessions and process groups ─────────────────────────────────────
+// These are the extern symbols ports link against (libc.h has matching
+// static inlines for in-tree apps).  They used to be stubs -- setsid()
+// returned getpid() without leaving the session, setpgid() was a no-op
+// returning success, and the getters all reported getpid() -- on the
+// grounds that "MakaOS has no multi-session model".  It does now: a
+// spawned child stays in its parent's session and process group, so
+// every one of these has real work to do and a port that calls them
+// (a shell setting up job control, the JVM daemonising) must not be
+// told a comfortable lie.
+pid_t setsid(void) {
+    return (pid_t)__syscall_ret(syscall0(SYS_SETSID));
 }
-pid_t getpgid(pid_t pid) { (void)pid; return getpid(); }
-pid_t getpgrp(void)      { return getpid(); }
-pid_t getsid(pid_t pid)  { (void)pid; return getpid(); }
+int setpgid(pid_t pid, pid_t pgid) {
+    return (int)__syscall_ret(syscall2(SYS_SETPGID, (uint64_t)pid,
+                                       (uint64_t)pgid));
+}
+pid_t getpgid(pid_t pid) {
+    return (pid_t)__syscall_ret(syscall1(SYS_GETPGID, (uint64_t)pid));
+}
+pid_t getpgrp(void) {
+    return (pid_t)syscall0(SYS_GETPGRP);
+}
+pid_t getsid(pid_t pid) {
+    return (pid_t)__syscall_ret(syscall1(SYS_GETSID, (uint64_t)pid));
+}
 
 // kill — signal a pid.  SYS_KILL backs this.
 int kill(pid_t pid, int sig) {

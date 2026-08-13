@@ -531,13 +531,14 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
             while (dev[i] >= '0' && dev[i] <= '9') { n = n*10 + (dev[i]-'0'); i++; }
             if (dev[i] == '\0') match_ptsn = n;
         }
-        // /dev/tty aliases the console.  POSIX defines it as the caller's
-        // CONTROLLING terminal, which this cannot be yet -- spawn() gives every
-        // child its own session (elf.c sets t->sid = pid), so no process has a
-        // ctty and routing through tty_get_ctty() denies everyone.  The reason
-        // the alias is no longer a privilege hole is that /dev/tty is now 0620
-        // owned by the session's user, not 0666 (virtfs.c).
-        if      (match_tty)    f = tty_open(0);
+        // /dev/tty is the CALLER'S controlling terminal (POSIX), not a second
+        // hardcoded door onto the console -- as a 0666 alias for tty_open(0) it
+        // completely bypassed /dev/tty0's 0620.  Now that a spawned child stays
+        // in its parent's session (see sys_spawn), a login session's processes
+        // resolve this to the console they are actually on, and a process
+        // outside any session gets -ENXIO rather than the console.
+        if      (match_tty)  { f = tty_open_ctty();
+                               if (!f) return (uint64_t)-ENXIO; }
         else if (match_tty0)   f = tty_open(0);
         else if (match_kbdraw) f = vfs_kbdraw_open();
         else if (match_eventn >= 0) { extern vfs_file_t* evdev_open_device(uint32_t); f = evdev_open_device((uint32_t)match_eventn); }
@@ -1529,6 +1530,20 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
 
     // Wire parent-child relationship so waitpid works correctly.
     child->ppid = g_current->pid;
+
+    // POSIX: a spawned child stays in its parent's SESSION and process GROUP.
+    // Only setsid()/setpgid() may move it.  elf_exec_from_ext2 defaults a fresh
+    // task to sid = pgid = pid, which is right for the kernel-launched init
+    // tasks (they genuinely do start their own sessions) but wrong for every
+    // spawn from userland, and it had two consequences:
+    //   * no child ever shared login's session, so NOTHING on the system had a
+    //     controlling terminal and /dev/tty could not resolve to one;
+    //   * setsid() always failed -EPERM, because its "already a process group
+    //     leader" guard is pid == pgid and that was true for every task.
+    // Set before sched_add(): task_idx_insert() indexes the task by pgid/sid,
+    // so these must be final before it is published.
+    child->sid  = g_current->sid;
+    child->pgid = g_current->pgid;
 
     // ── Apply spawn_attr if provided ──────────────────────────────────────
     // `a` was read + pre-validated above (single read -> no TOCTOU); apply it

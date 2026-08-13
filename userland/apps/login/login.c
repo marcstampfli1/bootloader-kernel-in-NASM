@@ -195,11 +195,11 @@ static int start_session(passwd_entry_t* pw, const char* username,
     // Root-only ioctl, so it must happen BEFORE we hand out credentials.
     ioctl(0, TIOCSCONSOWN, (void*)(uint64_t)pw->uid);
 
-    // NOTE: no TIOCSCTTY here.  Claiming the console as this session's
-    // controlling terminal would be the POSIX thing to do, but it buys nothing
-    // while spawn() gives every child its own session id (kernel elf.c sets
-    // t->sid = pid), so the session's own shell would not share our sid anyway.
-    // Terminal access is gated by ownership above, not by the ctty relation.
+    // Claim the console as this session's controlling terminal.  The session
+    // child inherits our sid (spawn keeps a child in its parent's session), so
+    // it and its descendants resolve /dev/tty to this console; a process that
+    // is not in our session resolves nothing and gets -ENXIO.
+    ioctl(0, TIOCSCTTY, (void*)0);
 
     // ── Change to home directory ─────────────────────────────────────
     if (chdir(pw->home) < 0) {
@@ -287,6 +287,14 @@ static int start_session(passwd_entry_t* pw, const char* username,
     int status = 0;
     waitpid(pid, &status, 0);
 
+    // Reclaim the foreground process group.  A shell that sets up job control
+    // puts itself in its own group and calls tcsetpgrp(), which leaves US in
+    // the background -- and a background read on the controlling terminal
+    // returns -EINTR (after SIGTTIN), so the next login prompt could never read
+    // a keystroke.  Job control only became reachable once sessions were
+    // inherited, so this could not bite before.
+    tcsetpgrp(0, getpgrp());
+
     // Session over: take the terminal back and revoke every fd the session
     // left behind, so nothing it spawned can keep reading the console.
     ioctl(0, TIOCSCONSOWN, (void*)0);
@@ -295,7 +303,24 @@ static int start_session(passwd_entry_t* pw, const char* username,
 
 // ── Main ──────────────────────────────────────────────────────────────────
 
+// Ignore the job-control signals the terminal generates.  The session child
+// inherits our process group, so a Ctrl-C / Ctrl-\ / Ctrl-Z at the console is
+// delivered to the whole group -- us included.  Real login and getty ignore
+// these for exactly this reason: the shell handles them, and the thing that
+// owns the console must not be killed by a keystroke typed into it.
+static void ignore_job_control_signals(void) {
+    struct_sigaction sa;
+    int i;
+    const int sigs[] = { SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU };
+    for (i = 0; i < 5; i++) {
+        __builtin_memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_IGN;
+        sigaction(sigs[i], &sa, (struct_sigaction*)0);
+    }
+}
+
 int main(void) {
+    ignore_job_control_signals();
     ioctl(0, TCFLSH, (void*)0);  // flush stale input (phantom keystrokes from BIOS/UEFI)
     write(1, "\f", 1);  // clear screen on entry
 

@@ -486,15 +486,11 @@ vfs_file_t* tty_open(int idx) {
 // /dev/tty -- POSIX: the caller's CONTROLLING terminal, not "the console".
 // This used to be `tty_open(0)`, i.e. a second, world-accessible (0666) door
 // onto /dev/tty0 (0620 root) -- so the tty0 permission bits meant nothing.
-// NOTE: /dev/tty is POSIX-defined as the caller's CONTROLLING terminal, which
-// would be `tty_open_tty(tty_get_ctty())`.  That is not wired up yet, and it
-// cannot be until spawn() stops handing every child its own session: elf.c
-// gives a newly exec'd task `t->sid = pid` (see elf.c, "t->sid = pid"), so a
-// login session's child never inherits login's sid and NO process on the system
-// has a controlling terminal -- routing /dev/tty through tty_get_ctty() makes
-// it fail with -ENXIO for everyone (measured).  Until sessions are inherited,
-// /dev/tty stays an alias for the console; what makes that safe now is that the
-// node is 0620 owned by the session's user (see virtfs.c) rather than 0666.
+// /dev/tty -- POSIX: the caller's CONTROLLING terminal, never a fixed alias for
+// the console.  Returns NULL (open reports -ENXIO) when the caller has no ctty.
+vfs_file_t* tty_open_ctty(void) {
+    return tty_open_tty(tty_get_ctty());
+}
 
 tty_t* tty_console(void) { return &g_tty0; }
 
