@@ -7,6 +7,7 @@
 #include "smp.h"
 #include "seqlock.h"
 #include "rcu.h"
+#include "cred.h"      // cred_t: a new inode is stamped with its creator's uid/gid
 #include "checked.h"   // index_ok / ckd_add_u32: bounded-index + overflow-safe add
 #include "dcache.h"    // Phase 7: cached path-component lookups +
                        // invalidation hooks at every mutation site
@@ -2590,7 +2591,12 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size,
         if (ok) {
             work.i_size        = size;
             work.i_blocks      = n_blocks * (s_block_size / 512);
-            work.i_mode        = EXT2_S_IFREG | 0644;
+            // Overwriting an EXISTING file must not re-stamp its mode: doing so
+            // silently widened every rewritten file to 0644 (a 0600 /etc/shadow
+            // became world-readable the first time anything rewrote it).  Only
+            // fill the mode in if it is not already a regular file.
+            if ((work.i_mode & 0xF000) != EXT2_S_IFREG)
+                work.i_mode    = EXT2_S_IFREG | 0644;
             work.i_links_count = 1;
             inode_pub_begin(leaf);
             leaf->inode = work;          // commit to the cache only on success
@@ -2613,6 +2619,17 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size,
     new_inode.i_mode        = EXT2_S_IFREG | 0644;
     new_inode.i_links_count = 1;
     new_inode.i_size        = size;
+    // A new file belongs to whoever CREATED it.  The inode is zeroed above, so
+    // without this every file created by any user came out uid=0/gid=0 (owned
+    // by root) -- invisible while fs_lookup ignored file permissions, but the
+    // moment that gate became real it would have left unprivileged processes
+    // unable to write back the files they had just created (e.g. in /tmp).
+    // A NULL cred is an internal kernel write and stays uid/gid 0.
+    if (cred) {
+        const cred_t* cc = (const cred_t*)cred;
+        new_inode.i_uid = (uint16_t)cc->euid;
+        new_inode.i_gid = (uint16_t)cc->egid;
+    }
 
     uint32_t n_blocks = (size + s_block_size - 1) / s_block_size;
     uint32_t written  = 0;
@@ -2754,9 +2771,10 @@ int ext2_truncate_to(const char* path, uint64_t length) {
 // Permission-aware path walk.  Checks execute (search) on every directory
 // component traversed.  Uses the same walk as path_to_inode internally.
 // cred is a const cred_t* — typed as void* to avoid the ext2.h → cred.h
-// dependency (cred.h is a security layer header, not an fs header).
+// dependency (cred.h is a security layer header, not an fs header).  The
+// headers themselves are pulled in at the top of this file, since the write
+// path also needs cred_t (to stamp a new inode's owner).
 #include "perm.h"
-#include "cred.h"
 #include "errno.h"
 
 // ── ext2_dir_write_ok ───────────────────────────────────────────────────────

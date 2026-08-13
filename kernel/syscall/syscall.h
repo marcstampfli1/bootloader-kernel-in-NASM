@@ -289,6 +289,11 @@ typedef struct {
 #define TIOCGPTN    0x80045430  // get pty number
 #define TIOCSPTLCK  0x40045431  // lock/unlock pty
 #define TIOCGSERIAL 0x541E   // get serial info (stub)
+// MakaOS private: hand the terminal to a uid for the duration of one login
+// session, and REVOKE every fd opened under the previous owner (vhangup).
+// Root only.  `arg` is the new owner uid; 0 returns it to root.  This is what
+// lets /dev/tty0 + /dev/tty belong to the logged-in user and to nobody else.
+#define TIOCSCONSOWN 0x54F0  // set console owner uid + revoke stale fds
 #define TIOCSTI     0x5412   // insert char into input queue
 
 // ── termios c_iflag bits ──────────────────────────────────────────────────

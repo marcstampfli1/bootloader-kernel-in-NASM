@@ -590,7 +590,55 @@ typedef struct drm_client {
     uint32_t     virgl_ctx_id;         // device-global 3D context; 0 = uninit
     drm_res3d_t* res3d;                // O(1) handle-indexed array (grows)
     uint32_t     res3d_cap;            // allocated slot count
+    // 1 = this fd came from /dev/dri/renderD128 (minor 128), the RENDER node.
+    // Render nodes are deliberately world-openable (0666); the privilege
+    // boundary is the ioctl allowlist, not the file mode -- see
+    // drm_render_ioctl_allowed().
+    uint8_t      is_render;
 } drm_client_t;
+
+// ── Render-node ioctl allowlist ───────────────────────────────────────────
+//
+// /dev/dri/renderD128 is mode 0666 -- ANY user can open it, which is correct
+// and matches Linux (that is what a render node is for).  What makes that safe
+// on Linux is that a render fd only accepts the DRM_RENDER_ALLOW subset of the
+// uAPI: buffer/GPU-context management, never display control.  This kernel
+// routed BOTH nodes to the same drm_ioctl() and consulted the minor nowhere, so
+// an unprivileged process could open the render node and then drive KMS --
+// SET_MASTER, MODE_SETCRTC, MODE_PAGE_FLIP, MODE_ATOMIC -- i.e. take over the
+// scanout (spoof the console, hide or replace what the user sees), and use
+// MODE_MAP_DUMB to get an mmap offset for a KMS buffer it never should reach.
+// /dev/dri/card0 stays 0660 root:root and keeps the full uAPI.
+//
+// Fail closed: this is an ALLOWLIST.  A newly added ioctl is denied on render
+// nodes until someone deliberately lists it here.
+static int drm_render_ioctl_allowed(uint64_t req) {
+    switch (req) {
+    // Generic, information-only or per-fd state.
+    case DRM_IOCTL_VERSION:
+    case DRM_IOCTL_GET_CAP:
+    case DRM_IOCTL_SET_CLIENT_CAP:
+    // GEM handle lifetime + buffer sharing (this is a render fd's whole job).
+    case DRM_IOCTL_GEM_CLOSE:
+    case DRM_IOCTL_PRIME_HANDLE_TO_FD:
+    case DRM_IOCTL_PRIME_FD_TO_HANDLE:
+    // virtio-gpu 3D (virgl) uAPI -- the render node's reason to exist.
+    case DRM_IOCTL_VIRTGPU_GETPARAM:
+    case DRM_IOCTL_VIRTGPU_GET_CAPS:
+    case DRM_IOCTL_VIRTGPU_CONTEXT_INIT:
+    case DRM_IOCTL_VIRTGPU_RESOURCE_CREATE:
+    case DRM_IOCTL_VIRTGPU_RESOURCE_INFO:
+    case DRM_IOCTL_VIRTGPU_MAP:
+    case DRM_IOCTL_VIRTGPU_EXECBUFFER:
+    case DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST:
+    case DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST:
+    case DRM_IOCTL_VIRTGPU_WAIT:
+    case DRM_IOCTL_MAKA_PIN_LIMIT:
+        return 1;
+    default:
+        return 0;   // everything modeset / master / dumb / auth: primary only
+    }
+}
 
 // Device-global resource id allocator.  Never returns 0 (reserved).
 // Start above the IDs the virtio-gpu scanout test reserves (res=1 for the
@@ -3568,6 +3616,17 @@ static int drm_ioctl_maka_pin_limit(vfs_file_t* f, uint64_t arg) {
 
 // ── ioctl dispatch ──────────────────────────────────────────────────
 static int64_t drm_ioctl_impl(vfs_file_t* self, uint64_t req, uint64_t arg) {
+    // Render-node gate, BEFORE the dispatch: a renderD128 fd only carries the
+    // DRM_RENDER_ALLOW subset.  Without this an unprivileged process could open
+    // the world-readable render node and drive KMS through it.
+    {
+        drm_client_t* rc_cl = self ? (drm_client_t*)self->ctx : NULL;
+        if (rc_cl && rc_cl->is_render && !drm_render_ioctl_allowed(req)) {
+            pr_warn("drm", "render-node fd denied ioctl %s req=0x%08x",
+                    drm_ioctl_name(req), (uint32_t)req);
+            return -EACCES;
+        }
+    }
     switch (req) {
     case DRM_IOCTL_VERSION:           return drm_ioctl_version(arg);
     case DRM_IOCTL_GET_CAP:           return drm_ioctl_get_cap(arg);
@@ -3720,6 +3779,7 @@ static vfs_file_t* vfs_drm_open_minor(uint32_t minor) {
     __builtin_memset(c, 0, sizeof(*c));
     c->next_handle  = 1;
     c->next_fb_id        = 1;
+    c->is_render         = (minor == 128);   // renderD128 -> DRM_RENDER_ALLOW only
 
     vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired (poll-ready), refcount=1
     if (!f) { kfree(c); return NULL; }

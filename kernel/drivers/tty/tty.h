@@ -47,6 +47,22 @@ typedef struct tty_t {
     // ── Session this tty is the controlling terminal of ──────────────────
     uint32_t session;
 
+    // ── Session ownership of the terminal device ─────────────────────────
+    // owner_uid is the uid currently entitled to read/write this terminal --
+    // the classic Unix "login chowns the tty to whoever is logged in".  The
+    // /dev node's permission check resolves its uid from here instead of from
+    // a fixed table entry, so a terminal belongs to the user whose session is
+    // on it and to nobody else.  0 (root) when no user session is active.
+    //
+    // gen is bumped every time ownership changes.  Every open fd remembers the
+    // gen it was opened at, and any read/write/poll on a stale fd fails -EIO --
+    // this is vhangup(2): revoking the DEVICE alone is not enough, because a
+    // process that opened the terminal during the previous session would
+    // otherwise keep a live fd and could go on reading the next user's
+    // keystrokes (their password at the login prompt).
+    uint32_t owner_uid;
+    uint32_t gen;
+
     // ── Line-discipline lock ─────────────────────────────────────────────
     // Serializes every mutation of the read ring (read_buf/rd_head/rd_tail)
     // and the canonical accumulation (line_buf/line_len).  These are touched
@@ -123,6 +139,24 @@ void tty_input_char(tty_t* tty, char c);
 // Open /dev/tty or /dev/ttyN → returns a vfs_file_t backed by the tty.
 // Each open() returns a fresh vfs_file_t pointing to the same tty_t.
 struct vfs_file_t* tty_open(int idx);  // idx 0 = tty0
+
+// Current owner uid of `tty` (see tty_t::owner_uid).  NULL-safe.
+uint32_t tty_get_owner(tty_t* tty);
+
+// Hand the terminal to `uid` (0 = back to root) and REVOKE every fd that was
+// opened under the previous owner (bumps tty_t::gen).  Root-only at the
+// syscall boundary.
+void tty_set_owner(tty_t* tty, uint32_t uid);
+
+// Re-stamp `f`'s generation to the tty's current one.  Used by the fd that
+// performed the ownership change so it does not revoke itself.
+void tty_fd_resync(struct vfs_file_t* f);
+
+// 1 iff `f` is an open handle on `tty`.
+int tty_file_is(struct vfs_file_t* f, tty_t* tty);
+
+// The physical console tty (/dev/tty0).
+tty_t* tty_console(void);
 
 // Get the tty that is the controlling terminal of the calling process.
 // Returns NULL if the process has no controlling terminal.

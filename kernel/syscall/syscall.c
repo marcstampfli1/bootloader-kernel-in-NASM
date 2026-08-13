@@ -407,10 +407,17 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
     // ── Permission check + existence test via unified fs_lookup ──────────
     // Covers both virtfs (/proc, /dev) and ext2 in one call.
     // fsn.inode_nr is the already-resolved ext2 inode — no second lookup needed.
-    uint8_t open_need = ACL_PERM_READ;
+    // POSIX: the access mode alone decides what is required.  O_WRONLY must
+    // NOT demand read permission (a 0222 file is legitimately write-only), and
+    // O_RDONLY must not demand write.  This was previously "READ, plus WRITE
+    // when writing", which is only harmless while the ext2 side of fs_lookup
+    // ignores `need` entirely -- it does not any more.
+    uint8_t open_need;
     {
         int oflags_acc = (int)(flags & 3);
-        if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR) open_need |= ACL_PERM_WRITE;
+        if      (oflags_acc == O_WRONLY) open_need = ACL_PERM_WRITE;
+        else if (oflags_acc == O_RDWR)   open_need = ACL_PERM_READ | ACL_PERM_WRITE;
+        else                             open_need = ACL_PERM_READ;
     }
     fs_node_t fsn;
     int fsr = fs_lookup(path, &g_current->cred, open_need, &fsn);
@@ -493,6 +500,12 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
             while (dev[i] >= '0' && dev[i] <= '9') { n = n*10 + (dev[i]-'0'); i++; }
             if (dev[i] == '\0') match_ptsn = n;
         }
+        // /dev/tty aliases the console.  POSIX defines it as the caller's
+        // CONTROLLING terminal, which this cannot be yet -- spawn() gives every
+        // child its own session (elf.c sets t->sid = pid), so no process has a
+        // ctty and routing through tty_get_ctty() denies everyone.  The reason
+        // the alias is no longer a privilege hole is that /dev/tty is now 0620
+        // owned by the session's user, not 0666 (virtfs.c).
         if      (match_tty)    f = tty_open(0);
         else if (match_tty0)   f = tty_open(0);
         else if (match_kbdraw) f = vfs_kbdraw_open();
@@ -4774,6 +4787,25 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
     case TIOCSCTTY:
         tty_set_ctty(tty);
         return 0;
+    case TIOCSCONSOWN: {
+        // Session handover: only root (login) may re-own the terminal.
+        if (!cred_is_root(&g_current->cred)) return (uint64_t)-EPERM;
+        tty_set_owner(tty, (uint32_t)arg);
+        // tty_set_owner revoked EVERY fd on this tty, including the caller's
+        // own console handles.  The caller IS the session manager, so re-validate
+        // its handles -- otherwise login would hang up on itself and could never
+        // print the next prompt.
+        task_files_t* tfo = g_current->files_shared;
+        if (tfo) {
+            spin_lock(&tfo->lock);
+            for (uint32_t i = 0; i < tfo->ft->cap; i++) {
+                vfs_file_t* cf = tfo->ft->fd_table[i];
+                if (cf && tty_file_is(cf, tty)) tty_fd_resync(cf);
+            }
+            spin_unlock(&tfo->lock);
+        }
+        return 0;
+    }
     case TIOCGSERIAL: {
         // Stub: report an all-zero serial_struct (60 bytes).  arg is a raw user
         // pointer -- a raw memset here was an arbitrary-kernel-address 60-byte
@@ -6137,6 +6169,12 @@ static uint64_t w_sys_tcsetpgrp(uint64_t a, uint64_t b, uint64_t c, uint64_t d) 
 }
 static uint64_t w_sys_reboot(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)a; (void)b; (void)c; (void)d;
+    // Resetting the machine is privileged (Linux gates it on CAP_SYS_BOOT).
+    // Unguarded, any unprivileged process could reset the box on demand -- a
+    // denial of service on its own, and the second stage of the /etc/passwd
+    // escalation chain (tamper with the user database, then reboot to make
+    // login re-read it).
+    if (!g_current || !cred_is_root(&g_current->cred)) return (uint64_t)-EPERM;
     outb(0x64, 0xFE);
     for (;;) __asm__ volatile("cli; hlt");
     return 0;

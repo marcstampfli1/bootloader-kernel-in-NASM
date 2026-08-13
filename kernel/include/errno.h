@@ -9,6 +9,8 @@
 #define ESRCH        3   // No such process
 #define EINTR        4   // Interrupted system call
 #define EIO          5   // I/O error
+#define ENXIO        6   // No such device or address (POSIX: open("/dev/tty")
+                         // when the caller has no controlling terminal)
 #define ENOEXEC      8   // Exec format error
 #define ENODEV       19  // No such device
 #define EBADF        9   // Bad file descriptor

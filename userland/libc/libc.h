@@ -1190,6 +1190,9 @@ typedef struct termios {
 #define TIOCEXCL    0x540C
 #define TIOCNXCL    0x540D
 #define TIOCSCTTY   0x540E
+// Root-only: give the console to a uid for one login session and revoke every
+// fd opened under the previous owner (see kernel/syscall/syscall.h).
+#define TIOCSCONSOWN 0x54F0
 
 typedef struct winsize {
     uint16_t ws_row;

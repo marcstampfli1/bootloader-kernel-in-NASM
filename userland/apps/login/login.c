@@ -186,12 +186,20 @@ static int read_password(char* buf, int max) {
 // status, or -1 if it could not be spawned.
 static int start_session(passwd_entry_t* pw, const char* username,
                          const char* cmd_override) {
-    // ── Credentials drop ────────────────────────────────────────────
-    // Order matters: setgid BEFORE setuid (once uid != 0 we may lose
-    // the ability to setgid to arbitrary groups).
-    setgid(pw->gid);
-    setgroups(0, (uint32_t*)0);   // clear supplemental groups
-    setuid(pw->uid);
+    // ── Terminal ownership for THIS session ─────────────────────────
+    // Hand /dev/tty0 (and therefore /dev/tty) to the user who is logging in,
+    // and revoke every fd another session left open on it.  Without this the
+    // console belonged permanently to root while /dev/tty was world-open, so
+    // any user's leftover background process could read the console -- i.e.
+    // the next person's keystrokes, root's password included.
+    // Root-only ioctl, so it must happen BEFORE we hand out credentials.
+    ioctl(0, TIOCSCONSOWN, (void*)(uint64_t)pw->uid);
+
+    // NOTE: no TIOCSCTTY here.  Claiming the console as this session's
+    // controlling terminal would be the POSIX thing to do, but it buys nothing
+    // while spawn() gives every child its own session id (kernel elf.c sets
+    // t->sid = pid), so the session's own shell would not share our sid anyway.
+    // Terminal access is gated by ownership above, not by the ctty relation.
 
     // ── Change to home directory ─────────────────────────────────────
     if (chdir(pw->home) < 0) {
@@ -254,15 +262,34 @@ static int start_session(passwd_entry_t* pw, const char* username,
     const char* prog = cmd_override ? cmd_override : pw->shell;
     const char* sh_argv[] = { prog, (char*)0 };
     int inherit_stdio[3] = { -1, -1, -1 };
-    int pid = spawn(prog, sh_argv, shell_env, inherit_stdio, NULL);
+
+    // Apply the user's credentials to the CHILD, not to ourselves.  login used
+    // to call setgid/setuid on its own process and then spawn; that is a one-way
+    // door -- after the first non-root session login was permanently uid 1000,
+    // so it could no longer read /etc/shadow (making every later login fall into
+    // the "no shadow entry" branch) nor setuid(0) for a root login, and it never
+    // checked those calls for failure.  spawn() applies uid/gid atomically to the
+    // child while login stays root and stays able to manage the next session.
+    spawn_attr_t at;
+    __builtin_memset(&at, 0, sizeof(at));
+    at.flags = SPAWN_ATTR_CRED;
+    at.uid   = pw->uid;
+    at.gid   = pw->gid;
+
+    int pid = spawn(prog, sh_argv, shell_env, inherit_stdio, &at);
     if (pid < 0) {
         write(1, "login: failed to exec session\n", 30);
+        ioctl(0, TIOCSCONSOWN, (void*)0);   // release the terminal again
         return -1;
     }
 
     // Wait for the session to exit.
     int status = 0;
     waitpid(pid, &status, 0);
+
+    // Session over: take the terminal back and revoke every fd the session
+    // left behind, so nothing it spawned can keep reading the console.
+    ioctl(0, TIOCSCONSOWN, (void*)0);
     return status;
 }
 
@@ -342,16 +369,17 @@ int main(void) {
             continue;
         }
 
-        // Check password.
+        // Check password.  FAIL CLOSED: a user with no /etc/shadow entry can
+        // never authenticate.  This used to fall through and admit them with no
+        // password "in case shadow is misconfigured" -- which is exactly the
+        // state login put itself in after one non-root session (it had dropped
+        // to that uid and could no longer read the 0600 shadow file), so the
+        // next prompt accepted ANY username with ANY password.
         shadow_entry_t* sh = find_shadow(username);
-        if (sh) {
-            if (s_strcmp(sh->password, password) != 0) {
-                write(1, "Login incorrect.\n", 17);
-                continue;
-            }
+        if (!sh || s_strcmp(sh->password, password) != 0) {
+            write(1, "Login incorrect.\n", 17);
+            continue;
         }
-        // If no shadow entry: allow login without password (not recommended,
-        // but lets root in even if shadow is misconfigured).
 
         // ── Start the user's session (shared with the auto-login path) ───
         start_session(pw, username, (const char*)0);

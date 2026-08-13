@@ -1,6 +1,8 @@
 #include "virtfs.h"
 #include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "acl.h"
+#include "perm.h"    // vfs_check_perm / inode_perm_t -- the one permission gate
+#include "tty.h"     // tty_get_owner/tty_console: /dev/tty[0] uid is dynamic
 #include "errno.h"
 #include "kstr.h"    // str_eq (shared string utils; was local s_streq)
 #include "ext2.h"
@@ -19,7 +21,11 @@ typedef struct {
 } dev_node_t;
 
 static const dev_node_t s_dev_nodes[] = {
-    { "tty",     0, 0, 0666, FS_TYPE_CHAR },
+    // /dev/tty is the caller's controlling terminal, so it gets the SAME
+    // protection as the device it resolves to -- it was 0666, a world-open
+    // second door onto the 0620 console.  uid is resolved dynamically from the
+    // tty's current owner (see virt_resolve), not from this table.
+    { "tty",     0, 0, 0620, FS_TYPE_CHAR },
     { "tty0",    0, 0, 0620, FS_TYPE_CHAR },  // owner+group rw, no other
     { "kbd",     0, 0, 0660, FS_TYPE_CHAR },
     { "kbdraw",  0, 0, 0660, FS_TYPE_CHAR },
@@ -136,6 +142,13 @@ static int virt_resolve(const char* path, const virtmount_t* m,
         *out_gid  = dn->gid;
         *out_mode = dn->mode;
         *out_type = dn->type;
+        // The console terminal is owned by whoever currently holds the session
+        // on it (classic "login chowns the tty"), not by a fixed table entry.
+        // Static root ownership plus a 0666 /dev/tty alias meant any user could
+        // read the console -- i.e. capture the next user's keystrokes, password
+        // included.  tty_set_owner() moves this and revokes stale fds.
+        if (str_eq(node_name, "tty0") || str_eq(node_name, "tty"))
+            *out_uid = tty_get_owner(tty_console());
         return 0;
     }
 
@@ -391,9 +404,31 @@ int fs_lookup(char* path, const cred_t* cred, uint8_t need,
     uint32_t ino = ext2_lookup_path(path, cred, &err);
     if (!ino) return err ? err : -ENOENT;
 
+    ext2_inode_t inode;
+    if (!ext2_read_inode(ino, &inode)) return -ENOENT;
+
+    // Enforce `need` on the RESOLVED OBJECT ITSELF.  ext2_lookup_path only
+    // walks the directory chain (ACL_PERM_EXEC per component), so before this
+    // check the caller's requested read/write access was never validated
+    // against the target inode at all: every ext2 file in a traversable
+    // directory was readable AND writable by every user, /etc/shadow and
+    // /etc/passwd included (a trivial local root).  virtfs_lookup already
+    // applies `need` to /dev and /proc nodes -- ext2 must match it, through
+    // the same vfs_check_perm primitive so the two cannot drift.
+    if (need) {
+        inode_perm_t ip = {
+            .uid      = inode.i_uid,
+            .gid      = inode.i_gid,
+            .mode     = (uint16_t)(inode.i_mode & 0x1FF),
+            .inode_nr = ino,
+            .dev      = 0,
+            .nosuid   = 0,
+        };
+        int pr = vfs_check_perm(&ip, cred, need);
+        if (pr != 0) return pr;
+    }
+
     if (out) {
-        ext2_inode_t inode;
-        if (!ext2_read_inode(ino, &inode)) return -ENOENT;
         int is_dir = ((inode.i_mode & 0xF000) == 0x4000);
         out->is_virtual = 0;
         out->type       = is_dir ? FS_TYPE_DIR : FS_TYPE_FILE;

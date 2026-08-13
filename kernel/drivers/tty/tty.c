@@ -351,12 +351,21 @@ uint64_t tty_ldisc_drain(tty_t* tty, uint8_t* out, uint64_t len) {
 // ── VFS operations for /dev/ttyN ─────────────────────────────────────────
 
 typedef struct {
-    tty_t* tty;
+    tty_t*   tty;
+    uint32_t gen;   // tty->gen at open time; mismatch == this fd was revoked
 } tty_ctx_t;
+
+// A revoked fd (its session's ownership of the terminal has ended) must not be
+// able to read the next user's input or write to their screen.  One predicate
+// so read/write/poll cannot drift.
+static inline int tty_fd_revoked(const tty_ctx_t* ctx) {
+    return ctx && ctx->tty && ctx->gen != ctx->tty->gen;
+}
 
 static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     tty_ctx_t* ctx = (tty_ctx_t*)self->ctx;
     tty_t* tty = ctx->tty;
+    if (tty_fd_revoked(ctx)) return -EIO;   // vhangup: this session is over
     if (!len) return 0;
 
     // POSIX: background process reading from its controlling tty → SIGTTIN.
@@ -399,6 +408,8 @@ static int64_t tty_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     tty_ctx_t* ctx = (tty_ctx_t*)self->ctx;
     tty_t* tty = ctx->tty;
     const uint8_t* src = (const uint8_t*)buf;
+    if (tty_fd_revoked(ctx)) return -EIO;   // vhangup: cannot paint on the
+                                            // next user's screen either
 
     // POSIX: background process writing to its controlling tty → SIGTTOU (if TOSTOP).
     if (tty_is_background(tty) && (tty->termios.c_lflag & TOSTOP)) {
@@ -436,19 +447,25 @@ static void tty_vfs_close(vfs_file_t* self) {
 static int tty_vfs_poll(vfs_file_t* self, int events) {
     tty_ctx_t* ctx = (tty_ctx_t*)self->ctx;
     tty_t* tty = ctx->tty;
+    // A revoked fd reports ready so a poll loop wakes immediately and then
+    // takes the -EIO from read/write, rather than blocking forever.
+    if (tty_fd_revoked(ctx)) return 1;
     if (events & 1 /*POLLIN*/)
         return !rb_empty(tty->rd_head, tty->rd_tail);
     return 1;
 }
 
 // ── tty_open ─────────────────────────────────────────────────────────────
-vfs_file_t* tty_open(int idx) {
-    if (idx != 0) return NULL;
-    tty_t* tty = &g_tty0;
+// Build a vfs_file_t for an arbitrary tty_t.  One opener for /dev/tty0 and
+// /dev/tty so the two cannot drift in what they wire up (they did: /dev/tty
+// used to be a hardcoded second door onto g_tty0).
+static vfs_file_t* tty_open_tty(tty_t* tty) {
+    if (!tty) return NULL;
 
     tty_ctx_t* ctx = kmalloc(sizeof(tty_ctx_t));
     if (!ctx) return NULL;
     ctx->tty = tty;
+    ctx->gen = tty->gen;   // this fd is valid for the CURRENT session only
 
     vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) { kfree(ctx); return NULL; }
@@ -459,6 +476,50 @@ vfs_file_t* tty_open(int idx) {
     f->ctx   = ctx;
     f->secondary_waitq = &tty->waitq;  // non-default: woken by ldisc when data arrives
     return f;
+}
+
+vfs_file_t* tty_open(int idx) {
+    if (idx != 0) return NULL;
+    return tty_open_tty(&g_tty0);
+}
+
+// /dev/tty -- POSIX: the caller's CONTROLLING terminal, not "the console".
+// This used to be `tty_open(0)`, i.e. a second, world-accessible (0666) door
+// onto /dev/tty0 (0620 root) -- so the tty0 permission bits meant nothing.
+// NOTE: /dev/tty is POSIX-defined as the caller's CONTROLLING terminal, which
+// would be `tty_open_tty(tty_get_ctty())`.  That is not wired up yet, and it
+// cannot be until spawn() stops handing every child its own session: elf.c
+// gives a newly exec'd task `t->sid = pid` (see elf.c, "t->sid = pid"), so a
+// login session's child never inherits login's sid and NO process on the system
+// has a controlling terminal -- routing /dev/tty through tty_get_ctty() makes
+// it fail with -ENXIO for everyone (measured).  Until sessions are inherited,
+// /dev/tty stays an alias for the console; what makes that safe now is that the
+// node is 0620 owned by the session's user (see virtfs.c) rather than 0666.
+
+tty_t* tty_console(void) { return &g_tty0; }
+
+uint32_t tty_get_owner(tty_t* tty) { return tty ? tty->owner_uid : 0; }
+
+void tty_set_owner(tty_t* tty, uint32_t uid) {
+    if (!tty) return;
+    tty->owner_uid = uid;
+    // Revoke every fd opened under the previous owner.  Handing the device to
+    // a new user while their predecessor still holds a working fd would leave
+    // the terminal readable by the wrong uid -- the keystroke-capture hole.
+    __atomic_add_fetch(&tty->gen, 1u, __ATOMIC_ACQ_REL);
+}
+
+// Is `f` an open handle on `tty`?  Identified by the read op, which only
+// tty_open_tty() installs -- no need to expose tty_ctx_t outside this file.
+int tty_file_is(vfs_file_t* f, tty_t* tty) {
+    if (!f || !tty || f->read != tty_vfs_read || !f->ctx) return 0;
+    return ((tty_ctx_t*)f->ctx)->tty == tty;
+}
+
+void tty_fd_resync(vfs_file_t* f) {
+    if (!f || !f->ctx) return;
+    tty_ctx_t* ctx = (tty_ctx_t*)f->ctx;
+    if (ctx->tty) ctx->gen = ctx->tty->gen;
 }
 
 // ── tty_get_ctty / tty_set_ctty ──────────────────────────────────────────
