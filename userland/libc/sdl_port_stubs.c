@@ -294,6 +294,15 @@ int feraiseexcept(int excepts)  { (void)excepts; return 0; }
 int fetestexcept(int excepts)   { (void)excepts; return 0; }
 int fegetround(void)            { return 0 /*FE_TONEAREST*/; }
 int fesetround(int round)       { (void)round; return 0; }
+// Full-environment ops (HotSpot's C1/C2 pull these in via <cfenv>). MakaOS runs
+// only the default round-to-nearest, non-stop FP environment, so save/restore
+// and hold/update are no-ops that report success.
+int fegetenv(void* envp)                   { (void)envp; return 0; }
+int fesetenv(const void* envp)             { (void)envp; return 0; }
+int fegetexceptflag(void* fp, int excepts) { (void)fp; (void)excepts; return 0; }
+int fesetexceptflag(const void* fp, int excepts) { (void)fp; (void)excepts; return 0; }
+int feholdexcept(void* envp)               { (void)envp; return 0; }
+int feupdateenv(const void* envp)          { (void)envp; return 0; }
 
 // iconv — MakaOS has no locale / charset conversion database yet.
 // iconv_open reports unsupported so callers fall back to UTF-8

@@ -39,6 +39,9 @@ char* program_invocation_short_name = _prog_name_default;
 // If the loader doesn't set it, default to an empty environment.
 static char* s_empty_env[] = { NULL };
 char** environ = s_empty_env;
+// glibc exposes the same array under __environ (environ is the weak alias there);
+// prebuilt .so's compiled against glibc import __environ. Same variable here.
+extern char** __environ __attribute__((alias("environ")));
 
 // __dso_handle identifies a module to __cxa_atexit for per-DSO destructor
 // registration. It is normally supplied by crtbeginS.o, but MakaOS builds
@@ -322,6 +325,14 @@ static void heap_lock(void) {
 static void heap_unlock(void) {
     __atomic_clear(&s_heap_lock_flag, __ATOMIC_RELEASE);
 }
+
+// fork() atfork hooks for the allocator lock.  A child forked while a SIBLING
+// thread held s_heap_lock_flag would inherit it LOCKED (the holder does not
+// exist in the child) and deadlock/abort on its first malloc.  fork() takes the
+// lock across the address-space copy (no thread can be mid-malloc) and resets it
+// unlocked in the child.  Not static: called from fork() in unistd.c.
+void __libc_malloc_atfork_lock(void)   { heap_lock(); }
+void __libc_malloc_atfork_unlock(void) { heap_unlock(); }
 
 static int heap_grow(size_t need) {
     size_t new_end = s_heap_end + need + 4096;
@@ -923,116 +934,15 @@ int putchar(int c) {
 // ── sscanf ────────────────────────────────────────────────────────────────
 // Minimal sscanf supporting %d, %u, %x, %s, %c, %ld, %lu, %lx, %%, [width].
 
+// sscanf: thin wrapper over the unified scanf engine (vsscanf -> scanf_core,
+// defined later in this file).  The former inline parser here lacked %[...]
+// scansets and field width, which broke HotSpot's -XX: flag parser; there is
+// now ONE scanf implementation so the two can never diverge again.
+int vsscanf(const char* str, const char* fmt, va_list ap);
 int sscanf(const char* str, const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    int count = 0;
-    const char* s = str;
-
-    while (*fmt) {
-        if (*fmt == '%') {
-            fmt++;
-            // Width modifier (ignored for now, we parse until whitespace/delimiter).
-            while (*fmt >= '0' && *fmt <= '9') fmt++;
-
-            int is_long = 0;
-            if (*fmt == 'l') {
-                is_long = 1; fmt++;
-                // 'll' (long long) -- consume the second 'l'.  On LP64 long and
-                // long long are both 64-bit, so is_long already selects the wide
-                // store/parse; the bug was leaving the 2nd 'l' unconsumed, which
-                // turned "%lld" into is_long + an unknown 'l' + a literal 'd', so
-                // the number never parsed. HotSpot's JLONG_FORMAT is "%lld"
-                // (int64_t == long long here), so every %lld sscanf hit this.
-                if (*fmt == 'l') fmt++;
-            }
-            if (*fmt == 'z' || *fmt == 'j' || *fmt == 't') { is_long = 1; fmt++; }  // size_t/intmax_t/ptrdiff_t
-            else if (*fmt == 'h') { fmt++; if (*fmt == 'h') fmt++; }                // short/char -> int
-
-            if (*fmt == '%') {
-                if (*s == '%') { s++; }
-                fmt++;
-                continue;
-            }
-            if (*fmt == 'c') {
-                char* dst = va_arg(ap, char*);
-                if (!*s) goto done;
-                *dst = *s++;
-                count++;
-                fmt++;
-                continue;
-            }
-            if (*fmt == 's') {
-                char* dst = va_arg(ap, char*);
-                // Skip leading whitespace.
-                while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-                if (!*s) goto done;
-                while (*s && *s != ' ' && *s != '\t' && *s != '\n')
-                    *dst++ = *s++;
-                *dst = '\0';
-                count++;
-                fmt++;
-                continue;
-            }
-            if (*fmt == 'd' || *fmt == 'i') {
-                // Skip whitespace.
-                while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-                if (!*s) goto done;
-                char* end;
-                long v = strtol(s, &end, 10);
-                if (end == s) goto done;
-                if (is_long) *va_arg(ap, long*)       = v;
-                else         *va_arg(ap, int*)         = (int)v;
-                s = end; count++; fmt++;
-                continue;
-            }
-            if (*fmt == 'u') {
-                while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-                if (!*s) goto done;
-                char* end;
-                long v = strtol(s, &end, 10);
-                if (end == s) goto done;
-                if (is_long) *va_arg(ap, unsigned long*)      = (unsigned long)v;
-                else         *va_arg(ap, unsigned int*)        = (unsigned int)v;
-                s = end; count++; fmt++;
-                continue;
-            }
-            if (*fmt == 'x' || *fmt == 'X') {
-                while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-                if (!*s) goto done;
-                char* end;
-                long v = strtol(s, &end, 16);
-                if (end == s) goto done;
-                if (is_long) *va_arg(ap, unsigned long*)      = (unsigned long)v;
-                else         *va_arg(ap, unsigned int*)        = (unsigned int)v;
-                s = end; count++; fmt++;
-                continue;
-            }
-            if (*fmt == 'n') {
-                // %n: store the count of input chars consumed so far. It does
-                // NOT consume input and does NOT count toward the return value.
-                // Omitting it (as before) left the caller's counter untouched --
-                // HotSpot's "sscanf(s, "%ld%n", ...)" then saw an unchanged -1
-                // and treated a perfectly-parsed default as a parse error.
-                if (is_long) *va_arg(ap, long*) = (long)(s - str);
-                else         *va_arg(ap, int*)  = (int)(s - str);
-                fmt++;
-                continue;
-            }
-            // Unknown specifier: skip.
-            fmt++;
-        } else if (*fmt == ' ' || *fmt == '\t' || *fmt == '\n') {
-            // Whitespace in format matches any amount of whitespace in input.
-            while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-            fmt++;
-        } else {
-            // Literal character match.
-            if (*s == *fmt) { s++; }
-            else break;
-            fmt++;
-        }
-    }
-done:
+    int count = vsscanf(str, fmt, ap);
     va_end(ap);
     return count;
 }
@@ -1486,6 +1396,26 @@ char* strcasestr(const char* haystack, const char* needle) {
         if (!*n) return (char*)haystack;
     }
     return NULL;
+}
+
+// C99 long-double parse. MakaOS has no extended-precision path; delegate to
+// strtod (double precision suffices for the callers that pull it in via libstdc++).
+long double strtold(const char* s, char** endptr) {
+    return (long double)strtod(s, endptr);
+}
+
+// C11 quick_exit / at_quick_exit. Rarely used; a small fixed registry suffices.
+static void (*s_quick_exit_fns[32])(void);
+static int s_quick_exit_n = 0;
+int at_quick_exit(void (*func)(void)) {
+    if (!func || s_quick_exit_n >= 32) return -1;
+    s_quick_exit_fns[s_quick_exit_n++] = func;
+    return 0;
+}
+void quick_exit(int status) {
+    for (int i = s_quick_exit_n; i-- > 0; ) s_quick_exit_fns[i]();
+    _exit(status);
+    for (;;) { }
 }
 
 double strtod(const char* s, char** endptr) {
@@ -2062,9 +1992,16 @@ long syscall(long n, ...) {
         // clock, so strip the flags it does not model, leaving a plain
         // FUTEX_WAIT/FUTEX_WAKE/etc. for the kernel.
         op &= ~(128 | 256);      // FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME
-        return (long)syscall4(114, (uint64_t)(uintptr_t)uaddr,
+        // Convert the raw kernel return (-errno) to the POSIX -1/errno
+        // convention via __syscall_ret, like every other libc syscall.
+        // Returning it raw handed callers -11 (-EAGAIN) / -4 (-EINTR) where
+        // they expected -1+errno: HotSpot's WaitBarrier does
+        // `s = syscall(SYS_futex,...); guarantee(s==0 || (s==-1 && errno==EAGAIN)
+        // || (s==-1 && errno==EINTR))` and aborted on s==-11 (not 0, not -1)
+        // with a stale errno ("futex FUTEX_WAIT failed: Unknown errno").
+        return __syscall_ret(syscall4(114, (uint64_t)(uintptr_t)uaddr,
                               (uint64_t)op, (uint64_t)(unsigned)val,
-                              (uint64_t)(uintptr_t)to);
+                              (uint64_t)(uintptr_t)to));
     }
     default:  errno = ENOSYS; return -1;
     }
@@ -2999,93 +2936,200 @@ FILE* tmpfile(void) {
     return 0;
 }
 
-// ── scanf family — minimal %d/%s/%u/%x/%lx/%ld — satisfies libinput. ─────
-// libinput-record parses trivially-formatted event dumps with scanf.
-// We don't need fancy conversion; only the primitives below.
+// ── scanf family — the single source of truth for sscanf/vsscanf ────────────
+// One correct, complete C99 scanf engine (scanf_core); sscanf and vsscanf both
+// route through it so the two can never drift.  Supports: assignment
+// suppression (%*), field width, length modifiers (h hh l ll j z t L q),
+// conversions d i u o x X p c s [ (scanset, incl. ^negation and leading ]),
+// floating (a e f g and caps), n, and %%.  The former hand-rolled parsers
+// lacked %[...] scansets and field width entirely, which silently broke
+// HotSpot's ENTIRE -XX: flag parser (arguments.cpp parse_argument builds every
+// flag match out of "%255[A-Za-z0-9_]" scansets) -- every -XX: option came back
+// "Improperly specified VM option".  libinput/libdrm/mesa also rely on it.
 static int scanf_core(const char** bufp, const char* fmt, va_list ap);
 int vsscanf(const char* buf, const char* fmt, va_list ap) {
     const char* b = buf;
     return scanf_core(&b, fmt, ap);
 }
+static int sc_is_ws(int c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
 static int scanf_core(const char** bufp, const char* fmt, va_list ap) {
     int matched = 0;
     const char* b = *bufp;
     const char* const start = *bufp;
+
     while (*fmt) {
-        if (*fmt == ' ' || *fmt == '\t' || *fmt == '\n') {
-            while (*b == ' ' || *b == '\t' || *b == '\n') b++;
+        unsigned char fc = (unsigned char)*fmt;
+
+        // Whitespace in the format matches any run (including none) of input ws.
+        if (sc_is_ws(fc)) {
+            while (sc_is_ws((unsigned char)*b)) b++;
             fmt++;
             continue;
         }
-        if (*fmt != '%') {
+        // Ordinary character: must match literally, else stop.
+        if (fc != '%') {
             if (*b != *fmt) break;
             b++; fmt++;
             continue;
         }
+
+        // ---- conversion: %[*][width][length]specifier ----
         fmt++;
-        int longflag = 0, llflag = 0;
-        while (*fmt == 'l') { longflag++; if (longflag == 2) llflag = 1; fmt++; }
-        while (*b == ' ' || *b == '\t' || *b == '\n') b++;
-        switch (*fmt) {
-        case 'd': {
-            int neg = 0;
-            if (*b == '-') { neg = 1; b++; } else if (*b == '+') b++;
-            if (*b < '0' || *b > '9') return matched;
-            long long v = 0;
-            while (*b >= '0' && *b <= '9') { v = v*10 + (*b - '0'); b++; }
-            if (neg) v = -v;
-            if (llflag)      *va_arg(ap, long long*) = v;
-            else if (longflag) *va_arg(ap, long*)    = (long)v;
-            else               *va_arg(ap, int*)     = (int)v;
-            matched++;
+        if (*fmt == '%') {                     // "%%" -> a literal percent
+            if (*b != '%') break;
+            b++; fmt++;
+            continue;
+        }
+
+        int suppress = 0;
+        if (*fmt == '*') { suppress = 1; fmt++; }
+
+        int width = -1;                        // -1 => unbounded
+        if (*fmt >= '0' && *fmt <= '9') {
+            width = 0;
+            while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
+        }
+
+        int lg = 0, sh = 0;                    // lg: 1=long 2=long long ; sh: 1=short 2=char
+        for (;;) {
+            if (*fmt == 'l')                         { lg = (lg >= 1) ? 2 : 1; fmt++; }
+            else if (*fmt == 'h')                    { sh = (sh >= 1) ? 2 : 1; fmt++; }
+            else if (*fmt=='j'||*fmt=='z'||*fmt=='t'){ lg = 1; fmt++; }   // long-width on LP64
+            else if (*fmt=='L'||*fmt=='q')           { lg = 2; fmt++; }
+            else break;
+        }
+
+        char conv = *fmt;
+        switch (conv) {
+        case 'c': {                            // width chars, no ws-skip, no NUL
+            int n = (width < 0) ? 1 : width, got = 0;
+            char* out = suppress ? NULL : va_arg(ap, char*);
+            while (n-- > 0 && *b) { if (out) *out++ = *b; b++; got++; }
+            if (got == 0) goto out;
+            if (!suppress) matched++;
             break;
         }
-        case 'u': case 'x': {
-            int base = (*fmt == 'x') ? 16 : 10;
-            if (base == 16 && b[0] == '0' && (b[1] == 'x' || b[1] == 'X')) b += 2;
-            unsigned long long v = 0; int consumed = 0;
-            while (*b) {
-                int d;
-                if (*b >= '0' && *b <= '9') d = *b - '0';
-                else if (base == 16 && *b >= 'a' && *b <= 'f') d = *b - 'a' + 10;
-                else if (base == 16 && *b >= 'A' && *b <= 'F') d = *b - 'A' + 10;
-                else break;
-                v = v * base + d; b++; consumed++;
+        case 's': {                            // ws-skip, non-ws run, NUL-terminated
+            while (sc_is_ws((unsigned char)*b)) b++;
+            if (!*b) goto out;
+            char* out = suppress ? NULL : va_arg(ap, char*);
+            int got = 0;
+            while (*b && !sc_is_ws((unsigned char)*b) && (width < 0 || got < width)) {
+                if (out) *out++ = *b;
+                b++; got++;
             }
-            if (!consumed) return matched;
-            if (llflag)      *va_arg(ap, unsigned long long*) = v;
-            else if (longflag) *va_arg(ap, unsigned long*)    = (unsigned long)v;
-            else               *va_arg(ap, unsigned int*)     = (unsigned int)v;
-            matched++;
+            if (out) *out = '\0';
+            if (got == 0) goto out;
+            if (!suppress) matched++;
             break;
         }
-        case 's': {
-            char* out = va_arg(ap, char*);
-            int i = 0;
-            while (*b && *b != ' ' && *b != '\t' && *b != '\n') { out[i++] = *b++; }
-            out[i] = 0;
-            if (!i) return matched;
-            matched++;
+        case '[': {                            // scanset: %[set] / %[^set]; no ws-skip
+            fmt++;                             // step past '['
+            int negate = 0;
+            if (*fmt == '^') { negate = 1; fmt++; }
+            const char* set = fmt;
+            if (*fmt == ']') fmt++;            // a leading ']' is a set member
+            while (*fmt && *fmt != ']') fmt++;
+            const char* set_end = fmt;         // at ']' (or '\0' if malformed)
+            char* out = suppress ? NULL : va_arg(ap, char*);
+            int got = 0;
+            while (*b && (width < 0 || got < width)) {
+                int in = 0;
+                for (const char* p = set; p < set_end; p++)
+                    if (*p == *b) { in = 1; break; }
+                if (in == negate) break;       // member+^stop, or non-member+plain stop
+                if (out) *out++ = *b;
+                b++; got++;
+            }
+            if (out) *out = '\0';
+            if (got == 0) goto out;
+            if (!suppress) matched++;
+            // fmt now at ']' (or '\0'); the common advance below steps past it.
             break;
         }
-        case 'c': {
-            char* out = va_arg(ap, char*);
-            if (!*b) return matched;
-            *out = *b++;
-            matched++;
+        case 'd': case 'i': case 'u': case 'o':
+        case 'x': case 'X': case 'p': {
+            while (sc_is_ws((unsigned char)*b)) b++;
+            int base = (conv == 'i') ? 0 : (conv == 'd' || conv == 'u') ? 10
+                     : (conv == 'o') ? 8 : 16;
+            int is_signed = (conv == 'd' || conv == 'i');
+            char tmp[65];
+            const char* src = b;
+            if (width >= 0) {                  // bound the parse to `width` chars
+                int m = width > 64 ? 64 : width, k = 0;
+                while (k < m && b[k]) { tmp[k] = b[k]; k++; }
+                tmp[k] = '\0';
+                src = tmp;
+            }
+            char* endp = NULL;
+            if (conv == 'p') {
+                unsigned long long v = strtoull(src, &endp, 16);
+                if (endp == src) goto out;
+                if (!suppress) *va_arg(ap, void**) = (void*)(unsigned long)v;
+            } else if (is_signed) {
+                long long v = strtoll(src, &endp, base);
+                if (endp == src) goto out;
+                if (!suppress) {
+                    if (sh >= 2)      *va_arg(ap, signed char*) = (signed char)v;
+                    else if (sh == 1) *va_arg(ap, short*)       = (short)v;
+                    else if (lg >= 2) *va_arg(ap, long long*)   = v;
+                    else if (lg == 1) *va_arg(ap, long*)        = (long)v;
+                    else              *va_arg(ap, int*)         = (int)v;
+                }
+            } else {
+                unsigned long long v = strtoull(src, &endp, base);
+                if (endp == src) goto out;
+                if (!suppress) {
+                    if (sh >= 2)      *va_arg(ap, unsigned char*)      = (unsigned char)v;
+                    else if (sh == 1) *va_arg(ap, unsigned short*)     = (unsigned short)v;
+                    else if (lg >= 2) *va_arg(ap, unsigned long long*) = v;
+                    else if (lg == 1) *va_arg(ap, unsigned long*)      = (unsigned long)v;
+                    else              *va_arg(ap, unsigned int*)       = (unsigned int)v;
+                }
+            }
+            b += (endp - src);
+            if (!suppress) matched++;
             break;
         }
-        case 'n':
-            // Chars consumed so far; not a match, consumes no input.
-            if (llflag)        *va_arg(ap, long long*) = (long long)(b - start);
-            else if (longflag) *va_arg(ap, long*)      = (long)(b - start);
-            else               *va_arg(ap, int*)       = (int)(b - start);
+        case 'a': case 'A': case 'e': case 'E':
+        case 'f': case 'F': case 'g': case 'G': {
+            while (sc_is_ws((unsigned char)*b)) b++;
+            char tmp[65];
+            const char* src = b;
+            if (width >= 0) {
+                int m = width > 64 ? 64 : width, k = 0;
+                while (k < m && b[k]) { tmp[k] = b[k]; k++; }
+                tmp[k] = '\0';
+                src = tmp;
+            }
+            char* endp = NULL;
+            double v = strtod(src, &endp);
+            if (endp == src) goto out;
+            if (!suppress) {
+                if (lg >= 1) *va_arg(ap, double*) = v;
+                else         *va_arg(ap, float*)  = (float)v;
+            }
+            b += (endp - src);
+            if (!suppress) matched++;
             break;
-        case '%': if (*b++ != '%') return matched; break;
-        default: return matched;
         }
-        fmt++;
+        case 'n':                              // count consumed; no match, no input
+            if (!suppress) {
+                if (lg >= 2)      *va_arg(ap, long long*)   = (long long)(b - start);
+                else if (lg == 1) *va_arg(ap, long*)        = (long)(b - start);
+                else if (sh >= 2) *va_arg(ap, signed char*) = (signed char)(b - start);
+                else if (sh == 1) *va_arg(ap, short*)       = (short)(b - start);
+                else              *va_arg(ap, int*)         = (int)(b - start);
+            }
+            break;
+        default:                               // unknown conversion: cannot continue
+            goto out;
+        }
+        if (*fmt) fmt++;                        // advance past the specifier (never past NUL)
     }
+out:
     *bufp = b;
     return matched;
 }

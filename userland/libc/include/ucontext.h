@@ -37,7 +37,18 @@ enum {
 typedef long long greg_t;
 typedef greg_t gregset_t[NGREG];
 
-struct _libc_fpstate;   // 512-byte FXSAVE area (opaque here)
+// 512-byte FXSAVE area, glibc-compatible layout. HotSpot's crash handler reads
+// fpregs->_xmm[i] and fpregs->mxcsr, so this must be a complete type.
+struct _libc_fpxreg { unsigned short significand[4]; unsigned short exponent; unsigned short __pad[3]; };
+struct _libc_xmmreg { uint32_t element[4]; };
+struct _libc_fpstate {
+    uint16_t cwd, swd, ftw, fop;
+    uint64_t rip, rdp;
+    uint32_t mxcsr, mxcr_mask;
+    struct _libc_fpxreg _st[8];
+    struct _libc_xmmreg _xmm[16];
+    uint32_t __pad[24];
+};
 
 typedef struct {
     gregset_t              gregs;

@@ -185,6 +185,7 @@ SYSROOT_CFLAGS=(
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/fts.c" -o "$BUILD_DIR/user_fts.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/dns.c"   -o "$BUILD_DIR/user_dns.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math.c" -o "$BUILD_DIR/user_math.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math_c99.c" -o "$BUILD_DIR/user_math_c99.o"
 
 # POSIX-header-aligned syscall wrapper files.  One file per header —
 # each provides link-resolvable extern symbols for sysroot consumers
@@ -252,6 +253,7 @@ done
 ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_libc.o"    "$BUILD_DIR/user_stdio.o" \
    "$BUILD_DIR/user_dns.o"     "$BUILD_DIR/user_math.o" \
+   "$BUILD_DIR/user_math_c99.o" \
    "$BUILD_DIR/user_setjmp.o"  "$BUILD_DIR/user_pthread.o" \
    "$BUILD_DIR/user_pthread_tramp.o" \
    "$BUILD_DIR/user_dlfcn.o"    "$BUILD_DIR/user_locale.o" \
@@ -960,6 +962,12 @@ EXT2_SECTORS=1048576  # 512 MiB — DE stack (sway+swaybar+swaybg+tofi) + xkb tr
 # JDKTEST stages the ~55 MB exploded OpenJDK java.base image (6437 class files +
 # libjvm.so); grow the rootfs to 1 GiB so it fits with headroom.
 if [ "${JDKTEST:-0}" = "1" ] || [ "${LWJGLTEST:-0}" = "1" ]; then EXT2_SECTORS=2097152; fi  # 1 GiB
+# MCTEST stages the full exploded JDK (180 MB) + Minecraft client/libs/assets
+# (~715 MB) + writable gameDir; grow the rootfs to 3 GiB. Default mke2fs inode
+# ratio (16 KiB) gives ~196k inodes for ~30k files -- ample.
+if [ "${MCTEST:-0}" = "1" ]; then EXT2_SECTORS=6291456; fi  # 3 GiB
+# Stress test needs the big-fs conditions (384 block groups, high inodes) where
+# the leaves[] corruption reproduced.
 ESP_START=2048
 ESP_END=4095
 
@@ -1170,14 +1178,38 @@ fi
 # OpenJDK Zero java.base (JDKTEST=1): stage the exploded runtime image at /jdk so
 # `/jdk/bin/java -version` runs at boot.  Only bin/java + lib/ + the java.base
 # exploded classes are staged (not the full images/ tree with every module).
-if [ "${JDKTEST:-0}" = "1" ] || [ "${LWJGLTEST:-0}" = "1" ]; then
-    JDK_IMG="build/third_party/openjdk17u/build/linux-x86_64-zero-release/jdk"
+if [ "${JDKTEST:-0}" = "1" ] || [ "${LWJGLTEST:-0}" = "1" ] || [ "${MCTEST:-0}" = "1" ]; then
+    # JDK_VARIANT=server selects the tiered C1+C2 JIT VM; default zero (interpreter).
+    JDK_IMG="build/third_party/openjdk17u/build/linux-x86_64-${JDK_VARIANT:-zero}-release/jdk"
     if [ -x "$JDK_IMG/bin/java" ]; then
         debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk"         > /dev/null 2>&1 || true
         debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk/bin"     > /dev/null 2>&1 || true
         debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk/modules" > /dev/null 2>&1 || true
         ext2_install_bin "$BUILD_DIR/ext2.img" "$JDK_IMG/bin/java" jdk/bin/java
         ext2_install_tree "$BUILD_DIR/ext2.img" "$JDK_IMG/lib"                jdk/lib
+        # The JDK's libzip.so is linked against system zlib (libz.so.1), needed
+        # by java.util.zip.Inflater -> reading ANY jar (client.jar, libraries).
+        # The zlib port only builds libz.a (static); build a SHARED libz.so.1
+        # from the same pinned, already-PIC sources with the MakaOS cross-gcc and
+        # stage it at /lib/libz.so.1 (the loader's search path).
+        ZLIB_SRC_DIR="$BUILD_DIR/third_party/zlib-1.3.1"
+        if [ -d "$ZLIB_SRC_DIR" ] && [ -x "$USER_CC" ]; then
+            "$USER_CC" -shared -O2 -fPIC -DHAVE_HIDDEN -DZ_HAVE_UNISTD_H \
+                -Wl,-soname,libz.so.1 -o "$BUILD_DIR/libz.so.1" \
+                "$ZLIB_SRC_DIR"/adler32.c "$ZLIB_SRC_DIR"/compress.c "$ZLIB_SRC_DIR"/crc32.c \
+                "$ZLIB_SRC_DIR"/deflate.c "$ZLIB_SRC_DIR"/gzclose.c "$ZLIB_SRC_DIR"/gzlib.c \
+                "$ZLIB_SRC_DIR"/gzread.c "$ZLIB_SRC_DIR"/gzwrite.c "$ZLIB_SRC_DIR"/infback.c \
+                "$ZLIB_SRC_DIR"/inffast.c "$ZLIB_SRC_DIR"/inflate.c "$ZLIB_SRC_DIR"/inftrees.c \
+                "$ZLIB_SRC_DIR"/trees.c "$ZLIB_SRC_DIR"/uncompr.c "$ZLIB_SRC_DIR"/zutil.c \
+                2>/dev/null && ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libz.so.1" lib/libz.so.1 \
+                && echo "[build] libz.so.1 (shared zlib for the JDK) staged at /lib" \
+                || echo "[build] warn: libz.so.1 build/stage failed -- jar reads will fail"
+        fi
+        # conf/ holds java.security (JCA provider list + policy) which the
+        # security subsystem loads on first crypto/SecureRandom use -- Minecraft
+        # (and any ResourceBundle/locale path) needs it, or class init cascades
+        # into NoClassDefFoundError: sun.security.jca.Providers.
+        [ -d "$JDK_IMG/conf" ] && ext2_install_tree "$BUILD_DIR/ext2.img" "$JDK_IMG/conf" jdk/conf
         # Stage every built exploded module (java.base, jdk.unsupported for
         # sun.misc.Unsafe which LWJGL/Minecraft need, and any others built).
         for moddir in "$JDK_IMG/modules"/*/; do
@@ -1216,6 +1248,44 @@ if [ "${LWJGLTEST:-0}" = "1" ] && [ -d "$BUILD_DIR/lwjgl" ] && [ -f "$BUILD_DIR/
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/lwjgl/natives/liblwjgl_opengl.so" lwjgl/liblwjgl_opengl.so
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libglfw.so"                       lwjgl/libglfw.so
     echo "[build] LWJGL staged at /lwjgl (jars + core natives + our libglfw.so + HelloWindow.class)"
+fi
+# MCTEST=1: stage a full Minecraft install under /mc (client.jar + library jars +
+# extracted LWJGL natives + assets) and a writable gameDir. Our Wayland libglfw.so
+# is substituted for LWJGL's bundled X11/Wayland one. Needs scripts/fetch-minecraft.sh
+# to have populated build/mc/<version> first, and /jdk (staged above) + AUTOLOGIN sway.
+MC_VER="${MC_VER:-1.20.4}"
+MC_SRC="$BUILD_DIR/mc/$MC_VER"
+if [ "${MCTEST:-0}" = "1" ] && [ -f "$MC_SRC/client.jar" ] && [ -f "$BUILD_DIR/libglfw.so" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /mc"        > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /mc/natives" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /mc/game"   > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /mc/game/tmp" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $MC_SRC/client.jar /mc/client.jar" > /dev/null 2>&1 || true
+    # McLaunch: a thin launcher that loads net.minecraft.client.main.Main
+    # reflectively and prints the full throwable chain itself -- the stock java
+    # launcher masks a main-class load failure behind its localized error path.
+    MCLAUNCH_SRC="$USERLAND_DIR/apps/mclaunch/McLaunch.java"
+    HOST_JAVAC17="/usr/lib/jvm/java-17-openjdk-amd64/bin/javac"
+    [ -x "$HOST_JAVAC17" ] || HOST_JAVAC17="$(command -v javac)"
+    mkdir -p "$BUILD_DIR/mc/mclaunch"
+    if [ -f "$MCLAUNCH_SRC" ] && [ -n "$HOST_JAVAC17" ]; then
+        rm -rf "$BUILD_DIR/mc/mclaunch"; mkdir -p "$BUILD_DIR/mc/mclaunch"
+        "$HOST_JAVAC17" --release 17 -d "$BUILD_DIR/mc/mclaunch" "$MCLAUNCH_SRC" 2>/dev/null || echo "[build] warn: McLaunch compile failed"
+    fi
+    # McLaunch is in package makaos.launch -> makaos/launch/McLaunch.class.
+    [ -d "$BUILD_DIR/mc/mclaunch/makaos" ] && \
+        ext2_install_tree "$BUILD_DIR/ext2.img" "$BUILD_DIR/mc/mclaunch/makaos" mc/makaos
+    ext2_install_tree "$BUILD_DIR/ext2.img" "$MC_SRC/libraries" mc/libraries
+    ext2_install_tree "$BUILD_DIR/ext2.img" "$MC_SRC/assets"    mc/assets
+    # Natives must be +x (MakaOS requires +x to mmap PROT_EXEC). Stage every
+    # extracted LWJGL native EXCEPT the bundled libglfw.so, then drop in ours.
+    for so in "$MC_SRC/natives"/*.so; do
+        base="$(basename "$so")"
+        [ "$base" = "libglfw.so" ] && continue
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$so" "mc/natives/$base"
+    done
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libglfw.so" mc/natives/libglfw.so
+    echo "[build] Minecraft $MC_VER staged at /mc (client + $(ls "$MC_SRC/libraries" | wc -l) libs + natives + assets)"
 fi
 if [ -f "$BUILD_DIR/user_virgltest.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_virgltest.elf" bin/virgltest
@@ -1469,6 +1539,42 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
         # eglGetProcAddress, which knows the full GL 4.x set.
         printf 'exec /jdk/bin/java -Dos.name=Linux -Dorg.lwjgl.librarypath=/lwjgl -Dorg.lwjgl.glfw.libname=/lwjgl/libglfw.so -Dorg.lwjgl.opengl.libname=/lwjgl/libglfw.so -cp %s HelloWindow\n' \
             "$LWJGL_CP" >> "$BUILD_DIR/etc_stage/sway_config"
+    fi
+    # Minecraft: autostart the client under sway. Classpath is client.jar + every
+    # library jar; natives (incl. our libglfw.so) come from /mc/natives. Offline
+    # dummy credentials; gameDir + java.io.tmpdir point at the writable /mc/game.
+    if [ "${MCTEST:-0}" = "1" ] && [ -f "$MC_SRC/client.jar" ]; then
+        MC_CP="/mc"
+        MC_CP="$MC_CP:/mc/client.jar"
+        # Exclude the LWJGL *-natives-*.jar (they hold only .so's): on the classpath
+        # LWJGL tries to EXTRACT them to a temp dir (which fails on MakaOS -- deep
+        # mkdir + unset user.name = I/O error). Off the classpath, LWJGL loads the
+        # natives directly from java.library.path=/mc/natives instead.
+        for j in "$MC_SRC"/libraries/*.jar; do
+            case "$(basename "$j")" in *-natives-*.jar) continue;; esac
+            MC_CP="$MC_CP:/mc/libraries/$(basename "$j")"
+        done
+        MC_AIDX="$(sed -n 's/^assetIndex=//p' "$MC_SRC/launch.txt" 2>/dev/null)"; MC_AIDX="${MC_AIDX:-12}"
+        # -XX:TieredStopAtLevel=1: run C1 only (no C2).  History: C1 originally
+        #   SIGSEGV'd (LinearScan/BlockBegin) -- but that was the sys_brk remove+add
+        #   heap-corruption bug trashing the C1 compiler's C-heap, NOT a C1 bug; with
+        #   the brk fix (in-place heap grow) C1 runs clean.  C2 (-XX:-TieredCompilation)
+        #   still DETERMINISTICALLY miscompiles java.util.HashMap.resize on MakaOS (a
+        #   real C2-codegen bug, kernel clean), so cap at C1: far faster than -Xint and
+        #   crash-free.  (Requires the libc sscanf %[...] scanset fix so HotSpot's -XX:
+        #   parser works, AND the syscall()/futex __syscall_ret fix so WaitBarrier's
+        #   FUTEX_WAIT sees -1/errno instead of a raw -EAGAIN.)
+        # -Djdk.lang.Process.launchMechanism=vfork: the default POSIX_SPAWN path
+        #   execs /jdk/lib/jspawnhelper, which PF-KILLs (RIP=0) on MakaOS; vfork
+        #   spawns directly so oshi's hardware probes fail cleanly (IOException)
+        #   instead of wedging the JVM.
+        # -Djava.security.egd=file:/dev/./urandom: seed SecureRandom from the
+        #   kernel CSPRNG.  Without it (and before /dev/random existed) SecureRandom
+        #   fell back to the ThreadedSeedGenerator software-entropy collector, which
+        #   stalled MC's bootstrap for MINUTES.  The kernel now also exposes
+        #   /dev/random (== urandom), so getInstanceStrong() no longer blocks either.
+        printf 'exec /jdk/bin/java -XX:TieredStopAtLevel=1 -Djava.security.egd=file:/dev/./urandom -Djdk.lang.Process.launchMechanism=vfork -Xmx2g -Dos.name=Linux -Duser.name=mc -Duser.home=/mc/game -Djava.awt.headless=true -Djava.io.tmpdir=/mc/game/tmp -Djava.library.path=/mc/natives -Djna.boot.library.path=/mc/natives -Djna.nounpack=true -Dorg.lwjgl.librarypath=/mc/natives -Dorg.lwjgl.glfw.libname=/mc/natives/libglfw.so -Dorg.lwjgl.opengl.libname=/mc/natives/libglfw.so -cp %s makaos.launch.McLaunch --username Player --version %s --gameDir /mc/game --assetsDir /mc/assets --assetIndex %s --uuid 00000000000000000000000000000000 --accessToken 0 --userType legacy --versionType release\n' \
+            "$MC_CP" "$MC_VER" "$MC_AIDX" >> "$BUILD_DIR/etc_stage/sway_config"
     fi
     if [ -f "$BUILD_DIR/quake-id1/pak0.pak" ]; then
         printf 'exec /bin/dplaunch\n' >> "$BUILD_DIR/etc_stage/sway_config"

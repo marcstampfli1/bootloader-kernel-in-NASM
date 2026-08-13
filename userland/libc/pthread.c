@@ -148,10 +148,14 @@ int pthread_getcpuclockid(pthread_t tid, clockid_t* clk) {
 int pthread_attr_init(pthread_attr_t* a) {
     if (!a) return EINVAL;
     a->kind          = 0;
-    a->stack_size    = 1024 * 1024;           // 1 MiB default — fontconfig's
-                                              // XML parse blew through 256K
-                                              // (no guard pages yet: overflow
-                                              // scribbled the neighbour map)
+    a->stack_size    = 8 * 1024 * 1024;       // 8 MiB default — glibc parity.
+                                              // Was 1 MiB (bumped from 256K for
+                                              // fontconfig); glibc-ABI software
+                                              // assumes ~8 MiB and overflows
+                                              // less: HotSpot's C1 compiler
+                                              // thread (LinearScan deep frames)
+                                              // SIGSEGV'd under Minecraft on the
+                                              // 1 MiB default.
     a->stack         = NULL;
     a->detachstate   = PTHREAD_CREATE_JOINABLE;
     a->schedpolicy   = 0;  // SCHED_OTHER
@@ -248,7 +252,7 @@ int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
                     void* (*start)(void*), void* arg) {
     if (!tid_out || !start) return EINVAL;
 
-    size_t stack_size = attr ? attr->stack_size : 1024 * 1024;
+    size_t stack_size = attr ? attr->stack_size : 8 * 1024 * 1024;  // 8 MiB default (glibc parity)
     void*  stack      = attr ? attr->stack      : NULL;
     if (!stack) {
         stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
@@ -831,7 +835,40 @@ int pthread_setcanceltype(int type, int* oldtype) {
 }
 void pthread_testcancel(void) { }
 
+// pthread_atfork: register fork handlers.  fork() (unistd.c) runs the `prepare`
+// handlers in REVERSE registration order before the fork, and the `parent` /
+// `child` handlers in FORWARD order after it (POSIX).  jemalloc + the JVM
+// register these to lock their allocator arenas across the fork and reset them
+// in the child; without running them, a fork under allocator contention leaves
+// the child's arenas locked -> deadlock/abort on first native alloc.
+#define ATFORK_MAX 32
+static struct { void (*prep)(void); void (*parent)(void); void (*child)(void); } s_atfork[ATFORK_MAX];
+static volatile unsigned char s_atfork_lock = 0;
+static int s_atfork_n = 0;
+
 int pthread_atfork(void (*prep)(void), void (*parent)(void), void (*child)(void)) {
-    (void)prep; (void)parent; (void)child;
+    while (__atomic_test_and_set(&s_atfork_lock, __ATOMIC_ACQUIRE)) sched_yield();
+    if (s_atfork_n < ATFORK_MAX) {
+        s_atfork[s_atfork_n].prep   = prep;
+        s_atfork[s_atfork_n].parent = parent;
+        s_atfork[s_atfork_n].child  = child;
+        s_atfork_n++;
+    }
+    __atomic_clear(&s_atfork_lock, __ATOMIC_RELEASE);
     return 0;
+}
+// Invoked by fork().  No locking: fork serializes the process (all other threads
+// are quiesced by the syscall's address-space copy); concurrent registration
+// during a fork is not a supported use.
+void __run_atfork_prepare(void) {
+    for (int i = s_atfork_n - 1; i >= 0; i--)
+        if (s_atfork[i].prep) s_atfork[i].prep();
+}
+void __run_atfork_parent(void) {
+    for (int i = 0; i < s_atfork_n; i++)
+        if (s_atfork[i].parent) s_atfork[i].parent();
+}
+void __run_atfork_child(void) {
+    for (int i = 0; i < s_atfork_n; i++)
+        if (s_atfork[i].child) s_atfork[i].child();
 }

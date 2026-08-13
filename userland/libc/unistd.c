@@ -85,13 +85,40 @@ int unlink(const char* path) {
 
 // ── Process identity ────────────────────────────────────────────────
 pid_t fork(void) {
+    // Multithreaded-fork safety.  fork() copies ONLY the calling thread, but the
+    // whole address space -- including any allocator lock a SIBLING thread was
+    // holding at the instant of the fork.  The child would inherit that lock
+    // LOCKED (its holder does not exist in the child) and deadlock/abort on its
+    // first malloc.  glibc solves this with pthread_atfork handlers; do the same:
+    //   1. run user prepare handlers (jemalloc/JVM lock their arenas), reverse order
+    //   2. take libc's own heap lock LAST (so a prepare handler may still malloc)
+    //   3. after the fork, release/reset every lock; run parent- or child-side handlers
+    // (Observed: Minecraft's OSHI hardware probe forks during multi-threaded
+    // graphics init; without this the child aborts with SIGABRT and MC's render
+    // thread blocks forever waiting on it.)  These are weak so minimal in-tree
+    // binaries that never link pthread still work.
+    extern void __run_atfork_prepare(void)     __attribute__((weak));
+    extern void __run_atfork_parent(void)      __attribute__((weak));
+    extern void __run_atfork_child(void)       __attribute__((weak));
+    extern void __libc_malloc_atfork_lock(void)   __attribute__((weak));
+    extern void __libc_malloc_atfork_unlock(void) __attribute__((weak));
+
+    if (__run_atfork_prepare)     __run_atfork_prepare();
+    if (__libc_malloc_atfork_lock) __libc_malloc_atfork_lock();
+
     pid_t r = (pid_t)__syscall_ret(syscall0(SYS_FORK));
+
     if (r == 0) {
-        // Child: its new pid must not keep the parent's TLS-cached
-        // pthread identity (mutex ownership / pthread_self would alias).
-        // Weak ref: a no-op for in-tree binaries that never link pthread.
+        // Child: allocator is now single-threaded -- unlock libc's heap first so
+        // child handlers may malloc, run child handlers, then fix pthread identity
+        // (the new pid must not keep the parent's TLS-cached pthread self).
+        if (__libc_malloc_atfork_unlock) __libc_malloc_atfork_unlock();
+        if (__run_atfork_child)           __run_atfork_child();
         extern void __pthread_reset_self(void) __attribute__((weak));
         if (__pthread_reset_self) __pthread_reset_self();
+    } else {
+        if (__libc_malloc_atfork_unlock) __libc_malloc_atfork_unlock();
+        if (__run_atfork_parent)          __run_atfork_parent();
     }
     return r;
 }

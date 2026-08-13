@@ -17,5 +17,12 @@
 // code that hardcodes them works. Add a tag here only when the shim handles it.
 #define SYS_gettid 186
 #define SYS_futex  202
+// ZGC's zSyscall_linux.cpp references these UNCONDITIONALLY (not #ifdef-guarded),
+// so they must be defined for the server VM to compile. MakaOS's syscall() shim
+// returns -ENOSYS for them; harmless since ZGC is never the selected collector
+// (Minecraft/default use G1). Values are Linux/x86-64.
+#define SYS_fallocate      285
+#define SYS_get_mempolicy  239
+#define SYS_memfd_create   319
 
 #endif // _SYS_SYSCALL_H

@@ -27,7 +27,7 @@ pkill -9 -f "qemu-system-x86_64.*disk\.img" 2>/dev/null || true
 
 echo "[run-gl] virtio-gpu-gl + egl-headless (rendernode=$RENDERNODE); serial -> $SERIAL"
 exec qemu-system-x86_64 \
-  -accel kvm -cpu host -smp 4 -m 1024M -nodefaults -no-user-config \
+  -accel kvm -cpu host -smp "${QEMU_SMP:-4}" -m "${QEMU_MEM:-1024M}" -nodefaults -no-user-config \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file="$OVMF_VARS" \
   -drive format=raw,file=build/disk.img,if=none,id=hd0,snapshot=on \

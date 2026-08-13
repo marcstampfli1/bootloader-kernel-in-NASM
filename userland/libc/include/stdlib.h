@@ -109,6 +109,13 @@ int   unlockpt(int fd);
 char* ptsname(int fd);
 int   ptsname_r(int fd, char* buf, size_t len);
 
+// C99/C11 additions the host libstdc++ <cstdlib> (used when cross-building C++
+// against this sysroot, e.g. OpenJDK HotSpot's x86 code generators) expects to
+// find in <stdlib.h>.
+long double strtold(const char* s, char** endptr);
+int         at_quick_exit(void (*func)(void));
+void        quick_exit(int status) __attribute__((__noreturn__));
+
 #ifdef __cplusplus
 }
 #endif
